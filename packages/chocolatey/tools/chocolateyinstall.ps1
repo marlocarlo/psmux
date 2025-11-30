@@ -7,7 +7,7 @@ $packageArgs = @{
   packageName    = $env:ChocolateyPackageName
   unzipLocation  = $toolsDir
   url64bit       = $url64
-  checksum64     = 'TODO_SHA256_HASH'
+  checksum64     = 'f3305fb9cd4ba44e516898de0b18a06b8b32e90b21f2047f05a9123eaa37ac79'
   checksumType64 = 'sha256'
 }
 
