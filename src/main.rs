@@ -4464,9 +4464,17 @@ fn run_server(session_name: String) -> io::Result<()> {
                     }
                     "kill-pane" => { let _ = tx.send(CtrlReq::KillPane); }
                     "capture-pane" => {
+                        let print_stdout = args.iter().any(|a| *a == "-p");
                         let (rtx, rrx) = mpsc::channel::<String>();
                         let _ = tx.send(CtrlReq::CapturePane(rtx));
-                        if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); }
+                        if let Ok(text) = rrx.recv() {
+                            if print_stdout {
+                                let _ = write!(stream, "{}", text);
+                            } else {
+                                // Save to buffer instead
+                                let _ = tx.send(CtrlReq::SetBuffer(text));
+                            }
+                        }
                     }
                     "dump-layout" => {
                         let (rtx, rrx) = mpsc::channel::<String>();
