@@ -673,6 +673,7 @@ fn main() -> io::Result<()> {
             "kill-server" => {
                 let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                 let psmux_dir = format!("{}\\.psmux", home);
+                let mut sessions_killed = 0;
                 if let Ok(entries) = std::fs::read_dir(&psmux_dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
@@ -683,13 +684,22 @@ fn main() -> io::Result<()> {
                                     // Send kill-session to each server
                                     if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
                                         let _ = std::io::Write::write_all(&mut stream, b"kill-session\n");
+                                        sessions_killed += 1;
+                                    } else {
+                                        // Server not running, just remove stale port file
+                                        let _ = std::fs::remove_file(&path);
                                     }
                                 }
+                            } else {
+                                // Can't read port file, remove it
+                                let _ = std::fs::remove_file(&path);
                             }
-                            // Remove the port file
-                            let _ = std::fs::remove_file(&path);
                         }
                     }
+                }
+                if sessions_killed > 0 {
+                    // Give servers a moment to clean up
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 return Ok(());
             }
@@ -5484,9 +5494,17 @@ fn run_server(session_name: String) -> io::Result<()> {
                 }
             }
         }
-        let _ = reap_children(&mut app)?;
+        // Check if all windows/panes have exited
+        if reap_children(&mut app)? {
+            // All windows are gone - clean up port file and exit server
+            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+            let regpath = format!("{}\\.psmux\\{}.port", home, app.session_name);
+            let _ = std::fs::remove_file(&regpath);
+            break;
+        }
         thread::sleep(Duration::from_millis(20));
     }
+    Ok(())
 }
 
 fn capture_active_pane_range(app: &mut AppState, s: Option<u16>, e: Option<u16>) -> io::Result<Option<String>> {
