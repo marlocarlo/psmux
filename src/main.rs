@@ -1772,7 +1772,7 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
     
     loop {
         // Check if server is still alive before drawing
-        if std::net::TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(100)).is_err() {
+        if std::net::TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(20)).is_err() {
             // Server is gone, exit gracefully
             break;
         }
@@ -1894,7 +1894,7 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                 f.render_widget(para, overlay.inner(oa));
             }
         })?;
-        if event::poll(Duration::from_millis(50))? {
+        if event::poll(Duration::from_millis(16))? {
             match event::read()? { Event::Key(key) if key.kind == KeyEventKind::Press => {
                 if matches!(key.code, KeyCode::Char('q')) && key.modifiers.contains(KeyModifiers::CONTROL) { quit = true; }
                 else if matches!(key.code, KeyCode::Char('b')) && key.modifiers.contains(KeyModifiers::CONTROL) { prefix_armed = true; }
@@ -5502,7 +5502,7 @@ fn run_server(session_name: String) -> io::Result<()> {
             let _ = std::fs::remove_file(&regpath);
             break;
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(5));
     }
     Ok(())
 }
