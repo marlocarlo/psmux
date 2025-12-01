@@ -44,13 +44,24 @@ If you've used tmux on Linux/macOS and wished you had something similar on Windo
 
 ## Installation
 
-### Using Cargo (Recommended)
+### Quick Install (Recommended)
+
+```powershell
+irm https://raw.githubusercontent.com/marlocarlo/psmux/master/scripts/install.ps1 | iex
+```
+
+This downloads the latest release and adds it to your PATH. After installation, `psmux`, `pmux`, and `tmux` commands are all available.
+
+To uninstall:
+```powershell
+irm https://raw.githubusercontent.com/marlocarlo/psmux/master/scripts/uninstall.ps1 | iex
+```
+
+### Using Cargo
 
 ```powershell
 cargo install psmux
 ```
-
-After installation, `psmux`, `pmux`, and `tmux` commands are all available.
 
 ### Using Chocolatey
 
