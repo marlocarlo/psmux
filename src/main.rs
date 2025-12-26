@@ -1702,7 +1702,14 @@ fn main() -> io::Result<()> {
                 print_commands();
                 return Ok(());
             }
-            _ => {}
+            _ => {
+                // Unknown command - print error and exit
+                if !cmd.is_empty() {
+                    eprintln!("psmux: unknown command: {}", cmd);
+                    eprintln!("Run 'psmux --help' for usage information.");
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unknown command: {}", cmd)));
+                }
+            }
         }
     
     // Default behavior: If no PSMUX_REMOTE_ATTACH is set and no specific command matched,
@@ -1894,7 +1901,12 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                                 let mut fg = map_color(&cell.fg);
                                 let mut bg = map_color(&cell.bg);
                                 if cell.inverse { std::mem::swap(&mut fg, &mut bg); }
+                                // Dim predictions from cursor position onwards (including wrapped lines)
+                                if *active && dim_predictions_enabled() && (r > *cursor_row || (r == *cursor_row && c >= *cursor_col)) {
+                                    fg = dim_color(fg);
+                                }
                                 let mut style = Style::default().fg(fg).bg(bg);
+                                if cell.dim { style = style.add_modifier(Modifier::DIM); }
                                 if cell.bold { style = style.add_modifier(Modifier::BOLD); }
                                 if cell.italic { style = style.add_modifier(Modifier::ITALIC); }
                                 if cell.underline { style = style.add_modifier(Modifier::UNDERLINED); }
@@ -3431,8 +3443,8 @@ fn vt_to_color(c: vt100::Color) -> Color {
             4 => Color::Blue,
             5 => Color::Magenta,
             6 => Color::Cyan,
-            7 => Color::Gray,
-            8 => Color::DarkGray,
+            7 => Color::Rgb(128, 128, 128),  // Gray - dimmed for better contrast
+            8 => Color::Rgb(80, 80, 80),     // DarkGray - very subtle for autocomplete
             9 => Color::LightRed,
             10 => Color::LightGreen,
             11 => Color::LightYellow,
@@ -3444,6 +3456,25 @@ fn vt_to_color(c: vt100::Color) -> Color {
         },
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }
+}
+
+fn dim_color(c: Color) -> Color {
+    match c {
+        Color::Rgb(r, g, b) => Color::Rgb((r as u16 * 2 / 5) as u8, (g as u16 * 2 / 5) as u8, (b as u16 * 2 / 5) as u8),
+        Color::Black => Color::Rgb(40, 40, 40),
+        Color::White | Color::Gray | Color::DarkGray => Color::Rgb(100, 100, 100),
+        Color::LightRed => Color::Rgb(150, 80, 80),
+        Color::LightGreen => Color::Rgb(80, 150, 80),
+        Color::LightYellow => Color::Rgb(150, 150, 80),
+        Color::LightBlue => Color::Rgb(80, 120, 180),
+        Color::LightMagenta => Color::Rgb(150, 80, 150),
+        Color::LightCyan => Color::Rgb(80, 150, 150),
+        _ => Color::Rgb(80, 80, 80),
+    }
+}
+
+fn dim_predictions_enabled() -> bool {
+    std::env::var("PSMUX_DIM_PREDICTIONS").map(|v| v != "0" && v.to_lowercase() != "false").unwrap_or(true)
 }
 
 fn apply_cursor_style<W: Write>(out: &mut W) -> io::Result<()> {
@@ -3501,6 +3532,8 @@ fn render_node(f: &mut Frame, node: &mut Node, active_path: &Vec<usize>, cur_pat
             }
             let parser = pane.term.lock().unwrap();
             let screen = parser.screen();
+            let (cur_r, cur_c) = screen.cursor_position();
+            let dim_preds = dim_predictions_enabled();
             let mut lines: Vec<Line> = Vec::with_capacity(target_rows as usize);
             for r in 0..target_rows {
                 let mut spans: Vec<Span> = Vec::with_capacity(target_cols as usize);
@@ -3510,7 +3543,12 @@ fn render_node(f: &mut Frame, node: &mut Node, active_path: &Vec<usize>, cur_pat
                         let mut fg = vt_to_color(cell.fgcolor());
                         let mut bg = vt_to_color(cell.bgcolor());
                         if cell.inverse() { std::mem::swap(&mut fg, &mut bg); }
+                        // Dim predictions from cursor position onwards (including wrapped lines)
+                        if dim_preds && (r > cur_r || (r == cur_r && c >= cur_c)) {
+                            fg = dim_color(fg);
+                        }
                         let mut style = Style::default().fg(fg).bg(bg);
+                        if cell.dim() { style = style.add_modifier(Modifier::DIM); }
                         if cell.bold() { style = style.add_modifier(Modifier::BOLD); }
                         if cell.italic() { style = style.add_modifier(Modifier::ITALIC); }
                         if cell.underline() { style = style.add_modifier(Modifier::UNDERLINED); }
@@ -5767,7 +5805,7 @@ fn capture_active_pane_range(app: &mut AppState, s: Option<u16>, e: Option<u16>)
     Ok(Some(text))
 }
 #[derive(Serialize, Deserialize)]
-struct CellJson { text: String, fg: String, bg: String, bold: bool, italic: bool, underline: bool, inverse: bool }
+struct CellJson { text: String, fg: String, bg: String, bold: bool, italic: bool, underline: bool, inverse: bool, dim: bool }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -5803,9 +5841,9 @@ fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                             let fg = color_to_name(cell.fgcolor());
                             let bg = color_to_name(cell.bgcolor());
                             let text = cell.contents().to_string();
-                            row.push(CellJson { text, fg, bg, bold: cell.bold(), italic: cell.italic(), underline: cell.underline(), inverse: cell.inverse() });
+                            row.push(CellJson { text, fg, bg, bold: cell.bold(), italic: cell.italic(), underline: cell.underline(), inverse: cell.inverse(), dim: cell.dim() });
                         } else {
-                            row.push(CellJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), bold: false, italic: false, underline: false, inverse: false });
+                            row.push(CellJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), bold: false, italic: false, underline: false, inverse: false, dim: false });
                         }
                     }
                     lines.push(row);
