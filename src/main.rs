@@ -14,8 +14,7 @@ use ratatui::Terminal;
 use crossterm::terminal::{enable_raw_mode, disable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute};
 use crossterm::cursor::{EnableBlinking, DisableBlinking};
-use crossterm::event::EnableMouseCapture;
-use crossterm::event::DisableMouseCapture;
+use crossterm::event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste};
 use ratatui::style::{Style, Modifier};
 use unicode_width::UnicodeWidthStr;
 use chrono::Local;
@@ -1776,7 +1775,7 @@ fn main() -> io::Result<()> {
     env::set_var("PSMUX_ACTIVE", "1");
     let mut stdout = io::stdout();
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen, EnableBlinking, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableBlinking, EnableMouseCapture, EnableBracketedPaste)?;
     apply_cursor_style(&mut stdout)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -1799,7 +1798,7 @@ fn main() -> io::Result<()> {
         
         // Normal exit
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), DisableBlinking, DisableMouseCapture, LeaveAlternateScreen)?;
+        execute!(terminal.backend_mut(), DisableBlinking, DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen)?;
         terminal.show_cursor()?;
         return result;
     }
@@ -2196,6 +2195,14 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                         KeyCode::PageDown => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key pagedown\n"); } }
                         _ => {}
                     }
+                }
+            } Event::Paste(data) => {
+                // Bracketed paste - send all pasted text at once for fast pasting
+                if let Some(mut s) = try_connect() {
+                    // Base64 encode to safely transmit any characters
+                    use std::io::Write as _;
+                    let encoded = base64_encode(&data);
+                    let _ = s.write_all(format!("send-paste {}\n", encoded).as_bytes());
                 }
             } Event::Mouse(me) => {
                 use crossterm::event::{MouseEventKind,MouseButton};
@@ -2609,6 +2616,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                 }
                 CtrlReq::SendText(s) => { send_text_to_active(&mut app, &s)?; }
                 CtrlReq::SendKey(k) => { send_key_to_active(&mut app, &k)?; }
+                CtrlReq::SendPaste(s) => { send_text_to_active(&mut app, &s)?; }
                 CtrlReq::ZoomPane => { toggle_zoom(&mut app); }
                 CtrlReq::CopyEnter => { enter_copy_mode(&mut app); }
                 CtrlReq::CopyMove(dx, dy) => { move_copy_cursor(&mut app, dx, dy); }
@@ -4589,6 +4597,7 @@ enum CtrlReq {
     DumpLayout(mpsc::Sender<String>),
     SendText(String),
     SendKey(String),
+    SendPaste(String),
     ZoomPane,
     CopyEnter,
     CopyMove(i16, i16),
@@ -4798,6 +4807,14 @@ fn run_server(session_name: String) -> io::Result<()> {
                     }
                     "send-text" => {
                         if let Some(payload) = args.get(0) { let _ = tx.send(CtrlReq::SendText(payload.to_string())); }
+                    }
+                    "send-paste" => {
+                        // Bracketed paste - decode base64 and send all at once
+                        if let Some(encoded) = args.get(0) {
+                            if let Some(decoded) = base64_decode(encoded) {
+                                let _ = tx.send(CtrlReq::SendPaste(decoded));
+                            }
+                        }
                     }
                     "send-key" => {
                         if let Some(payload) = args.get(0) { let _ = tx.send(CtrlReq::SendKey(payload.to_string())); }
@@ -5183,6 +5200,7 @@ fn run_server(session_name: String) -> io::Result<()> {
                 }
                 CtrlReq::SendText(s) => { send_text_to_active(&mut app, &s)?; }
                 CtrlReq::SendKey(k) => { send_key_to_active(&mut app, &k)?; }
+                CtrlReq::SendPaste(s) => { send_text_to_active(&mut app, &s)?; }
                 CtrlReq::ZoomPane => { toggle_zoom(&mut app); }
                 CtrlReq::CopyEnter => { enter_copy_mode(&mut app); }
                 CtrlReq::CopyMove(dx, dy) => { move_copy_cursor(&mut app, dx, dy); }
@@ -5997,6 +6015,55 @@ fn list_tree_json(app: &AppState) -> io::Result<String> {
     }
     let s = serde_json::to_string(&v).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
     Ok(s)
+}
+
+// Simple base64 encode/decode for paste data transmission
+const BASE64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(data: &str) -> String {
+    let bytes = data.as_bytes();
+    let mut result = String::new();
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
+        result.push(BASE64_CHARS[(b0 >> 2)] as char);
+        result.push(BASE64_CHARS[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
+        if chunk.len() > 1 {
+            result.push(BASE64_CHARS[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(BASE64_CHARS[b2 & 0x3f] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
+}
+
+fn base64_decode(encoded: &str) -> Option<String> {
+    let mut result = Vec::new();
+    let chars: Vec<u8> = encoded.bytes().filter(|&b| b != b'=').collect();
+    for chunk in chars.chunks(4) {
+        if chunk.len() < 2 { break; }
+        let decode_char = |c: u8| -> Option<u8> {
+            BASE64_CHARS.iter().position(|&x| x == c).map(|p| p as u8)
+        };
+        let b0 = decode_char(chunk[0])?;
+        let b1 = decode_char(chunk[1])?;
+        result.push((b0 << 2) | (b1 >> 4));
+        if chunk.len() > 2 {
+            let b2 = decode_char(chunk[2])?;
+            result.push((b1 << 4) | (b2 >> 2));
+            if chunk.len() > 3 {
+                let b3 = decode_char(chunk[3])?;
+                result.push((b2 << 6) | b3);
+            }
+        }
+    }
+    String::from_utf8(result).ok()
 }
 
 fn color_to_name(c: vt100::Color) -> String {
