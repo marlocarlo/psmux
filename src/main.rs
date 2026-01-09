@@ -23,6 +23,37 @@ use std::env;
 use crossterm::style::Print;
 use serde::{Serialize, Deserialize};
 
+/// Enable virtual terminal processing on Windows Console Host.
+/// This is required for ANSI color codes to work in conhost.exe (legacy console).
+#[cfg(windows)]
+fn enable_virtual_terminal_processing() {
+    // Windows API constants
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(nStdHandle: u32) -> *mut std::ffi::c_void;
+        fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut u32) -> i32;
+        fn SetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, dwMode: u32) -> i32;
+    }
+
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if !handle.is_null() {
+            let mut mode: u32 = 0;
+            if GetConsoleMode(handle, &mut mode) != 0 {
+                SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn enable_virtual_terminal_processing() {
+    // No-op on non-Windows platforms
+}
+
 struct Pane {
     master: Box<dyn MasterPty>,
     child: Box<dyn portable_pty::Child>,
@@ -1775,6 +1806,7 @@ fn main() -> io::Result<()> {
     }
     env::set_var("PSMUX_ACTIVE", "1");
     let mut stdout = io::stdout();
+    enable_virtual_terminal_processing();
     enable_raw_mode()?;
     execute!(stdout, EnterAlternateScreen, EnableBlinking, EnableMouseCapture)?;
     apply_cursor_style(&mut stdout)?;
@@ -1910,7 +1942,9 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                                 if cell.bold { style = style.add_modifier(Modifier::BOLD); }
                                 if cell.italic { style = style.add_modifier(Modifier::ITALIC); }
                                 if cell.underline { style = style.add_modifier(Modifier::UNDERLINED); }
-                                spans.push(Span::styled(cell.text.clone(), style));
+                                // Render empty cells as space to maintain column alignment
+                                let text = if cell.text.is_empty() { " ".to_string() } else { cell.text.clone() };
+                                spans.push(Span::styled(text, style));
                             }
                             lines.push(Line::from(spans));
                         }
@@ -3146,15 +3180,25 @@ fn detect_shell() -> CommandBuilder {
     match pwsh.or(cmd) {
         Some(path) => {
             let mut builder = CommandBuilder::new(&path);
-            // If it's PowerShell, disable inline predictions (ghost text) which doesn't render well in PTY
+            // Set terminal capability environment variables for color support
+            builder.env("TERM", "xterm-256color");
+            builder.env("COLORTERM", "truecolor");
+            // If it's PowerShell, configure for PTY environment
             if path.to_lowercase().contains("pwsh") {
-                // Use -NoExit with a command to disable predictions, then continue interactive
-                builder.args(["-NoLogo", "-NoExit", "-Command", 
-                    "Set-PSReadLineOption -PredictionSource None -ErrorAction SilentlyContinue"]);
+                // Use -NoExit with a command to:
+                // 1. Force ANSI color output (needed for ConPTY)
+                // 2. Disable inline predictions (ghost text) which doesn't render well in PTY
+                builder.args(["-NoLogo", "-NoExit", "-Command",
+                    "$PSStyle.OutputRendering = 'Ansi'; Set-PSReadLineOption -PredictionSource None -ErrorAction SilentlyContinue"]);
             }
             builder
         }
-        None => CommandBuilder::new("pwsh.exe"),
+        None => {
+            let mut builder = CommandBuilder::new("pwsh.exe");
+            builder.env("TERM", "xterm-256color");
+            builder.env("COLORTERM", "truecolor");
+            builder
+        }
     }
 }
 
@@ -4417,6 +4461,22 @@ fn parse_status(fmt: &str, app: &AppState, time_str: &str) -> Vec<Span<'static>>
 }
 
 fn map_color(name: &str) -> Color {
+    // Handle indexed colors: "idx:N"
+    if let Some(idx_str) = name.strip_prefix("idx:") {
+        if let Ok(idx) = idx_str.parse::<u8>() {
+            return Color::Indexed(idx);
+        }
+    }
+    // Handle RGB colors: "rgb:R,G,B"
+    if let Some(rgb_str) = name.strip_prefix("rgb:") {
+        let parts: Vec<&str> = rgb_str.split(',').collect();
+        if parts.len() == 3 {
+            if let (Ok(r), Ok(g), Ok(b)) = (parts[0].parse::<u8>(), parts[1].parse::<u8>(), parts[2].parse::<u8>()) {
+                return Color::Rgb(r, g, b);
+            }
+        }
+    }
+    // Handle named colors
     match name.to_lowercase().as_str() {
         "black" => Color::Black,
         "red" => Color::Red,
