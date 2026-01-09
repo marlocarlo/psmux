@@ -23,6 +23,41 @@ use std::env;
 use crossterm::style::Print;
 use serde::{Serialize, Deserialize};
 
+/// Install a console control handler on Windows to prevent termination on client detach.
+/// When the psmux client exits (after Ctrl+B d), Windows console events may propagate
+/// to the server process. This handler ignores CTRL_CLOSE_EVENT and related events
+/// to keep the server running.
+#[cfg(windows)]
+fn install_console_ctrl_handler() {
+    type HandlerRoutine = unsafe extern "system" fn(u32) -> i32;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<HandlerRoutine>, add: i32) -> i32;
+    }
+
+    const CTRL_CLOSE_EVENT: u32 = 2;
+    const CTRL_LOGOFF_EVENT: u32 = 5;
+    const CTRL_SHUTDOWN_EVENT: u32 = 6;
+
+    unsafe extern "system" fn handler(ctrl_type: u32) -> i32 {
+        // Return TRUE (1) to indicate we handled the event and prevent termination
+        match ctrl_type {
+            CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => 1,
+            _ => 0, // Let other events (like CTRL_C_EVENT) be handled normally
+        }
+    }
+
+    unsafe {
+        SetConsoleCtrlHandler(Some(handler), 1);
+    }
+}
+
+#[cfg(not(windows))]
+fn install_console_ctrl_handler() {
+    // No-op on non-Windows platforms
+}
+
 struct Pane {
     master: Box<dyn MasterPty>,
     child: Box<dyn portable_pty::Child>,
@@ -4699,6 +4734,9 @@ fn focus_pane_by_id(app: &mut AppState, pid: usize) {
     if let Some(p) = found { win.active_path = p; }
 }
 fn run_server(session_name: String) -> io::Result<()> {
+    // Install console control handler to prevent termination on client detach
+    install_console_ctrl_handler();
+
     let pty_system = PtySystemSelection::default()
         .get()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
