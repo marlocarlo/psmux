@@ -2,7 +2,6 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::net::TcpListener;
 use std::io::Read as _;
 use std::io::BufRead as _;
 
@@ -135,7 +134,6 @@ struct AppState {
     display_map: Vec<(usize, Vec<usize>)>,
     binds: Vec<Bind>,
     control_rx: Option<mpsc::Receiver<CtrlReq>>,
-    control_port: Option<u16>,
     session_name: String,
     attached_clients: usize,
     created_at: chrono::DateTime<Local>,
@@ -328,33 +326,36 @@ fn print_commands() {
 "#);
 }
 
-/// Clean up any stale port files (where server is not actually running)
-fn cleanup_stale_port_files() {
+/// Clean up any stale sessions (where server is not actually running)
+fn cleanup_stale_sessions() {
     let home = match env::var("USERPROFILE").or_else(|_| env::var("HOME")) {
         Ok(h) => h,
         Err(_) => return,
     };
+    let sessions_file = format!("{}\\.psmux\\sessions", home);
+
+    if let Ok(content) = std::fs::read_to_string(&sessions_file) {
+        let mut active: Vec<String> = Vec::new();
+        for name in content.lines() {
+            let name = name.trim();
+            if name.is_empty() { continue; }
+            // Check if session pipe exists
+            if pipe_exists(name) {
+                active.push(name.to_string());
+            }
+        }
+        // Rewrite sessions file with only active sessions
+        let _ = std::fs::write(&sessions_file, active.join("\n"));
+    }
+
+    // Also clean up old port files if any exist (migration from old version)
     let psmux_dir = format!("{}\\.psmux", home);
     if let Ok(entries) = std::fs::read_dir(&psmux_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().map(|e| e == "port").unwrap_or(false) {
-                if let Ok(port_str) = std::fs::read_to_string(&path) {
-                    if let Ok(port) = port_str.trim().parse::<u16>() {
-                        let addr = format!("127.0.0.1:{}", port);
-                        // Quick check if server is alive
-                        if std::net::TcpStream::connect_timeout(
-                            &addr.parse().unwrap(),
-                            Duration::from_millis(50)
-                        ).is_err() {
-                            // Server not responding - remove stale port file
-                            let _ = std::fs::remove_file(&path);
-                        }
-                    } else {
-                        // Invalid port file content
-                        let _ = std::fs::remove_file(&path);
-                    }
-                }
+                // Remove old port files - they're no longer used
+                let _ = std::fs::remove_file(&path);
             }
         }
     }
@@ -363,8 +364,8 @@ fn cleanup_stale_port_files() {
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     
-    // Clean up any stale port files at startup
-    cleanup_stale_port_files();
+    // Clean up any stale sessions at startup
+    cleanup_stale_sessions();
     
     // Parse -t flag early to set target session for all commands
     if let Some(pos) = args.iter().position(|a| a == "-t") {
@@ -406,67 +407,54 @@ fn main() -> io::Result<()> {
         // kill-server MUST be handled early before any potential fall-through
         "kill-server" => {
             let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-            let psmux_dir = format!("{}\\.psmux", home);
+            let sessions_file = format!("{}\\.psmux\\sessions", home);
             let mut sessions_killed = 0;
-            if let Ok(entries) = std::fs::read_dir(&psmux_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().map(|e| e == "port").unwrap_or(false) {
-                        if let Ok(port_str) = std::fs::read_to_string(&path) {
-                            if let Ok(port) = port_str.trim().parse::<u16>() {
-                                let addr = format!("127.0.0.1:{}", port);
-                                if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
-                                    let _ = std::io::Write::write_all(&mut stream, b"kill-session\n");
-                                    sessions_killed += 1;
-                                } else {
-                                    let _ = std::fs::remove_file(&path);
-                                }
-                            }
-                        } else {
-                            let _ = std::fs::remove_file(&path);
-                        }
+            if let Ok(content) = std::fs::read_to_string(&sessions_file) {
+                for name in content.lines() {
+                    let name = name.trim();
+                    if name.is_empty() { continue; }
+                    // Send kill-session command via named pipe
+                    if let Ok(pipe) = connect_to_pipe(name, 100) {
+                        let _ = pipe_write(pipe, b"kill-session\n");
+                        close_pipe(pipe);
+                        sessions_killed += 1;
                     }
                 }
             }
             if sessions_killed > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
+            // Clear sessions file
+            let _ = std::fs::write(&sessions_file, "");
             return Ok(());
         }
         "ls" | "list-sessions" => {
-                let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                let dir = format!("{}\\.psmux", home);
-                if let Ok(entries) = std::fs::read_dir(&dir) {
-                    for e in entries.flatten() {
-                        if let Some(name) = e.file_name().to_str() {
-                            if let Some((base, ext)) = name.rsplit_once('.') {
-                                if ext == "port" {
-                                    if let Ok(port_str) = std::fs::read_to_string(e.path()) {
-                                        if let Ok(_p) = port_str.trim().parse::<u16>() {
-                                            let addr = format!("127.0.0.1:{}", port_str.trim());
-                                            if let Ok(mut s) = std::net::TcpStream::connect_timeout(
-                                                &addr.parse().unwrap(),
-                                                Duration::from_millis(50)
-                                            ) {
-                                                let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
-                                                let _ = std::io::Write::write_all(&mut s, b"session-info\n");
-                                                let mut br = std::io::BufReader::new(s);
-                                                let mut line = String::new();
-                                                let _ = br.read_line(&mut line);
-                                                if !line.trim().is_empty() { println!("{}", line.trim_end()); } else { println!("{}", base); }
-                                            } else {
-                                                // stale port file - remove it
-                                                let _ = std::fs::remove_file(e.path());
-                                            }
-                                        }
-                                    }
-                                }
+            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+            let sessions_file = format!("{}\\.psmux\\sessions", home);
+            if let Ok(content) = std::fs::read_to_string(&sessions_file) {
+                for name in content.lines() {
+                    let name = name.trim();
+                    if name.is_empty() { continue; }
+                    // Check if session pipe exists and get info
+                    if let Ok(pipe) = connect_to_pipe(name, 50) {
+                        let _ = pipe_write(pipe, b"session-info\n");
+                        let mut buf = [0u8; 4096];
+                        if let Ok(n) = pipe_read(pipe, &mut buf) {
+                            if n > 0 {
+                                let line = String::from_utf8_lossy(&buf[..n]);
+                                println!("{}", line.trim_end());
+                            } else {
+                                println!("{}", name);
                             }
+                        } else {
+                            println!("{}", name);
                         }
+                        close_pipe(pipe);
                     }
                 }
-                return Ok(());
             }
+            return Ok(());
+        }
             "attach" | "attach-session" => {
                 let name = args
                     .iter()
@@ -487,31 +475,13 @@ fn main() -> io::Result<()> {
             "new-session" | "new" => {
                 let name = args.iter().position(|a| a == "-s").and_then(|i| args.get(i+1)).map(|s| s.clone()).unwrap_or_else(|| "default".to_string());
                 let detached = args.iter().any(|a| a == "-d");
-                
-                // Check if session already exists AND is actually running
-                let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                let port_path = format!("{}\\.psmux\\{}.port", home, name);
-                if std::path::Path::new(&port_path).exists() {
-                    // Verify server is actually running
-                    let server_alive = if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                        if let Ok(port) = port_str.trim().parse::<u16>() {
-                            let addr = format!("127.0.0.1:{}", port);
-                            std::net::TcpStream::connect_timeout(
-                                &addr.parse().unwrap(),
-                                Duration::from_millis(100)
-                            ).is_ok()
-                        } else { false }
-                    } else { false };
-                    
-                    if server_alive {
-                        eprintln!("psmux: session '{}' already exists", name);
-                        return Ok(());
-                    } else {
-                        // Stale port file - remove it and continue
-                        let _ = std::fs::remove_file(&port_path);
-                    }
+
+                // Check if session already exists by checking if named pipe exists
+                if pipe_exists(&name) {
+                    eprintln!("psmux: session '{}' already exists", name);
+                    return Ok(());
                 }
-                
+
                 // Always spawn a background server first
                 let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
                 let mut cmd = std::process::Command::new(&exe);
@@ -526,15 +496,15 @@ fn main() -> io::Result<()> {
                     cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
                 }
                 let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
-                
-                // Wait for server to create port file (up to 2 seconds)
+
+                // Wait for server to create named pipe (up to 2 seconds)
                 for _ in 0..20 {
-                    if std::path::Path::new(&port_path).exists() {
+                    if pipe_exists(&name) {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                
+
                 if detached {
                     // User wants detached session - we're done
                     return Ok(());
@@ -752,10 +722,8 @@ fn main() -> io::Result<()> {
                 }
                 // Try to send kill command to server
                 if send_control("kill-session\n".to_string()).is_err() {
-                    // Server not responding - clean up stale port file
-                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let port_path = format!("{}\\.psmux\\{}.port", home, session_name);
-                    let _ = std::fs::remove_file(&port_path);
+                    // Server not responding - clean up stale session entry
+                    unregister_session(&session_name);
                 }
                 return Ok(());
             }
@@ -778,18 +746,9 @@ fn main() -> io::Result<()> {
                     }
                     t
                 });
-                let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                let path = format!("{}\\.psmux\\{}.port", home, target);
-                if let Ok(port_str) = std::fs::read_to_string(&path) {
-                    if let Ok(port) = port_str.trim().parse::<u16>() {
-                        let addr = format!("127.0.0.1:{}", port);
-                        if std::net::TcpStream::connect(&addr).is_ok() {
-                            std::process::exit(0);
-                        } else {
-                            // Stale port file - clean it up
-                            let _ = std::fs::remove_file(&path);
-                        }
-                    }
+                // Check if session exists by verifying pipe exists
+                if pipe_exists(&target) {
+                    std::process::exit(0);
                 }
                 std::process::exit(1);
             }
@@ -1715,32 +1674,12 @@ fn main() -> io::Result<()> {
     // we need to either attach to an existing session or create a new one.
     // This ensures sessions persist after detach.
     if env::var("PSMUX_REMOTE_ATTACH").ok().as_deref() != Some("1") {
-        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
         let session_name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
-        let port_path = format!("{}\\.psmux\\{}.port", home, session_name);
-        
-        // Check if port file exists AND server is actually alive
-        let server_alive = if std::path::Path::new(&port_path).exists() {
-            if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                if let Ok(port) = port_str.trim().parse::<u16>() {
-                    let addr = format!("127.0.0.1:{}", port);
-                    std::net::TcpStream::connect_timeout(
-                        &addr.parse().unwrap(),
-                        Duration::from_millis(50)
-                    ).is_ok()
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        
+
+        // Check if server is running via named pipe
+        let server_alive = pipe_exists(&session_name);
+
         if !server_alive {
-            // Clean up stale port file if it exists
-            let _ = std::fs::remove_file(&port_path);
             // No existing session - create one in background
             let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
             let mut cmd = std::process::Command::new(&exe);
@@ -1753,10 +1692,10 @@ fn main() -> io::Result<()> {
                 cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
             }
             let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
-            
-            // Wait for server to start
+
+            // Wait for server to start by checking for named pipe
             for _ in 0..20 {
-                if std::path::Path::new(&port_path).exists() {
+                if pipe_exists(&session_name) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -1807,11 +1746,12 @@ fn main() -> io::Result<()> {
 fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     let name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let path = format!("{}\\.psmux\\{}.port", home, name);
-    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no session"))?;
-    let addr = format!("127.0.0.1:{}", port);
-    let mut stream = std::net::TcpStream::connect(addr.clone())?;
-    let _ = std::io::Write::write_all(&mut stream, b"client-attach\n");
+
+    // Connect to named pipe and send client-attach
+    let pipe = connect_to_pipe(&name, 1000)?;
+    pipe_write(pipe, b"client-attach\n")?;
+    close_pipe(pipe);
+
     let last_path = format!("{}\\.psmux\\last_session", home);
     let _ = std::fs::write(&last_path, &name);
     let mut quit = false;
@@ -1830,23 +1770,47 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
     let mut session_entries: Vec<(String, String)> = Vec::new(); // (session_name, info)
     let mut session_selected: usize = 0;
     let current_session = name.clone();
-    
-    // Helper to connect to server - returns None if connection fails
-    let try_connect = || -> Option<std::net::TcpStream> {
-        std::net::TcpStream::connect(&addr).ok()
+
+    // Helper to send command to server via named pipe - returns response if any
+    let pipe_command = |cmd: &[u8]| -> Option<String> {
+        if let Ok(pipe) = connect_to_pipe(&name, 100) {
+            let _ = pipe_write(pipe, cmd);
+            let mut buf = [0u8; 65536];
+            let response = if let Ok(n) = pipe_read(pipe, &mut buf) {
+                if n > 0 {
+                    Some(String::from_utf8_lossy(&buf[..n]).to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            close_pipe(pipe);
+            response
+        } else {
+            None
+        }
     };
-    
+
+    // Helper to send command without expecting response
+    let pipe_send = |cmd: &[u8]| -> bool {
+        if let Ok(pipe) = connect_to_pipe(&name, 100) {
+            let result = pipe_write(pipe, cmd).is_ok();
+            close_pipe(pipe);
+            result
+        } else {
+            false
+        }
+    };
+
     // Struct to hold window info for status bar
     #[derive(serde::Deserialize, Default)]
     struct WinStatus { id: usize, name: String, active: bool }
-    
+
     loop {
         // Fetch layout BEFORE draw - this also serves as liveness check
-        let root: LayoutJson = if let Ok(mut s) = std::net::TcpStream::connect(&addr) {
-            let _ = s.set_read_timeout(Some(Duration::from_millis(100)));
-            let _ = std::io::Write::write_all(&mut s, b"dump-layout\n");
-            let mut buf = String::new();
-            if std::io::Read::read_to_string(&mut s, &mut buf).is_ok() && !buf.is_empty() {
+        let root: LayoutJson = if let Some(buf) = pipe_command(b"dump-layout\n") {
+            if !buf.is_empty() {
                 serde_json::from_str(&buf).unwrap_or(LayoutJson::Leaf { id: 0, rows: 0, cols: 0, cursor_row: 0, cursor_col: 0, active: true, copy_mode: false, scroll_offset: 0, content: Vec::new() })
             } else {
                 // Server closed connection or sent no data - exit
@@ -1856,28 +1820,19 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
             // Server connection failed - exit immediately
             break;
         };
-        
+
         // Fetch window list for status bar
-        let windows: Vec<WinStatus> = if let Ok(mut s) = std::net::TcpStream::connect(&addr) {
-            let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
-            let _ = std::io::Write::write_all(&mut s, b"list-windows\n");
-            let mut buf = String::new();
-            if std::io::Read::read_to_string(&mut s, &mut buf).is_ok() {
-                serde_json::from_str(&buf).unwrap_or_default()
-            } else {
-                Vec::new()
-            }
+        let windows: Vec<WinStatus> = if let Some(buf) = pipe_command(b"list-windows\n") {
+            serde_json::from_str(&buf).unwrap_or_default()
         } else {
             Vec::new()
         };
-        
+
         terminal.draw(|f| {
             let area = f.size();
             let chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Min(1), Constraint::Length(1)].as_ref()).split(area);
             // update server with client size
-            if let Ok(mut cs) = std::net::TcpStream::connect(addr.clone()) {
-                let _ = std::io::Write::write_all(&mut cs, format!("client-size {} {}\n", chunks[0].width, chunks[0].height).as_bytes());
-            }
+            pipe_send(format!("client-size {} {}\n", chunks[0].width, chunks[0].height).as_bytes());
 
             fn render_json(f: &mut Frame, node: &LayoutJson, area: Rect) {
                 match node {
@@ -2034,77 +1989,69 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                 else if prefix_armed {
                     // tmux-like prefix mappings
                     match key.code {
-                        KeyCode::Char('c') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"new-window\n"); } }
-                        KeyCode::Char('%') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"split-window -h\n"); } }
-                        KeyCode::Char('"') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"split-window -v\n"); } }
-                        KeyCode::Char('x') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"kill-pane\n"); } }
-                        KeyCode::Char('&') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"kill-window\n"); } }
-                        KeyCode::Char('z') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"zoom-pane\n"); } }
-                        KeyCode::Char('[') | KeyCode::Char('{') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"copy-enter\n"); } }
-                        KeyCode::Char('n') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"next-window\n"); } }
-                        KeyCode::Char('p') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"previous-window\n"); } }
-                        KeyCode::Char('o') => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"select-pane -t :.+\n"); } }
+                        KeyCode::Char('c') => { pipe_send(b"new-window\n"); }
+                        KeyCode::Char('%') => { pipe_send(b"split-window -h\n"); }
+                        KeyCode::Char('"') => { pipe_send(b"split-window -v\n"); }
+                        KeyCode::Char('x') => { pipe_send(b"kill-pane\n"); }
+                        KeyCode::Char('&') => { pipe_send(b"kill-window\n"); }
+                        KeyCode::Char('z') => { pipe_send(b"zoom-pane\n"); }
+                        KeyCode::Char('[') | KeyCode::Char('{') => { pipe_send(b"copy-enter\n"); }
+                        KeyCode::Char('n') => { pipe_send(b"next-window\n"); }
+                        KeyCode::Char('p') => { pipe_send(b"previous-window\n"); }
+                        KeyCode::Char('o') => { pipe_send(b"select-pane -t :.+\n"); }
                         // Arrow keys to switch panes
-                        KeyCode::Up => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"select-pane -U\n"); } }
-                        KeyCode::Down => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"select-pane -D\n"); } }
-                        KeyCode::Left => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"select-pane -L\n"); } }
-                        KeyCode::Right => { if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { let _ = std::io::Write::write_all(&mut s, b"select-pane -R\n"); } }
+                        KeyCode::Up => { pipe_send(b"select-pane -U\n"); }
+                        KeyCode::Down => { pipe_send(b"select-pane -D\n"); }
+                        KeyCode::Left => { pipe_send(b"select-pane -L\n"); }
+                        KeyCode::Right => { pipe_send(b"select-pane -R\n"); }
                         KeyCode::Char('d') => { quit = true; } // Detach
                         KeyCode::Char(',') => { renaming = true; rename_buf.clear(); }
                         KeyCode::Char('t') => { pane_renaming = true; pane_title_buf.clear(); }
-                        KeyCode::Char('w') => { 
-                            tree_chooser = true; 
-                            tree_entries.clear(); 
-                            tree_selected = 0; 
-                            if let Ok(mut s) = std::net::TcpStream::connect(addr.clone()) { 
-                                let _ = std::io::Write::write_all(&mut s, b"list-tree\n"); 
-                                let mut buf = String::new(); 
-                                let _ = std::io::Read::read_to_string(&mut s, &mut buf); 
-                                let infos: Vec<WinTree> = serde_json::from_str(&buf).unwrap_or(Vec::new()); 
-                                for wi in infos.into_iter() { 
-                                    tree_entries.push((true, wi.id, 0, wi.name)); 
-                                    for pi in wi.panes.into_iter() { 
-                                        tree_entries.push((false, wi.id, pi.id, pi.title)); 
-                                    } 
-                                } 
-                            } 
+                        KeyCode::Char('w') => {
+                            tree_chooser = true;
+                            tree_entries.clear();
+                            tree_selected = 0;
+                            if let Some(buf) = pipe_command(b"list-tree\n") {
+                                let infos: Vec<WinTree> = serde_json::from_str(&buf).unwrap_or(Vec::new());
+                                for wi in infos.into_iter() {
+                                    tree_entries.push((true, wi.id, 0, wi.name));
+                                    for pi in wi.panes.into_iter() {
+                                        tree_entries.push((false, wi.id, pi.id, pi.title));
+                                    }
+                                }
+                            }
                         }
                         KeyCode::Char('s') => {
-                            // Session chooser - list all available sessions
+                            // Session chooser - list all available sessions from sessions registry
                             session_chooser = true;
                             session_entries.clear();
                             session_selected = 0;
-                            let dir = format!("{}\\.psmux", home);
-                            if let Ok(entries) = std::fs::read_dir(&dir) {
-                                for e in entries.flatten() {
-                                    if let Some(fname) = e.file_name().to_str() {
-                                        if let Some((base, ext)) = fname.rsplit_once('.') {
-                                            if ext == "port" {
-                                                if let Ok(port_str) = std::fs::read_to_string(e.path()) {
-                                                    if let Ok(p) = port_str.trim().parse::<u16>() {
-                                                        let sess_addr = format!("127.0.0.1:{}", p);
-                                                        // Try to get session info quickly
-                                                        let info = if let Ok(mut ss) = std::net::TcpStream::connect_timeout(
-                                                            &sess_addr.parse().unwrap(),
-                                                            Duration::from_millis(25)
-                                                        ) {
-                                                            let _ = ss.set_read_timeout(Some(Duration::from_millis(25)));
-                                                            let _ = std::io::Write::write_all(&mut ss, b"session-info\n");
-                                                            let mut br = std::io::BufReader::new(ss);
-                                                            let mut line = String::new();
-                                                            if br.read_line(&mut line).is_ok() && !line.trim().is_empty() {
-                                                                line.trim().to_string()
-                                                            } else {
-                                                                format!("{}: (no info)", base)
-                                                            }
-                                                        } else {
-                                                            format!("{}: (not responding)", base)
-                                                        };
-                                                        session_entries.push((base.to_string(), info));
-                                                    }
+                            let sessions_file = format!("{}\\.psmux\\sessions", home);
+                            if let Ok(content) = std::fs::read_to_string(&sessions_file) {
+                                for sess_name in content.lines() {
+                                    let sess_name = sess_name.trim();
+                                    if sess_name.is_empty() { continue; }
+                                    // Check if session exists by trying to connect
+                                    if pipe_exists(sess_name) {
+                                        // Try to get session info
+                                        let info = if let Ok(pipe) = connect_to_pipe(sess_name, 50) {
+                                            let _ = pipe_write(pipe, b"session-info\n");
+                                            let mut buf = [0u8; 4096];
+                                            let result = if let Ok(n) = pipe_read(pipe, &mut buf) {
+                                                if n > 0 {
+                                                    String::from_utf8_lossy(&buf[..n]).trim().to_string()
+                                                } else {
+                                                    format!("{}: (no info)", sess_name)
                                                 }
-                                            }
-                                        }
+                                            } else {
+                                                format!("{}: (no info)", sess_name)
+                                            };
+                                            close_pipe(pipe);
+                                            result
+                                        } else {
+                                            format!("{}: (not responding)", sess_name)
+                                        };
+                                        session_entries.push((sess_name.to_string(), info));
                                     }
                                 }
                             }
@@ -2121,8 +2068,8 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                             }
                         }
                         KeyCode::Char('q') => { chooser = true; }
-                        KeyCode::Char('v') => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"copy-anchor\n"); } }
-                        KeyCode::Char('y') => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"copy-yank\n"); } }
+                        KeyCode::Char('v') => { pipe_send(b"copy-anchor\n"); }
+                        KeyCode::Char('y') => { pipe_send(b"copy-yank\n"); }
                         _ => {}
                     }
                     prefix_armed = false;
@@ -2136,8 +2083,8 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                                 if sname != &current_session {
                                     // Switch to selected session
                                     // First, detach from current session
-                                    let _ = std::net::TcpStream::connect(addr.clone()).and_then(|mut s| { let _ = std::io::Write::write_all(&mut s, b"client-detach\n"); Ok(()) });
-                                    
+                                    pipe_send(b"client-detach\n");
+
                                     // Store the target session name for re-attach after exiting this loop
                                     env::set_var("PSMUX_SWITCH_TO", sname);
                                     quit = true;
@@ -2149,69 +2096,59 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
                         // Tree chooser handling
                         KeyCode::Up if tree_chooser => { if tree_selected>0 { tree_selected-=1; } }
                         KeyCode::Down if tree_chooser => { if tree_selected+1 < tree_entries.len() { tree_selected+=1; } }
-                        KeyCode::Enter if tree_chooser => { if let Some((is_win, wid, pid, _)) = tree_entries.get(tree_selected) { if let Some(mut s) = try_connect() { if *is_win { let _ = std::io::Write::write_all(&mut s, format!("focus-window {}\n", wid).as_bytes()); } else { let _ = std::io::Write::write_all(&mut s, format!("focus-pane {}\n", pid).as_bytes()); } } tree_chooser=false; } }
+                        KeyCode::Enter if tree_chooser => { if let Some((is_win, wid, pid, _)) = tree_entries.get(tree_selected) { if *is_win { pipe_send(format!("focus-window {}\n", wid).as_bytes()); } else { pipe_send(format!("focus-pane {}\n", pid).as_bytes()); } tree_chooser=false; } }
                         KeyCode::Esc if tree_chooser => { tree_chooser=false; }
                         KeyCode::Char(c) if renaming && !key.modifiers.contains(KeyModifiers::CONTROL) => { rename_buf.push(c); }
                         KeyCode::Char(c) if pane_renaming && !key.modifiers.contains(KeyModifiers::CONTROL) => { pane_title_buf.push(c); }
                         KeyCode::Backspace if renaming => { let _ = rename_buf.pop(); }
                         KeyCode::Backspace if pane_renaming => { let _ = pane_title_buf.pop(); }
-                        KeyCode::Enter if renaming => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, format!("rename-window {}\n", rename_buf).as_bytes()); } renaming=false; }
-                        KeyCode::Enter if pane_renaming => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, format!("set-pane-title {}\n", pane_title_buf).as_bytes()); } pane_renaming=false; }
+                        KeyCode::Enter if renaming => { pipe_send(format!("rename-window {}\n", rename_buf).as_bytes()); renaming=false; }
+                        KeyCode::Enter if pane_renaming => { pipe_send(format!("set-pane-title {}\n", pane_title_buf).as_bytes()); pane_renaming=false; }
                         KeyCode::Esc if renaming => { renaming=false; }
                         KeyCode::Esc if pane_renaming => { pane_renaming=false; }
                         KeyCode::Char(d) if chooser && d.is_ascii_digit() => {
                             let raw = d.to_digit(10).unwrap() as usize;
                             let choice = if raw==0 {10} else {raw};
-                            if let Some((_,pid)) = choices.iter().find(|(n,_)| *n==choice) { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, format!("focus-pane {}\n", pid).as_bytes()); } chooser=false; }
+                            if let Some((_,pid)) = choices.iter().find(|(n,_)| *n==choice) { pipe_send(format!("focus-pane {}\n", pid).as_bytes()); chooser=false; }
                         }
                         KeyCode::Esc if chooser => { chooser=false; }
                         KeyCode::Char(' ') => {
                             // Space needs special handling - send as key not text
-                            if let Some(mut s) = try_connect() {
-                                let _ = std::io::Write::write_all(&mut s, b"send-key space\n");
-                            }
+                            pipe_send(b"send-key space\n");
                         }
                         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             // Send control character (Ctrl+C = 0x03, Ctrl+D = 0x04, etc.)
-                            let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
-                            if let Some(mut s) = try_connect() {
-                                let _ = std::io::Write::write_all(&mut s, format!("send-key C-{}\n", c).as_bytes());
-                            }
+                            let _ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
+                            pipe_send(format!("send-key C-{}\n", c).as_bytes());
                         }
                         KeyCode::Char(c) => {
-                            if let Some(mut s) = try_connect() {
-                                let _ = std::io::Write::write_all(&mut s, format!("send-text {}\n", c).as_bytes());
-                            }
+                            pipe_send(format!("send-text {}\n", c).as_bytes());
                         }
-                        KeyCode::Enter => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key enter\n"); } }
-                        KeyCode::Tab => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key tab\n"); } }
-                        KeyCode::Backspace => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key backspace\n"); } }
-                        KeyCode::Esc => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key esc\n"); } }
-                        KeyCode::Left => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key left\n"); } }
-                        KeyCode::Right => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key right\n"); } }
-                        KeyCode::Up => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key up\n"); } }
-                        KeyCode::Down => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key down\n"); } }
-                        KeyCode::PageUp => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key pageup\n"); } }
-                        KeyCode::PageDown => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"send-key pagedown\n"); } }
+                        KeyCode::Enter => { pipe_send(b"send-key enter\n"); }
+                        KeyCode::Tab => { pipe_send(b"send-key tab\n"); }
+                        KeyCode::Backspace => { pipe_send(b"send-key backspace\n"); }
+                        KeyCode::Esc => { pipe_send(b"send-key esc\n"); }
+                        KeyCode::Left => { pipe_send(b"send-key left\n"); }
+                        KeyCode::Right => { pipe_send(b"send-key right\n"); }
+                        KeyCode::Up => { pipe_send(b"send-key up\n"); }
+                        KeyCode::Down => { pipe_send(b"send-key down\n"); }
+                        KeyCode::PageUp => { pipe_send(b"send-key pageup\n"); }
+                        KeyCode::PageDown => { pipe_send(b"send-key pagedown\n"); }
                         _ => {}
                     }
                 }
             } Event::Paste(data) => {
                 // Bracketed paste - send all pasted text at once for fast pasting
-                if let Some(mut s) = try_connect() {
-                    // Base64 encode to safely transmit any characters
-                    use std::io::Write as _;
-                    let encoded = base64_encode(&data);
-                    let _ = s.write_all(format!("send-paste {}\n", encoded).as_bytes());
-                }
+                let encoded = base64_encode(&data);
+                pipe_send(format!("send-paste {}\n", encoded).as_bytes());
             } Event::Mouse(me) => {
                 use crossterm::event::{MouseEventKind,MouseButton};
                 match me.kind {
-                    MouseEventKind::Down(MouseButton::Left) => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, format!("mouse-down {} {}\n", me.column, me.row).as_bytes()); } }
-                    MouseEventKind::Drag(MouseButton::Left) => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, format!("mouse-drag {} {}\n", me.column, me.row).as_bytes()); } }
-                    MouseEventKind::Up(MouseButton::Left) => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, format!("mouse-up {} {}\n", me.column, me.row).as_bytes()); } }
-                    MouseEventKind::ScrollUp => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"scroll-up\n"); } }
-                    MouseEventKind::ScrollDown => { if let Some(mut s) = try_connect() { let _ = std::io::Write::write_all(&mut s, b"scroll-down\n"); } }
+                    MouseEventKind::Down(MouseButton::Left) => { pipe_send(format!("mouse-down {} {}\n", me.column, me.row).as_bytes()); }
+                    MouseEventKind::Drag(MouseButton::Left) => { pipe_send(format!("mouse-drag {} {}\n", me.column, me.row).as_bytes()); }
+                    MouseEventKind::Up(MouseButton::Left) => { pipe_send(format!("mouse-up {} {}\n", me.column, me.row).as_bytes()); }
+                    MouseEventKind::ScrollUp => { pipe_send(b"scroll-up\n"); }
+                    MouseEventKind::ScrollDown => { pipe_send(b"scroll-down\n"); }
                     _ => {}
                 }
             } _ => {} }
@@ -2219,43 +2156,323 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
         if reap_children_placeholder()? { /* no-op */ }
         if quit { break; }
     }
-    let _ = std::net::TcpStream::connect(addr).and_then(|mut s| { std::io::Write::write_all(&mut s, b"client-detach\n"); Ok(()) });
+    pipe_send(b"client-detach\n");
     Ok(())
 }
 
 fn reap_children_placeholder() -> io::Result<bool> { Ok(false) }
 
-fn send_control(line: String) -> io::Result<()> {
+// ===== Named Pipe Security and Connection Helpers =====
+
+use windows::Win32::Foundation::{HANDLE, CloseHandle, GENERIC_READ, GENERIC_WRITE, GENERIC_ALL, GetLastError, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE};
+use windows::Win32::Security::{
+    GetTokenInformation, TokenUser, TOKEN_USER, TOKEN_QUERY,
+    SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR, ACL,
+    InitializeSecurityDescriptor, SetSecurityDescriptorDacl,
+    InitializeAcl, AddAccessAllowedAce, GetLengthSid,
+    ACL_REVISION, ACCESS_ALLOWED_ACE,
+};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
+use windows::Win32::System::Pipes::{
+    CreateNamedPipeW, ConnectNamedPipe, DisconnectNamedPipe, WaitNamedPipeW,
+    PIPE_TYPE_BYTE, PIPE_READMODE_BYTE, PIPE_WAIT, PIPE_UNLIMITED_INSTANCES,
+};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, ReadFile, WriteFile, FlushFileBuffers,
+    FILE_SHARE_NONE, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+    PIPE_ACCESS_DUPLEX,
+};
+use windows::core::PCWSTR;
+
+/// Holds security descriptor and associated buffers that must stay alive
+struct PipeSecurityDescriptor {
+    _sd_buffer: Vec<u8>,
+    _acl_buffer: Vec<u8>,
+    _token_user_buffer: Vec<u8>,
+    sa: SECURITY_ATTRIBUTES,
+}
+
+/// Create a security descriptor that only allows the current user
+fn create_user_only_security_descriptor() -> io::Result<PipeSecurityDescriptor> {
+    unsafe {
+        // Get current process token
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("OpenProcessToken failed: {}", e)))?;
+
+        // Get token user information size
+        let mut token_user_size = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut token_user_size);
+
+        // Allocate and get token user
+        let mut token_user_buffer = vec![0u8; token_user_size as usize];
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(token_user_buffer.as_mut_ptr() as *mut _),
+            token_user_size,
+            &mut token_user_size,
+        ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("GetTokenInformation failed: {}", e)))?;
+
+        let _ = CloseHandle(token);
+
+        let token_user = &*(token_user_buffer.as_ptr() as *const TOKEN_USER);
+        let user_sid = token_user.User.Sid;
+
+        // Calculate ACL size
+        let sid_length = GetLengthSid(user_sid);
+        let acl_size = std::mem::size_of::<ACL>() + std::mem::size_of::<ACCESS_ALLOWED_ACE>() + sid_length as usize - std::mem::size_of::<u32>();
+        let mut acl_buffer = vec![0u8; acl_size];
+
+        // Initialize ACL
+        InitializeAcl(
+            acl_buffer.as_mut_ptr() as *mut ACL,
+            acl_size as u32,
+            ACL_REVISION,
+        ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("InitializeAcl failed: {}", e)))?;
+
+        // Add access allowed ACE for current user with full access
+        AddAccessAllowedAce(
+            acl_buffer.as_mut_ptr() as *mut ACL,
+            ACL_REVISION,
+            GENERIC_ALL.0,
+            user_sid,
+        ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("AddAccessAllowedAce failed: {}", e)))?;
+
+        // Initialize security descriptor
+        let mut sd_buffer = vec![0u8; std::mem::size_of::<windows::Win32::Security::SECURITY_DESCRIPTOR>()];
+        InitializeSecurityDescriptor(
+            PSECURITY_DESCRIPTOR(sd_buffer.as_mut_ptr() as *mut _),
+            SECURITY_DESCRIPTOR_REVISION,
+        ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("InitializeSecurityDescriptor failed: {}", e)))?;
+
+        // Set DACL on security descriptor
+        SetSecurityDescriptorDacl(
+            PSECURITY_DESCRIPTOR(sd_buffer.as_mut_ptr() as *mut _),
+            true,
+            Some(acl_buffer.as_ptr() as *const ACL),
+            false,
+        ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("SetSecurityDescriptorDacl failed: {}", e)))?;
+
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd_buffer.as_mut_ptr() as *mut _,
+            bInheritHandle: false.into(),
+        };
+
+        Ok(PipeSecurityDescriptor {
+            _sd_buffer: sd_buffer,
+            _acl_buffer: acl_buffer,
+            _token_user_buffer: token_user_buffer,
+            sa,
+        })
+    }
+}
+
+/// Create a named pipe server with security restrictions
+fn create_named_pipe_server(session_name: &str) -> io::Result<HANDLE> {
+    let pipe_name = format!("\\\\.\\pipe\\psmux-{}", session_name);
+    let wide_name: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut security = create_user_only_security_descriptor()?;
+
+    unsafe {
+        let handle = CreateNamedPipeW(
+            PCWSTR(wide_name.as_ptr()),
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES,
+            4096,
+            4096,
+            0,
+            Some(&mut security.sa),
+        );
+
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+
+        // Keep security descriptor alive by leaking it (pipe takes ownership conceptually)
+        std::mem::forget(security);
+
+        Ok(handle)
+    }
+}
+
+/// Wait for a client to connect to the pipe
+fn wait_for_pipe_connection(pipe: HANDLE) -> io::Result<()> {
+    unsafe {
+        let result = ConnectNamedPipe(pipe, None);
+        if result.is_err() {
+            let err = GetLastError();
+            if err == ERROR_PIPE_CONNECTED {
+                // Client connected between CreateNamedPipe and ConnectNamedPipe - that's OK
+                return Ok(());
+            }
+            return Err(io::Error::from_raw_os_error(err.0 as i32));
+        }
+        Ok(())
+    }
+}
+
+/// Disconnect client and prepare pipe for next connection
+fn disconnect_pipe(pipe: HANDLE) {
+    unsafe {
+        let _ = DisconnectNamedPipe(pipe);
+    }
+}
+
+/// Connect to a named pipe as a client
+fn connect_to_pipe(session_name: &str, timeout_ms: u32) -> io::Result<HANDLE> {
+    let pipe_name = format!("\\\\.\\pipe\\psmux-{}", session_name);
+    let wide_name: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
+
+    unsafe {
+        // Wait for pipe to be available
+        if !WaitNamedPipeW(PCWSTR(wide_name.as_ptr()), timeout_ms).as_bool() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "pipe not available"));
+        }
+
+        // Open the pipe
+        let handle = CreateFileW(
+            PCWSTR(wide_name.as_ptr()),
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            FILE_SHARE_NONE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("CreateFileW failed: {}", e)))?;
+
+        Ok(handle)
+    }
+}
+
+/// Check if a session's pipe exists
+fn pipe_exists(session_name: &str) -> bool {
+    let pipe_name = format!("\\\\.\\pipe\\psmux-{}", session_name);
+    let wide_name: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
+
+    unsafe {
+        // Try to open briefly
+        match CreateFileW(
+            PCWSTR(wide_name.as_ptr()),
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            FILE_SHARE_NONE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        ) {
+            Ok(handle) => {
+                let _ = CloseHandle(handle);
+                true
+            }
+            Err(_) => {
+                // ERROR_PIPE_BUSY means pipe exists but all instances in use
+                GetLastError() == ERROR_PIPE_BUSY
+            }
+        }
+    }
+}
+
+/// Write data to pipe and optionally read response
+fn pipe_write(pipe: HANDLE, data: &[u8]) -> io::Result<()> {
+    unsafe {
+        let mut written = 0u32;
+        WriteFile(pipe, Some(data), Some(&mut written), None)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("WriteFile failed: {}", e)))?;
+        let _ = FlushFileBuffers(pipe);
+        Ok(())
+    }
+}
+
+/// Read data from pipe
+fn pipe_read(pipe: HANDLE, buf: &mut [u8]) -> io::Result<usize> {
+    unsafe {
+        let mut read = 0u32;
+        match ReadFile(pipe, Some(buf), Some(&mut read), None) {
+            Ok(()) => Ok(read as usize),
+            Err(e) => {
+                // Check if it's just end of data
+                let err = GetLastError();
+                if err.0 == 109 { // ERROR_BROKEN_PIPE
+                    Ok(0)
+                } else {
+                    Err(io::Error::new(io::ErrorKind::Other, format!("ReadFile failed: {}", e)))
+                }
+            }
+        }
+    }
+}
+
+/// Close a pipe handle
+fn close_pipe(pipe: HANDLE) {
+    unsafe {
+        let _ = CloseHandle(pipe);
+    }
+}
+
+/// Register a session in the sessions registry
+fn register_session(name: &str) -> io::Result<()> {
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+    let dir = format!("{}\\.psmux", home);
+    let _ = std::fs::create_dir_all(&dir);
+    let sessions_file = format!("{}\\sessions", dir);
+
+    // Read existing sessions
+    let mut sessions: std::collections::HashSet<String> = std::fs::read_to_string(&sessions_file)
+        .unwrap_or_default()
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    sessions.insert(name.to_string());
+
+    // Write back
+    std::fs::write(&sessions_file, sessions.into_iter().collect::<Vec<_>>().join("\n"))
+}
+
+/// Unregister a session from the sessions registry
+fn unregister_session(name: &str) {
+    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+    let sessions_file = format!("{}\\.psmux\\sessions", home);
+
+    if let Ok(content) = std::fs::read_to_string(&sessions_file) {
+        let sessions: Vec<&str> = content.lines()
+            .filter(|s| s.trim() != name && !s.trim().is_empty())
+            .collect();
+        let _ = std::fs::write(&sessions_file, sessions.join("\n"));
+    }
+}
+
+// ===== End Named Pipe Helpers =====
+
+fn send_control(line: String) -> io::Result<()> {
     let target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
-    let path = format!("{}\\.psmux\\{}.port", home, target);
-    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no session"))?;
-    let addr = format!("127.0.0.1:{}", port);
-    let mut stream = std::net::TcpStream::connect(addr)?;
-    let _ = write!(stream, "{}", line);
+    let pipe = connect_to_pipe(&target, 1000)?;
+    pipe_write(pipe, line.as_bytes())?;
+    close_pipe(pipe);
     Ok(())
 }
 
 fn send_control_with_response(line: String) -> io::Result<String> {
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
-    let path = format!("{}\\.psmux\\{}.port", home, target);
-    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no session"))?;
-    let addr = format!("127.0.0.1:{}", port);
-    let mut stream = std::net::TcpStream::connect(&addr)?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
-    let _ = write!(stream, "{}", line);
-    let _ = stream.flush();
+    let pipe = connect_to_pipe(&target, 2000)?;
+    pipe_write(pipe, line.as_bytes())?;
+
     let mut buf = Vec::new();
     let mut temp = [0u8; 4096];
     loop {
-        match std::io::Read::read(&mut stream, &mut temp) {
+        match pipe_read(pipe, &mut temp) {
             Ok(0) => break,
             Ok(n) => buf.extend_from_slice(&temp[..n]),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => break,
             Err(_) => break,
         }
     }
+    close_pipe(pipe);
     Ok(String::from_utf8_lossy(&buf).to_string())
 }
 
@@ -2282,7 +2499,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
         display_map: Vec::new(),
         binds: Vec::new(),
         control_rx: None,
-        control_port: None,
         session_name: env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string()),
         attached_clients: 1,
         created_at: Local::now(),
@@ -2303,70 +2519,84 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
 
     let (tx, rx) = mpsc::channel::<CtrlReq>();
     app.control_rx = Some(rx);
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
-    let port = listener.local_addr()?.port();
-    app.control_port = Some(port);
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let dir = format!("{}\\.psmux", home);
-    let _ = std::fs::create_dir_all(&dir);
-    let regpath = format!("{}\\{}.port", dir, app.session_name);
-    let _ = std::fs::write(&regpath, port.to_string());
+
+    // Create named pipe server with user-only security
+    let session_name_for_pipe = app.session_name.clone();
+    let _ = register_session(&app.session_name);
+
     thread::spawn(move || {
-        for conn in listener.incoming() {
-            if let Ok(mut stream) = conn {
-                let mut line = String::new();
-                let mut r = io::BufReader::new(stream.try_clone().unwrap());
-                let _ = r.read_line(&mut line);
-                let mut parts = line.split_whitespace();
-                let cmd = parts.next().unwrap_or("");
-                // parse optional target specifier
-                let mut args: Vec<&str> = parts.by_ref().collect();
-                let mut target_win: Option<usize> = None;
-                let mut target_pane: Option<usize> = None;
-                let mut start_line: Option<u16> = None;
-                let mut end_line: Option<u16> = None;
-                let mut i = 0;
-                while i < args.len() {
-                    if args[i] == "-t" {
-                        if let Some(v) = args.get(i+1) {
-                            if v.starts_with('%') { if let Ok(pid) = v[1..].parse::<usize>() { target_pane = Some(pid); } }
-                            else if v.starts_with('@') { if let Ok(wid) = v[1..].parse::<usize>() { target_win = Some(wid); } }
-                        }
-                        i += 2; continue;
-                    } else if args[i] == "-S" {
-                        if let Some(v) = args.get(i+1) { if let Ok(n) = v.parse::<u16>() { start_line = Some(n); } }
-                        i += 2; continue;
-                    } else if args[i] == "-E" {
-                        if let Some(v) = args.get(i+1) { if let Ok(n) = v.parse::<u16>() { end_line = Some(n); } }
-                        i += 2; continue;
-                    }
-                    i += 1;
-                }
-                if let Some(wid) = target_win { let _ = tx.send(CtrlReq::FocusWindow(wid)); }
-                if let Some(pid) = target_pane { let _ = tx.send(CtrlReq::FocusPane(pid)); }
-                match cmd {
-                    "new-window" => { let _ = tx.send(CtrlReq::NewWindow); }
-                    "split-window" => {
-                        let kind = if args.iter().any(|a| *a == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
-                        let _ = tx.send(CtrlReq::SplitWindow(kind));
-                    }
-                    "kill-pane" => { let _ = tx.send(CtrlReq::KillPane); }
-                    "capture-pane" => {
-                        let (rtx, rrx) = mpsc::channel::<String>();
-                        if start_line.is_some() || end_line.is_some() { let _ = tx.send(CtrlReq::CapturePaneRange(rtx, start_line, end_line)); }
-                        else { let _ = tx.send(CtrlReq::CapturePane(rtx)); }
-                        if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); }
-                    }
-                    "client-attach" => { let _ = tx.send(CtrlReq::ClientAttach); let _ = write!(stream, "ok\n"); }
-                    "client-detach" => { let _ = tx.send(CtrlReq::ClientDetach); let _ = write!(stream, "ok\n"); }
-                    "session-info" => {
-                        let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::SessionInfo(rtx));
-                        if let Ok(line) = rrx.recv() { let _ = write!(stream, "{}", line); let _ = stream.flush(); }
-                    }
-                    _ => {}
-                }
+        loop {
+            // Create a new pipe instance for each connection
+            let pipe = match create_named_pipe_server(&session_name_for_pipe) {
+                Ok(p) => p,
+                Err(_) => { thread::sleep(Duration::from_millis(100)); continue; }
+            };
+
+            // Wait for client connection
+            if wait_for_pipe_connection(pipe).is_err() {
+                close_pipe(pipe);
+                continue;
             }
+
+            // Read command from pipe
+            let mut buf = [0u8; 4096];
+            let n = match pipe_read(pipe, &mut buf) {
+                Ok(n) if n > 0 => n,
+                _ => { disconnect_pipe(pipe); close_pipe(pipe); continue; }
+            };
+
+            let line = String::from_utf8_lossy(&buf[..n]).to_string();
+            let mut parts = line.split_whitespace();
+            let cmd = parts.next().unwrap_or("");
+            // parse optional target specifier
+            let args: Vec<&str> = parts.by_ref().collect();
+            let mut target_win: Option<usize> = None;
+            let mut target_pane: Option<usize> = None;
+            let mut start_line: Option<u16> = None;
+            let mut end_line: Option<u16> = None;
+            let mut i = 0;
+            while i < args.len() {
+                if args[i] == "-t" {
+                    if let Some(v) = args.get(i+1) {
+                        if v.starts_with('%') { if let Ok(pid) = v[1..].parse::<usize>() { target_pane = Some(pid); } }
+                        else if v.starts_with('@') { if let Ok(wid) = v[1..].parse::<usize>() { target_win = Some(wid); } }
+                    }
+                    i += 2; continue;
+                } else if args[i] == "-S" {
+                    if let Some(v) = args.get(i+1) { if let Ok(n) = v.parse::<u16>() { start_line = Some(n); } }
+                    i += 2; continue;
+                } else if args[i] == "-E" {
+                    if let Some(v) = args.get(i+1) { if let Ok(n) = v.parse::<u16>() { end_line = Some(n); } }
+                    i += 2; continue;
+                }
+                i += 1;
+            }
+            if let Some(wid) = target_win { let _ = tx.send(CtrlReq::FocusWindow(wid)); }
+            if let Some(pid) = target_pane { let _ = tx.send(CtrlReq::FocusPane(pid)); }
+            match cmd {
+                "new-window" => { let _ = tx.send(CtrlReq::NewWindow); }
+                "split-window" => {
+                    let kind = if args.iter().any(|a| *a == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
+                    let _ = tx.send(CtrlReq::SplitWindow(kind));
+                }
+                "kill-pane" => { let _ = tx.send(CtrlReq::KillPane); }
+                "capture-pane" => {
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    if start_line.is_some() || end_line.is_some() { let _ = tx.send(CtrlReq::CapturePaneRange(rtx, start_line, end_line)); }
+                    else { let _ = tx.send(CtrlReq::CapturePane(rtx)); }
+                    if let Ok(text) = rrx.recv() { let _ = pipe_write(pipe, text.as_bytes()); }
+                }
+                "client-attach" => { let _ = tx.send(CtrlReq::ClientAttach); let _ = pipe_write(pipe, b"ok\n"); }
+                "client-detach" => { let _ = tx.send(CtrlReq::ClientDetach); let _ = pipe_write(pipe, b"ok\n"); }
+                "session-info" => {
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::SessionInfo(rtx));
+                    if let Ok(line) = rrx.recv() { let _ = pipe_write(pipe, line.as_bytes()); }
+                }
+                _ => {}
+            }
+            disconnect_pipe(pipe);
+            close_pipe(pipe);
         }
     });
 
@@ -3298,16 +3528,12 @@ fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
     
     match parts[0] {
         "new-window" | "neww" => {
-            // Would need pty_system - use control channel instead
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "new-window\n");
-            }
+            // Send via named pipe to server's control channel
+            let _ = send_control_to_session(&app.session_name, "new-window\n");
         }
         "split-window" | "splitw" => {
             let flag = if parts.iter().any(|p| *p == "-h") { "-h" } else { "-v" };
-            if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("split-window {}\n", flag));
-            }
+            let _ = send_control_to_session(&app.session_name, &format!("split-window {}\n", flag));
         }
         "kill-pane" => {
             let _ = kill_active_pane(app);
@@ -3419,11 +3645,11 @@ fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Send a control message to a specific port
-fn send_control_to_port(port: u16, msg: &str) -> io::Result<()> {
-    let addr = format!("127.0.0.1:{}", port);
-    if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
-        let _ = stream.write_all(msg.as_bytes());
+/// Send a control message to a specific session via named pipe
+fn send_control_to_session(session_name: &str, msg: &str) -> io::Result<()> {
+    if let Ok(pipe) = connect_to_pipe(session_name, 500) {
+        let _ = pipe_write(pipe, msg.as_bytes());
+        close_pipe(pipe);
     }
     Ok(())
 }
@@ -4731,7 +4957,6 @@ fn run_server(session_name: String) -> io::Result<()> {
         display_map: Vec::new(),
         binds: Vec::new(),
         control_rx: None,
-        control_port: None,
         session_name,
         attached_clients: 0,
         created_at: Local::now(),
@@ -4748,421 +4973,435 @@ fn run_server(session_name: String) -> io::Result<()> {
     create_window(&*pty_system, &mut app)?;
     let (tx, rx) = mpsc::channel::<CtrlReq>();
     app.control_rx = Some(rx);
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
-    let port = listener.local_addr()?.port();
-    app.control_port = Some(port);
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let dir = format!("{}\\.psmux", home);
-    let _ = std::fs::create_dir_all(&dir);
-    let regpath = format!("{}\\{}.port", dir, app.session_name);
-    let _ = std::fs::write(&regpath, port.to_string());
+
+    // Create named pipe server with user-only security
+    let session_name_for_pipe = app.session_name.clone();
+    let _ = register_session(&app.session_name);
+
     thread::spawn(move || {
-        for conn in listener.incoming() {
-            if let Ok(mut stream) = conn {
-                let mut line = String::new();
-                let mut r = io::BufReader::new(stream.try_clone().unwrap());
-                let _ = r.read_line(&mut line);
-                let mut parts = line.split_whitespace();
-                let cmd = parts.next().unwrap_or("");
-                let mut args: Vec<&str> = parts.by_ref().collect();
-                let mut target_win: Option<usize> = None;
-                let mut target_pane: Option<usize> = None;
-                let mut i = 0;
-                while i < args.len() {
-                    if args[i] == "-t" {
-                        if let Some(v) = args.get(i+1) {
-                            if v.starts_with('%') { if let Ok(pid) = v[1..].parse::<usize>() { target_pane = Some(pid); } }
-                            else if v.starts_with('@') { if let Ok(wid) = v[1..].parse::<usize>() { target_win = Some(wid); } }
-                        }
-                        i += 2; continue;
-                    }
-                    i += 1;
-                }
-                if let Some(wid) = target_win { let _ = tx.send(CtrlReq::FocusWindow(wid)); }
-                if let Some(pid) = target_pane { let _ = tx.send(CtrlReq::FocusPane(pid)); }
-                match cmd {
-                    "new-window" => { let _ = tx.send(CtrlReq::NewWindow); }
-                    "split-window" => {
-                        let kind = if args.iter().any(|a| *a == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
-                        let _ = tx.send(CtrlReq::SplitWindow(kind));
-                    }
-                    "kill-pane" => { let _ = tx.send(CtrlReq::KillPane); }
-                    "capture-pane" => {
-                        let print_stdout = args.iter().any(|a| *a == "-p");
-                        let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::CapturePane(rtx));
-                        if let Ok(text) = rrx.recv() {
-                            if print_stdout {
-                                let _ = write!(stream, "{}", text);
-                            } else {
-                                // Save to buffer instead
-                                let _ = tx.send(CtrlReq::SetBuffer(text));
-                            }
-                        }
-                    }
-                    "dump-layout" => {
-                        let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::DumpLayout(rtx));
-                        if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); }
-                    }
-                    "send-text" => {
-                        if let Some(payload) = args.get(0) { let _ = tx.send(CtrlReq::SendText(payload.to_string())); }
-                    }
-                    "send-paste" => {
-                        // Bracketed paste - decode base64 and send all at once
-                        if let Some(encoded) = args.get(0) {
-                            if let Some(decoded) = base64_decode(encoded) {
-                                let _ = tx.send(CtrlReq::SendPaste(decoded));
-                            }
-                        }
-                    }
-                    "send-key" => {
-                        if let Some(payload) = args.get(0) { let _ = tx.send(CtrlReq::SendKey(payload.to_string())); }
-                    }
-                    "zoom-pane" => { let _ = tx.send(CtrlReq::ZoomPane); }
-                    "copy-enter" => { let _ = tx.send(CtrlReq::CopyEnter); }
-                    "copy-move" => {
-                        if args.len() >= 2 { if let (Ok(dx), Ok(dy)) = (args[0].parse::<i16>(), args[1].parse::<i16>()) { let _ = tx.send(CtrlReq::CopyMove(dx, dy)); } }
-                    }
-                    "copy-anchor" => { let _ = tx.send(CtrlReq::CopyAnchor); }
-                    "copy-yank" => { let _ = tx.send(CtrlReq::CopyYank); }
-                    "client-size" => {
-                        if args.len() >= 2 { if let (Ok(w), Ok(h)) = (args[0].parse::<u16>(), args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::ClientSize(w, h)); } }
-                    }
-                    "focus-pane" => {
-                        if let Some(pid) = args.get(0).and_then(|s| s.parse::<usize>().ok()) { let _ = tx.send(CtrlReq::FocusPaneCmd(pid)); }
-                    }
-                    "focus-window" => {
-                        if let Some(wid) = args.get(0).and_then(|s| s.parse::<usize>().ok()) { let _ = tx.send(CtrlReq::FocusWindowCmd(wid)); }
-                    }
-                    "mouse-down" => {
-                        if args.len()>=2 { if let (Ok(x),Ok(y))=(args[0].parse::<u16>(),args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::MouseDown(x,y)); } }
-                    }
-                    "mouse-drag" => {
-                        if args.len()>=2 { if let (Ok(x),Ok(y))=(args[0].parse::<u16>(),args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::MouseDrag(x,y)); } }
-                    }
-                    "mouse-up" => {
-                        if args.len()>=2 { if let (Ok(x),Ok(y))=(args[0].parse::<u16>(),args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::MouseUp(x,y)); } }
-                    }
-                    "scroll-up" => { let _ = tx.send(CtrlReq::ScrollUp); }
-                    "scroll-down" => { let _ = tx.send(CtrlReq::ScrollDown); }
-                    "next-window" => { let _ = tx.send(CtrlReq::NextWindow); }
-                    "previous-window" => { let _ = tx.send(CtrlReq::PrevWindow); }
-                    "rename-window" => { if let Some(name) = args.get(0) { let _ = tx.send(CtrlReq::RenameWindow((*name).to_string())); } }
-                    "list-windows" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListWindows(rtx)); if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); } }
-                    "list-tree" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListTree(rtx)); if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); } }
-                    "toggle-sync" => { let _ = tx.send(CtrlReq::ToggleSync); }
-                    "set-pane-title" => { let title = args.join(" "); let _ = tx.send(CtrlReq::SetPaneTitle(title)); }
-                    // New tmux-compatible commands
-                    "send-keys" => {
-                        let literal = args.iter().any(|a| *a == "-l");
-                        let keys: Vec<&str> = args.iter().filter(|a| !a.starts_with('-') && **a != "-l" && **a != "-t").copied().collect();
-                        let _ = tx.send(CtrlReq::SendKeys(keys.join(" "), literal));
-                    }
-                    "select-pane" => {
-                        let dir = if args.iter().any(|a| *a == "-U") { "U" }
-                            else if args.iter().any(|a| *a == "-D") { "D" }
-                            else if args.iter().any(|a| *a == "-L") { "L" }
-                            else if args.iter().any(|a| *a == "-R") { "R" }
-                            else { "" };
-                        let _ = tx.send(CtrlReq::SelectPane(dir.to_string()));
-                    }
-                    "select-window" => {
-                        if let Some(idx) = args.iter().find(|a| !a.starts_with('-')).and_then(|s| s.parse::<usize>().ok()) {
-                            let _ = tx.send(CtrlReq::SelectWindow(idx));
-                        }
-                    }
-                    "list-panes" => {
-                        let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::ListPanes(rtx));
-                        if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); }
-                    }
-                    "kill-window" => { let _ = tx.send(CtrlReq::KillWindow); }
-                    "kill-session" => { let _ = tx.send(CtrlReq::KillSession); }
-                    "has-session" => {
-                        let (rtx, rrx) = mpsc::channel::<bool>();
-                        let _ = tx.send(CtrlReq::HasSession(rtx));
-                        if let Ok(exists) = rrx.recv() {
-                            if !exists { std::process::exit(1); }
-                        }
-                    }
-                    "rename-session" => {
-                        if let Some(name) = args.iter().find(|a| !a.starts_with('-')) {
-                            let _ = tx.send(CtrlReq::RenameSession((*name).to_string()));
-                        }
-                    }
-                    "swap-pane" => {
-                        let dir = if args.iter().any(|a| *a == "-U") { "U" }
-                            else if args.iter().any(|a| *a == "-D") { "D" }
-                            else { "D" };
-                        let _ = tx.send(CtrlReq::SwapPane(dir.to_string()));
-                    }
-                    "resize-pane" => {
-                        let amount = args.iter().find(|a| a.parse::<u16>().is_ok()).and_then(|s| s.parse::<u16>().ok()).unwrap_or(1);
-                        let dir = if args.iter().any(|a| *a == "-U") { "U" }
-                            else if args.iter().any(|a| *a == "-D") { "D" }
-                            else if args.iter().any(|a| *a == "-L") { "L" }
-                            else if args.iter().any(|a| *a == "-R") { "R" }
-                            else { "D" };
-                        let _ = tx.send(CtrlReq::ResizePane(dir.to_string(), amount));
-                    }
-                    "set-buffer" => {
-                        let content = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<&str>>().join(" ");
-                        let _ = tx.send(CtrlReq::SetBuffer(content));
-                    }
-                    "paste-buffer" => {
-                        let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::ShowBuffer(rtx));
-                        if let Ok(text) = rrx.recv() {
-                            let _ = tx.send(CtrlReq::SendText(text));
-                        }
-                    }
-                    "list-buffers" => {
-                        let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::ListBuffers(rtx));
-                        if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); }
-                    }
-                    "show-buffer" => {
-                        let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::ShowBuffer(rtx));
-                        if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); }
-                    }
-                    "delete-buffer" => { let _ = tx.send(CtrlReq::DeleteBuffer); }
-                    "display-message" => {
-                        let fmt = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<&str>>().join(" ");
-                        let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt));
-                        if let Ok(text) = rrx.recv() { let _ = writeln!(stream, "{}", text); }
-                    }
-                    "last-window" => { let _ = tx.send(CtrlReq::LastWindow); }
-                    "last-pane" => { let _ = tx.send(CtrlReq::LastPane); }
-                    "rotate-window" => {
-                        let reverse = args.iter().any(|a| *a == "-D");
-                        let _ = tx.send(CtrlReq::RotateWindow(reverse));
-                    }
-                    "display-panes" => { let _ = tx.send(CtrlReq::DisplayPanes); }
-                    "break-pane" => { let _ = tx.send(CtrlReq::BreakPane); }
-                    "join-pane" => {
-                        if let Some(wid) = args.iter().find(|a| !a.starts_with('-')).and_then(|s| s.parse::<usize>().ok()) {
-                            let _ = tx.send(CtrlReq::JoinPane(wid));
-                        }
-                    }
-                    "respawn-pane" => { let _ = tx.send(CtrlReq::RespawnPane); }
-                    "session-info" => {
-                        let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::SessionInfo(rtx));
-                        if let Ok(line) = rrx.recv() { let _ = write!(stream, "{}", line); let _ = stream.flush(); }
-                    }
-                    "client-attach" => { let _ = tx.send(CtrlReq::ClientAttach); let _ = write!(stream, "ok\n"); }
-                    "client-detach" => { let _ = tx.send(CtrlReq::ClientDetach); let _ = write!(stream, "ok\n"); }
-                    // Config/Key binding commands
-                    "bind-key" | "bind" => {
-                        // bind-key <key> <command>
-                        let non_flag_args: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
-                        if non_flag_args.len() >= 2 {
-                            let key = non_flag_args[0].to_string();
-                            let command = non_flag_args[1..].join(" ");
-                            let _ = tx.send(CtrlReq::BindKey(key, command));
-                        }
-                    }
-                    "unbind-key" | "unbind" => {
-                        let non_flag_args: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
-                        if let Some(key) = non_flag_args.first() {
-                            let _ = tx.send(CtrlReq::UnbindKey(key.to_string()));
-                        }
-                    }
-                    "list-keys" | "lsk" => {
-                        let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::ListKeys(rtx));
-                        if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); }
-                    }
-                    "set-option" | "set" => {
-                        // set-option [-g] <option> <value>
-                        let non_flag_args: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
-                        if non_flag_args.len() >= 2 {
-                            let option = non_flag_args[0].to_string();
-                            let value = non_flag_args[1..].join(" ");
-                            let _ = tx.send(CtrlReq::SetOption(option, value));
-                        }
-                    }
-                    "show-options" | "show" => {
-                        let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::ShowOptions(rtx));
-                        if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); }
-                    }
-                    "source-file" | "source" => {
-                        let non_flag_args: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
-                        if let Some(path) = non_flag_args.first() {
-                            let _ = tx.send(CtrlReq::SourceFile(path.to_string()));
-                        }
-                    }
-                    // Additional commands for full tmux parity
-                    "move-window" => {
-                        let target = args.iter().find(|a| a.parse::<usize>().is_ok()).and_then(|s| s.parse().ok());
-                        let _ = tx.send(CtrlReq::MoveWindow(target));
-                    }
-                    "swap-window" => {
-                        if let Some(target) = args.iter().find(|a| a.parse::<usize>().is_ok()).and_then(|s| s.parse().ok()) {
-                            let _ = tx.send(CtrlReq::SwapWindow(target));
-                        }
-                    }
-                    "link-window" => {
-                        let target = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
-                        let _ = tx.send(CtrlReq::LinkWindow(target));
-                    }
-                    "unlink-window" => {
-                        let _ = tx.send(CtrlReq::UnlinkWindow);
-                    }
-                    "find-window" => {
-                        let pattern = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
-                        let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::FindWindow(rtx, pattern));
-                        if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); }
-                    }
-                    "move-pane" => {
-                        if let Some(target) = args.iter().find(|a| a.parse::<usize>().is_ok()).and_then(|s| s.parse().ok()) {
-                            let _ = tx.send(CtrlReq::MovePane(target));
-                        }
-                    }
-                    "pipe-pane" | "pipep" => {
-                        // Parse -I (stdin to pane) and -O (pane to stdout) flags
-                        let stdin_flag = args.iter().any(|a| *a == "-I");
-                        let stdout_flag = args.iter().any(|a| *a == "-O");
-                        let toggle = args.iter().any(|a| *a == "-o");
-                        let cmd = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<&str>>().join(" ");
-                        // Default to -O if no flags specified (pipe pane output to command)
-                        let (stdin, stdout) = if !stdin_flag && !stdout_flag {
-                            (false, true)
-                        } else {
-                            (stdin_flag, stdout_flag)
-                        };
-                        let _ = tx.send(CtrlReq::PipePane(cmd, stdin, stdout));
-                    }
-                    "select-layout" => {
-                        let layout = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"tiled").to_string();
-                        let _ = tx.send(CtrlReq::SelectLayout(layout));
-                    }
-                    "next-layout" => {
-                        let _ = tx.send(CtrlReq::NextLayout);
-                    }
-                    "list-clients" => {
-                        let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::ListClients(rtx));
-                        if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); }
-                    }
-                    "switch-client" => {
-                        let target = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
-                        let _ = tx.send(CtrlReq::SwitchClient(target));
-                    }
-                    "lock-client" => {
-                        let _ = tx.send(CtrlReq::LockClient);
-                    }
-                    "refresh-client" => {
-                        let _ = tx.send(CtrlReq::RefreshClient);
-                    }
-                    "suspend-client" => {
-                        let _ = tx.send(CtrlReq::SuspendClient);
-                    }
-                    "copy-mode-page-up" => {
-                        let _ = tx.send(CtrlReq::CopyModePageUp);
-                    }
-                    "clear-history" => {
-                        let _ = tx.send(CtrlReq::ClearHistory);
-                    }
-                    "save-buffer" => {
-                        let path = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
-                        let _ = tx.send(CtrlReq::SaveBuffer(path));
-                    }
-                    "load-buffer" => {
-                        let path = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
-                        let _ = tx.send(CtrlReq::LoadBuffer(path));
-                    }
-                    "set-environment" => {
-                        let non_flag: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
-                        if non_flag.len() >= 2 {
-                            let _ = tx.send(CtrlReq::SetEnvironment(non_flag[0].to_string(), non_flag[1].to_string()));
-                        } else if non_flag.len() == 1 {
-                            let _ = tx.send(CtrlReq::SetEnvironment(non_flag[0].to_string(), String::new()));
-                        }
-                    }
-                    "show-environment" => {
-                        let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::ShowEnvironment(rtx));
-                        if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); }
-                    }
-                    "set-hook" => {
-                        let non_flag: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
-                        if non_flag.len() >= 2 {
-                            let _ = tx.send(CtrlReq::SetHook(non_flag[0].to_string(), non_flag[1..].join(" ")));
-                        }
-                    }
-                    "show-hooks" => {
-                        let (rtx, rrx) = mpsc::channel::<String>();
-                        let _ = tx.send(CtrlReq::ShowHooks(rtx));
-                        if let Ok(text) = rrx.recv() { let _ = write!(stream, "{}", text); }
-                    }
-                    "wait-for" => {
-                        let lock = args.iter().any(|a| *a == "-L");
-                        let signal = args.iter().any(|a| *a == "-S");
-                        let unlock = args.iter().any(|a| *a == "-U");
-                        let channel = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
-                        let op = if lock { WaitForOp::Lock }
-                            else if signal { WaitForOp::Signal }
-                            else if unlock { WaitForOp::Unlock }
-                            else { WaitForOp::Wait };
-                        let _ = tx.send(CtrlReq::WaitFor(channel, op));
-                    }
-                    "display-menu" | "menu" => {
-                        // Parse menu definition: display-menu -x P -y P [-T title] name key command ...
-                        let mut x_pos: Option<i16> = None;
-                        let mut y_pos: Option<i16> = None;
-                        let mut i = 0;
-                        while i < args.len() {
-                            match args[i] {
-                                "-x" => { if let Some(v) = args.get(i+1) { x_pos = v.parse().ok(); i += 1; } }
-                                "-y" => { if let Some(v) = args.get(i+1) { y_pos = v.parse().ok(); i += 1; } }
-                                _ => {}
-                            }
-                            i += 1;
-                        }
-                        let menu = args.iter().filter(|a| !a.starts_with('-') && a.parse::<i16>().is_err()).cloned().collect::<Vec<&str>>().join(" ");
-                        let _ = tx.send(CtrlReq::DisplayMenu(menu, x_pos, y_pos));
-                    }
-                    "display-popup" | "popup" => {
-                        // Parse popup options: -E close on exit, -w width, -h height
-                        let close_on_exit = args.iter().any(|a| *a == "-E");
-                        let mut width: u16 = 80;
-                        let mut height: u16 = 24;
-                        let mut i = 0;
-                        while i < args.len() {
-                            match args[i] {
-                                "-w" => { if let Some(v) = args.get(i+1) { width = v.trim_end_matches('%').parse().unwrap_or(80); i += 1; } }
-                                "-h" => { if let Some(v) = args.get(i+1) { height = v.trim_end_matches('%').parse().unwrap_or(24); i += 1; } }
-                                _ => {}
-                            }
-                            i += 1;
-                        }
-                        let content = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<&str>>().join(" ");
-                        let _ = tx.send(CtrlReq::DisplayPopup(content, width, height, close_on_exit));
-                    }
-                    "confirm-before" | "confirm" => {
-                        // Parse: confirm-before [-p prompt] command
-                        let mut prompt: Option<String> = None;
-                        let mut i = 0;
-                        while i < args.len() {
-                            if args[i] == "-p" {
-                                if let Some(p) = args.get(i+1) { prompt = Some(p.to_string()); i += 1; }
-                            }
-                            i += 1;
-                        }
-                        let non_flag: Vec<&str> = args.iter().filter(|a| !a.starts_with('-') && Some(&a.to_string()) != prompt.as_ref()).copied().collect();
-                        let command = non_flag.join(" ");
-                        let prompt_str = prompt.unwrap_or_else(|| format!("Run '{}'?", command));
-                        let _ = tx.send(CtrlReq::ConfirmBefore(prompt_str, command));
-                    }
-                    _ => {}
-                }
+        loop {
+            // Create a new pipe instance for each connection
+            let pipe = match create_named_pipe_server(&session_name_for_pipe) {
+                Ok(p) => p,
+                Err(_) => { thread::sleep(Duration::from_millis(100)); continue; }
+            };
+
+            // Wait for client connection
+            if wait_for_pipe_connection(pipe).is_err() {
+                close_pipe(pipe);
+                continue;
             }
+
+            // Read command from pipe
+            let mut buf = [0u8; 4096];
+            let n = match pipe_read(pipe, &mut buf) {
+                Ok(n) if n > 0 => n,
+                _ => { disconnect_pipe(pipe); close_pipe(pipe); continue; }
+            };
+
+            let line = String::from_utf8_lossy(&buf[..n]).to_string();
+            let mut parts = line.split_whitespace();
+            let cmd = parts.next().unwrap_or("");
+            let args: Vec<&str> = parts.by_ref().collect();
+            let mut target_win: Option<usize> = None;
+            let mut target_pane: Option<usize> = None;
+            let mut i = 0;
+            while i < args.len() {
+                if args[i] == "-t" {
+                    if let Some(v) = args.get(i+1) {
+                        if v.starts_with('%') { if let Ok(pid) = v[1..].parse::<usize>() { target_pane = Some(pid); } }
+                        else if v.starts_with('@') { if let Ok(wid) = v[1..].parse::<usize>() { target_win = Some(wid); } }
+                    }
+                    i += 2; continue;
+                }
+                i += 1;
+            }
+            if let Some(wid) = target_win { let _ = tx.send(CtrlReq::FocusWindow(wid)); }
+            if let Some(pid) = target_pane { let _ = tx.send(CtrlReq::FocusPane(pid)); }
+            match cmd {
+                "new-window" => { let _ = tx.send(CtrlReq::NewWindow); }
+                "split-window" => {
+                    let kind = if args.iter().any(|a| *a == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
+                    let _ = tx.send(CtrlReq::SplitWindow(kind));
+                }
+                "kill-pane" => { let _ = tx.send(CtrlReq::KillPane); }
+                "capture-pane" => {
+                    let print_stdout = args.iter().any(|a| *a == "-p");
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::CapturePane(rtx));
+                    if let Ok(text) = rrx.recv() {
+                        if print_stdout {
+                            let _ = pipe_write(pipe, text.as_bytes());
+                        } else {
+                            // Save to buffer instead
+                            let _ = tx.send(CtrlReq::SetBuffer(text));
+                        }
+                    }
+                }
+                "dump-layout" => {
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::DumpLayout(rtx));
+                    if let Ok(text) = rrx.recv() { let _ = pipe_write(pipe, text.as_bytes()); }
+                }
+                "send-text" => {
+                    if let Some(payload) = args.get(0) { let _ = tx.send(CtrlReq::SendText(payload.to_string())); }
+                }
+                "send-paste" => {
+                    // Bracketed paste - decode base64 and send all at once
+                    if let Some(encoded) = args.get(0) {
+                        if let Some(decoded) = base64_decode(encoded) {
+                            let _ = tx.send(CtrlReq::SendPaste(decoded));
+                        }
+                    }
+                }
+                "send-key" => {
+                    if let Some(payload) = args.get(0) { let _ = tx.send(CtrlReq::SendKey(payload.to_string())); }
+                }
+                "zoom-pane" => { let _ = tx.send(CtrlReq::ZoomPane); }
+                "copy-enter" => { let _ = tx.send(CtrlReq::CopyEnter); }
+                "copy-move" => {
+                    if args.len() >= 2 { if let (Ok(dx), Ok(dy)) = (args[0].parse::<i16>(), args[1].parse::<i16>()) { let _ = tx.send(CtrlReq::CopyMove(dx, dy)); } }
+                }
+                "copy-anchor" => { let _ = tx.send(CtrlReq::CopyAnchor); }
+                "copy-yank" => { let _ = tx.send(CtrlReq::CopyYank); }
+                "client-size" => {
+                    if args.len() >= 2 { if let (Ok(w), Ok(h)) = (args[0].parse::<u16>(), args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::ClientSize(w, h)); } }
+                }
+                "focus-pane" => {
+                    if let Some(pid) = args.get(0).and_then(|s| s.parse::<usize>().ok()) { let _ = tx.send(CtrlReq::FocusPaneCmd(pid)); }
+                }
+                "focus-window" => {
+                    if let Some(wid) = args.get(0).and_then(|s| s.parse::<usize>().ok()) { let _ = tx.send(CtrlReq::FocusWindowCmd(wid)); }
+                }
+                "mouse-down" => {
+                    if args.len()>=2 { if let (Ok(x),Ok(y))=(args[0].parse::<u16>(),args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::MouseDown(x,y)); } }
+                }
+                "mouse-drag" => {
+                    if args.len()>=2 { if let (Ok(x),Ok(y))=(args[0].parse::<u16>(),args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::MouseDrag(x,y)); } }
+                }
+                "mouse-up" => {
+                    if args.len()>=2 { if let (Ok(x),Ok(y))=(args[0].parse::<u16>(),args[1].parse::<u16>()) { let _ = tx.send(CtrlReq::MouseUp(x,y)); } }
+                }
+                "scroll-up" => { let _ = tx.send(CtrlReq::ScrollUp); }
+                "scroll-down" => { let _ = tx.send(CtrlReq::ScrollDown); }
+                "next-window" => { let _ = tx.send(CtrlReq::NextWindow); }
+                "previous-window" => { let _ = tx.send(CtrlReq::PrevWindow); }
+                "rename-window" => { if let Some(name) = args.get(0) { let _ = tx.send(CtrlReq::RenameWindow((*name).to_string())); } }
+                "list-windows" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListWindows(rtx)); if let Ok(text) = rrx.recv() { let _ = pipe_write(pipe, text.as_bytes()); } }
+                "list-tree" => { let (rtx, rrx) = mpsc::channel::<String>(); let _ = tx.send(CtrlReq::ListTree(rtx)); if let Ok(text) = rrx.recv() { let _ = pipe_write(pipe, text.as_bytes()); } }
+                "toggle-sync" => { let _ = tx.send(CtrlReq::ToggleSync); }
+                "set-pane-title" => { let title = args.join(" "); let _ = tx.send(CtrlReq::SetPaneTitle(title)); }
+                // New tmux-compatible commands
+                "send-keys" => {
+                    let literal = args.iter().any(|a| *a == "-l");
+                    let keys: Vec<&str> = args.iter().filter(|a| !a.starts_with('-') && **a != "-l" && **a != "-t").copied().collect();
+                    let _ = tx.send(CtrlReq::SendKeys(keys.join(" "), literal));
+                }
+                "select-pane" => {
+                    let dir = if args.iter().any(|a| *a == "-U") { "U" }
+                        else if args.iter().any(|a| *a == "-D") { "D" }
+                        else if args.iter().any(|a| *a == "-L") { "L" }
+                        else if args.iter().any(|a| *a == "-R") { "R" }
+                        else { "" };
+                    let _ = tx.send(CtrlReq::SelectPane(dir.to_string()));
+                }
+                "select-window" => {
+                    if let Some(idx) = args.iter().find(|a| !a.starts_with('-')).and_then(|s| s.parse::<usize>().ok()) {
+                        let _ = tx.send(CtrlReq::SelectWindow(idx));
+                    }
+                }
+                "list-panes" => {
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::ListPanes(rtx));
+                    if let Ok(text) = rrx.recv() { let _ = pipe_write(pipe, text.as_bytes()); }
+                }
+                "kill-window" => { let _ = tx.send(CtrlReq::KillWindow); }
+                "kill-session" => { let _ = tx.send(CtrlReq::KillSession); }
+                "has-session" => {
+                    let (rtx, rrx) = mpsc::channel::<bool>();
+                    let _ = tx.send(CtrlReq::HasSession(rtx));
+                    if let Ok(exists) = rrx.recv() {
+                        if !exists { std::process::exit(1); }
+                    }
+                }
+                "rename-session" => {
+                    if let Some(name) = args.iter().find(|a| !a.starts_with('-')) {
+                        let _ = tx.send(CtrlReq::RenameSession((*name).to_string()));
+                    }
+                }
+                "swap-pane" => {
+                    let dir = if args.iter().any(|a| *a == "-U") { "U" }
+                        else if args.iter().any(|a| *a == "-D") { "D" }
+                        else { "D" };
+                    let _ = tx.send(CtrlReq::SwapPane(dir.to_string()));
+                }
+                "resize-pane" => {
+                    let amount = args.iter().find(|a| a.parse::<u16>().is_ok()).and_then(|s| s.parse::<u16>().ok()).unwrap_or(1);
+                    let dir = if args.iter().any(|a| *a == "-U") { "U" }
+                        else if args.iter().any(|a| *a == "-D") { "D" }
+                        else if args.iter().any(|a| *a == "-L") { "L" }
+                        else if args.iter().any(|a| *a == "-R") { "R" }
+                        else { "D" };
+                    let _ = tx.send(CtrlReq::ResizePane(dir.to_string(), amount));
+                }
+                "set-buffer" => {
+                    let content = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<&str>>().join(" ");
+                    let _ = tx.send(CtrlReq::SetBuffer(content));
+                }
+                "paste-buffer" => {
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::ShowBuffer(rtx));
+                    if let Ok(text) = rrx.recv() {
+                        let _ = tx.send(CtrlReq::SendText(text));
+                    }
+                }
+                "list-buffers" => {
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::ListBuffers(rtx));
+                    if let Ok(text) = rrx.recv() { let _ = pipe_write(pipe, text.as_bytes()); }
+                }
+                "show-buffer" => {
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::ShowBuffer(rtx));
+                    if let Ok(text) = rrx.recv() { let _ = pipe_write(pipe, text.as_bytes()); }
+                }
+                "delete-buffer" => { let _ = tx.send(CtrlReq::DeleteBuffer); }
+                "display-message" => {
+                    let fmt = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<&str>>().join(" ");
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt));
+                    if let Ok(text) = rrx.recv() { let _ = pipe_write(pipe, format!("{}\n", text).as_bytes()); }
+                }
+                "last-window" => { let _ = tx.send(CtrlReq::LastWindow); }
+                "last-pane" => { let _ = tx.send(CtrlReq::LastPane); }
+                "rotate-window" => {
+                    let reverse = args.iter().any(|a| *a == "-D");
+                    let _ = tx.send(CtrlReq::RotateWindow(reverse));
+                }
+                "display-panes" => { let _ = tx.send(CtrlReq::DisplayPanes); }
+                "break-pane" => { let _ = tx.send(CtrlReq::BreakPane); }
+                "join-pane" => {
+                    if let Some(wid) = args.iter().find(|a| !a.starts_with('-')).and_then(|s| s.parse::<usize>().ok()) {
+                        let _ = tx.send(CtrlReq::JoinPane(wid));
+                    }
+                }
+                "respawn-pane" => { let _ = tx.send(CtrlReq::RespawnPane); }
+                "session-info" => {
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::SessionInfo(rtx));
+                    if let Ok(line) = rrx.recv() { let _ = pipe_write(pipe, line.as_bytes()); }
+                }
+                "client-attach" => { let _ = tx.send(CtrlReq::ClientAttach); let _ = pipe_write(pipe, b"ok\n"); }
+                "client-detach" => { let _ = tx.send(CtrlReq::ClientDetach); let _ = pipe_write(pipe, b"ok\n"); }
+                // Config/Key binding commands
+                "bind-key" | "bind" => {
+                    // bind-key <key> <command>
+                    let non_flag_args: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
+                    if non_flag_args.len() >= 2 {
+                        let key = non_flag_args[0].to_string();
+                        let command = non_flag_args[1..].join(" ");
+                        let _ = tx.send(CtrlReq::BindKey(key, command));
+                    }
+                }
+                "unbind-key" | "unbind" => {
+                    let non_flag_args: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
+                    if let Some(key) = non_flag_args.first() {
+                        let _ = tx.send(CtrlReq::UnbindKey(key.to_string()));
+                    }
+                }
+                "list-keys" | "lsk" => {
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::ListKeys(rtx));
+                    if let Ok(text) = rrx.recv() { let _ = pipe_write(pipe, text.as_bytes()); }
+                }
+                "set-option" | "set" => {
+                    // set-option [-g] <option> <value>
+                    let non_flag_args: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
+                    if non_flag_args.len() >= 2 {
+                        let option = non_flag_args[0].to_string();
+                        let value = non_flag_args[1..].join(" ");
+                        let _ = tx.send(CtrlReq::SetOption(option, value));
+                    }
+                }
+                "show-options" | "show" => {
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::ShowOptions(rtx));
+                    if let Ok(text) = rrx.recv() { let _ = pipe_write(pipe, text.as_bytes()); }
+                }
+                "source-file" | "source" => {
+                    let non_flag_args: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
+                    if let Some(path) = non_flag_args.first() {
+                        let _ = tx.send(CtrlReq::SourceFile(path.to_string()));
+                    }
+                }
+                // Additional commands for full tmux parity
+                "move-window" => {
+                    let target = args.iter().find(|a| a.parse::<usize>().is_ok()).and_then(|s| s.parse().ok());
+                    let _ = tx.send(CtrlReq::MoveWindow(target));
+                }
+                "swap-window" => {
+                    if let Some(target) = args.iter().find(|a| a.parse::<usize>().is_ok()).and_then(|s| s.parse().ok()) {
+                        let _ = tx.send(CtrlReq::SwapWindow(target));
+                    }
+                }
+                "link-window" => {
+                    let target = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
+                    let _ = tx.send(CtrlReq::LinkWindow(target));
+                }
+                "unlink-window" => {
+                    let _ = tx.send(CtrlReq::UnlinkWindow);
+                }
+                "find-window" => {
+                    let pattern = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::FindWindow(rtx, pattern));
+                    if let Ok(text) = rrx.recv() { let _ = pipe_write(pipe, text.as_bytes()); }
+                }
+                "move-pane" => {
+                    if let Some(target) = args.iter().find(|a| a.parse::<usize>().is_ok()).and_then(|s| s.parse().ok()) {
+                        let _ = tx.send(CtrlReq::MovePane(target));
+                    }
+                }
+                "pipe-pane" | "pipep" => {
+                    // Parse -I (stdin to pane) and -O (pane to stdout) flags
+                    let stdin_flag = args.iter().any(|a| *a == "-I");
+                    let stdout_flag = args.iter().any(|a| *a == "-O");
+                    let _toggle = args.iter().any(|a| *a == "-o");
+                    let cmd = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<&str>>().join(" ");
+                    // Default to -O if no flags specified (pipe pane output to command)
+                    let (stdin, stdout) = if !stdin_flag && !stdout_flag {
+                        (false, true)
+                    } else {
+                        (stdin_flag, stdout_flag)
+                    };
+                    let _ = tx.send(CtrlReq::PipePane(cmd, stdin, stdout));
+                }
+                "select-layout" => {
+                    let layout = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"tiled").to_string();
+                    let _ = tx.send(CtrlReq::SelectLayout(layout));
+                }
+                "next-layout" => {
+                    let _ = tx.send(CtrlReq::NextLayout);
+                }
+                "list-clients" => {
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::ListClients(rtx));
+                    if let Ok(text) = rrx.recv() { let _ = pipe_write(pipe, text.as_bytes()); }
+                }
+                "switch-client" => {
+                    let target = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
+                    let _ = tx.send(CtrlReq::SwitchClient(target));
+                }
+                "lock-client" => {
+                    let _ = tx.send(CtrlReq::LockClient);
+                }
+                "refresh-client" => {
+                    let _ = tx.send(CtrlReq::RefreshClient);
+                }
+                "suspend-client" => {
+                    let _ = tx.send(CtrlReq::SuspendClient);
+                }
+                "copy-mode-page-up" => {
+                    let _ = tx.send(CtrlReq::CopyModePageUp);
+                }
+                "clear-history" => {
+                    let _ = tx.send(CtrlReq::ClearHistory);
+                }
+                "save-buffer" => {
+                    let path = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
+                    let _ = tx.send(CtrlReq::SaveBuffer(path));
+                }
+                "load-buffer" => {
+                    let path = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
+                    let _ = tx.send(CtrlReq::LoadBuffer(path));
+                }
+                "set-environment" => {
+                    let non_flag: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
+                    if non_flag.len() >= 2 {
+                        let _ = tx.send(CtrlReq::SetEnvironment(non_flag[0].to_string(), non_flag[1].to_string()));
+                    } else if non_flag.len() == 1 {
+                        let _ = tx.send(CtrlReq::SetEnvironment(non_flag[0].to_string(), String::new()));
+                    }
+                }
+                "show-environment" => {
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::ShowEnvironment(rtx));
+                    if let Ok(text) = rrx.recv() { let _ = pipe_write(pipe, text.as_bytes()); }
+                }
+                "set-hook" => {
+                    let non_flag: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
+                    if non_flag.len() >= 2 {
+                        let _ = tx.send(CtrlReq::SetHook(non_flag[0].to_string(), non_flag[1..].join(" ")));
+                    }
+                }
+                "show-hooks" => {
+                    let (rtx, rrx) = mpsc::channel::<String>();
+                    let _ = tx.send(CtrlReq::ShowHooks(rtx));
+                    if let Ok(text) = rrx.recv() { let _ = pipe_write(pipe, text.as_bytes()); }
+                }
+                "wait-for" => {
+                    let lock = args.iter().any(|a| *a == "-L");
+                    let signal = args.iter().any(|a| *a == "-S");
+                    let unlock = args.iter().any(|a| *a == "-U");
+                    let channel = args.iter().find(|a| !a.starts_with('-')).unwrap_or(&"").to_string();
+                    let op = if lock { WaitForOp::Lock }
+                        else if signal { WaitForOp::Signal }
+                        else if unlock { WaitForOp::Unlock }
+                        else { WaitForOp::Wait };
+                    let _ = tx.send(CtrlReq::WaitFor(channel, op));
+                }
+                "display-menu" | "menu" => {
+                    // Parse menu definition: display-menu -x P -y P [-T title] name key command ...
+                    let mut x_pos: Option<i16> = None;
+                    let mut y_pos: Option<i16> = None;
+                    let mut i = 0;
+                    while i < args.len() {
+                        match args[i] {
+                            "-x" => { if let Some(v) = args.get(i+1) { x_pos = v.parse().ok(); i += 1; } }
+                            "-y" => { if let Some(v) = args.get(i+1) { y_pos = v.parse().ok(); i += 1; } }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    let menu = args.iter().filter(|a| !a.starts_with('-') && a.parse::<i16>().is_err()).cloned().collect::<Vec<&str>>().join(" ");
+                    let _ = tx.send(CtrlReq::DisplayMenu(menu, x_pos, y_pos));
+                }
+                "display-popup" | "popup" => {
+                    // Parse popup options: -E close on exit, -w width, -h height
+                    let close_on_exit = args.iter().any(|a| *a == "-E");
+                    let mut width: u16 = 80;
+                    let mut height: u16 = 24;
+                    let mut i = 0;
+                    while i < args.len() {
+                        match args[i] {
+                            "-w" => { if let Some(v) = args.get(i+1) { width = v.trim_end_matches('%').parse().unwrap_or(80); i += 1; } }
+                            "-h" => { if let Some(v) = args.get(i+1) { height = v.trim_end_matches('%').parse().unwrap_or(24); i += 1; } }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    let content = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<&str>>().join(" ");
+                    let _ = tx.send(CtrlReq::DisplayPopup(content, width, height, close_on_exit));
+                }
+                "confirm-before" | "confirm" => {
+                    // Parse: confirm-before [-p prompt] command
+                    let mut prompt: Option<String> = None;
+                    let mut i = 0;
+                    while i < args.len() {
+                        if args[i] == "-p" {
+                            if let Some(p) = args.get(i+1) { prompt = Some(p.to_string()); i += 1; }
+                        }
+                        i += 1;
+                    }
+                    let non_flag: Vec<&str> = args.iter().filter(|a| !a.starts_with('-') && Some(&a.to_string()) != prompt.as_ref()).copied().collect();
+                    let command = non_flag.join(" ");
+                    let prompt_str = prompt.unwrap_or_else(|| format!("Run '{}'?", command));
+                    let _ = tx.send(CtrlReq::ConfirmBefore(prompt_str, command));
+                }
+                _ => {}
+            }
+            disconnect_pipe(pipe);
+            close_pipe(pipe);
         }
     });
     loop {
@@ -5334,23 +5573,17 @@ fn run_server(session_name: String) -> io::Result<()> {
                     }
                 }
                 CtrlReq::KillSession => {
-                    // Remove port file and exit
-                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let regpath = format!("{}\\.psmux\\{}.port", home, app.session_name);
-                    let _ = std::fs::remove_file(&regpath);
+                    // Unregister session and exit
+                    unregister_session(&app.session_name);
                     std::process::exit(0);
                 }
                 CtrlReq::HasSession(resp) => {
                     let _ = resp.send(true); // We are running, so session exists
                 }
                 CtrlReq::RenameSession(name) => {
-                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let old_path = format!("{}\\.psmux\\{}.port", home, app.session_name);
-                    let new_path = format!("{}\\.psmux\\{}.port", home, name);
-                    if let Some(port) = app.control_port {
-                        let _ = std::fs::remove_file(&old_path);
-                        let _ = std::fs::write(&new_path, port.to_string());
-                    }
+                    // Update session registry: unregister old name, register new name
+                    unregister_session(&app.session_name);
+                    let _ = register_session(&name);
                     app.session_name = name;
                 }
                 CtrlReq::SwapPane(dir) => {
@@ -5722,10 +5955,8 @@ fn run_server(session_name: String) -> io::Result<()> {
                     app.hooks.remove(&hook);
                 }
                 CtrlReq::KillServer => {
-                    // Kill this server
-                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let regpath = format!("{}\\.psmux\\{}.port", home, app.session_name);
-                    let _ = std::fs::remove_file(&regpath);
+                    // Unregister session and exit server
+                    unregister_session(&app.session_name);
                     std::process::exit(0);
                 }
                 CtrlReq::WaitFor(channel, op) => {
@@ -5822,10 +6053,8 @@ fn run_server(session_name: String) -> io::Result<()> {
         }
         // Check if all windows/panes have exited
         if reap_children(&mut app)? {
-            // All windows are gone - clean up port file and exit server
-            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-            let regpath = format!("{}\\.psmux\\{}.port", home, app.session_name);
-            let _ = std::fs::remove_file(&regpath);
+            // All windows are gone - unregister session and exit server
+            unregister_session(&app.session_name);
             break;
         }
         thread::sleep(Duration::from_millis(5));  // Faster response, lower latency
@@ -5948,28 +6177,24 @@ fn resolve_last_session_name() -> Option<String> {
     let last = std::fs::read_to_string(format!("{}\\last_session", dir)).ok();
     if let Some(name) = last {
         let name = name.trim().to_string();
-        let p = format!("{}\\{}.port", dir, name);
-        if std::path::Path::new(&p).exists() { return Some(name); }
+        if pipe_exists(&name) { return Some(name); }
     }
-    let mut picks: Vec<(String, std::time::SystemTime)> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for e in rd.flatten() {
-            if let Some(fname) = e.file_name().to_str() {
-                if let Some((base, ext)) = fname.rsplit_once('.') {
-                    if ext == "port" { if let Ok(md) = e.metadata() { picks.push((base.to_string(), md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH))); } }
-                }
+    // Fall back to sessions registry file
+    let sessions_path = format!("{}\\sessions", dir);
+    if let Ok(content) = std::fs::read_to_string(&sessions_path) {
+        for line in content.lines().rev() {
+            let name = line.trim();
+            if !name.is_empty() && pipe_exists(name) {
+                return Some(name.to_string());
             }
         }
     }
-    picks.sort_by_key(|(_, t)| *t);
-    picks.last().map(|(n, _)| n.clone())
+    None
 }
 
 fn resolve_default_session_name() -> Option<String> {
     if let Ok(name) = env::var("PSMUX_DEFAULT_SESSION") {
-        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).ok()?;
-        let p = format!("{}\\.psmux\\{}.port", home, name);
-        if std::path::Path::new(&p).exists() { return Some(name); }
+        if pipe_exists(&name) { return Some(name); }
     }
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).ok()?;
     let candidates = [format!("{}\\.psmuxrc", home), format!("{}\\.psmux\\pmuxrc", home)];
@@ -5977,8 +6202,7 @@ fn resolve_default_session_name() -> Option<String> {
         if let Ok(text) = std::fs::read_to_string(cfg) {
             let line = text.lines().find(|l| !l.trim().is_empty())?;
             let name = if let Some(rest) = line.strip_prefix("default-session ") { rest.trim().to_string() } else { line.trim().to_string() };
-            let p = format!("{}\\.psmux\\{}.port", home, name);
-            if std::path::Path::new(&p).exists() { return Some(name); }
+            if pipe_exists(&name) { return Some(name); }
         }
     }
     None
