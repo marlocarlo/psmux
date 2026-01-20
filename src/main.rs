@@ -6,7 +6,7 @@ use std::io::Read as _;
 use std::io::BufRead as _;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use portable_pty::{CommandBuilder, MasterPty, PtySize, PtySystemSelection};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize, PtySystem};
 use ratatui::{prelude::*, widgets::*};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -23,6 +23,7 @@ use serde::{Serialize, Deserialize};
 
 struct Pane {
     master: Box<dyn MasterPty>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn portable_pty::Child>,
     term: Arc<Mutex<vt100::Parser>>,
     last_rows: u16,
@@ -362,8 +363,36 @@ fn cleanup_stale_sessions() {
 }
 
 fn main() -> io::Result<()> {
+    // Set DLL search path to include executable directory for sideloaded conpty.dll
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        if let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf())) {
+            let wide: Vec<u16> = exe_dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+            unsafe {
+                #[link(name = "kernel32")]
+                extern "system" {
+                    fn SetDllDirectoryW(lpPathName: *const u16) -> i32;
+                }
+                SetDllDirectoryW(wide.as_ptr());
+            }
+        }
+    }
+
     let args: Vec<String> = env::args().collect();
-    
+
+    // Debug: check ConPTY DLL status
+    if args.get(1).map(|s| s.as_str()) == Some("--check-conpty") {
+        let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        println!("Executable directory: {:?}", exe_dir);
+        if let Some(dir) = &exe_dir {
+            println!("Sideloaded conpty.dll: {}", dir.join("conpty.dll").exists());
+            println!("Sideloaded OpenConsole.exe: {}", dir.join("OpenConsole.exe").exists());
+        }
+        println!("System conpty.dll: {}", std::path::Path::new(r"C:\Windows\System32\conpty.dll").exists());
+        return Ok(());
+    }
+
     // Clean up any stale sessions at startup
     cleanup_stale_sessions();
     
@@ -1670,18 +1699,34 @@ fn main() -> io::Result<()> {
             }
         }
     
+    // Debug helper - writes to file if PSMUX_DEBUG is set
+    fn debug_log(msg: &str) {
+        if std::env::var("PSMUX_DEBUG").is_ok() {
+            use std::io::Write;
+            let log_path = std::env::current_dir().unwrap_or_default().join("psmux_debug.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                let _ = writeln!(f, "[CLIENT {}] {}", std::process::id(), msg);
+            }
+        }
+    }
+
+    debug_log("main() starting");
+
     // Default behavior: If no PSMUX_REMOTE_ATTACH is set and no specific command matched,
     // we need to either attach to an existing session or create a new one.
     // This ensures sessions persist after detach.
     if env::var("PSMUX_REMOTE_ATTACH").ok().as_deref() != Some("1") {
         let session_name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
+        debug_log(&format!("session_name={}", session_name));
 
         // Check if server is running via named pipe
         let server_alive = pipe_exists(&session_name);
+        debug_log(&format!("server_alive={}", server_alive));
 
         if !server_alive {
             // No existing session - create one in background
             let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
+            debug_log(&format!("spawning server: {:?}", exe));
             let mut cmd = std::process::Command::new(&exe);
             cmd.arg("server").arg("-s").arg(&session_name);
             #[cfg(windows)]
@@ -1691,37 +1736,50 @@ fn main() -> io::Result<()> {
                 const CREATE_NO_WINDOW: u32 = 0x08000000;
                 cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
             }
-            let _child = cmd.spawn().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
+            let child_result = cmd.spawn();
+            debug_log(&format!("spawn result: {:?}", child_result.as_ref().map(|c| c.id())));
+            let _child = child_result.map_err(|e| io::Error::new(io::ErrorKind::Other, format!("failed to spawn server: {e}")))?;
 
             // Wait for server to start by checking for named pipe
-            for _ in 0..20 {
+            for i in 0..20 {
                 if pipe_exists(&session_name) {
+                    debug_log(&format!("pipe exists after {} iterations", i));
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
+            if !pipe_exists(&session_name) {
+                debug_log("WARNING: pipe never appeared after 2 seconds!");
+            }
         }
-        
+
         // Now attach to the session
         env::set_var("PSMUX_SESSION_NAME", &session_name);
         env::set_var("PSMUX_REMOTE_ATTACH", "1");
+        debug_log("set PSMUX_REMOTE_ATTACH=1");
     }
     
+    debug_log("checking PSMUX_ACTIVE");
     if env::var("PSMUX_ACTIVE").ok().as_deref() == Some("1") {
+        debug_log("nested session detected, exiting");
         eprintln!("psmux: nested sessions are not allowed");
         return Ok(());
     }
     env::set_var("PSMUX_ACTIVE", "1");
+    debug_log("enabling raw mode and alternate screen");
     let mut stdout = io::stdout();
     enable_raw_mode()?;
     execute!(stdout, EnterAlternateScreen, EnableBlinking, EnableMouseCapture, EnableBracketedPaste)?;
     apply_cursor_style(&mut stdout)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    
+    debug_log("terminal created, entering main loop");
+
     // Loop to handle session switching without spawning new processes
     loop {
+        debug_log("calling run_remote");
         let result = run_remote(&mut terminal);
+        debug_log(&format!("run_remote returned: {:?}", result.as_ref().err()));
         
         // Check if we should switch to another session
         if let Ok(switch_to) = env::var("PSMUX_SWITCH_TO") {
@@ -1744,13 +1802,28 @@ fn main() -> io::Result<()> {
 }
 
 fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    // Debug helper for run_remote
+    fn rlog(msg: &str) {
+        if std::env::var("PSMUX_DEBUG").is_ok() {
+            use std::io::Write;
+            let log_path = std::env::current_dir().unwrap_or_default().join("psmux_debug.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                let _ = writeln!(f, "[REMOTE {}] {}", std::process::id(), msg);
+            }
+        }
+    }
+
     let name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+    rlog(&format!("run_remote started, session={}", name));
 
     // Connect to named pipe and send client-attach
+    rlog("connecting to pipe");
     let pipe = connect_to_pipe(&name, 1000)?;
+    rlog("connected, sending client-attach");
     pipe_write(pipe, b"client-attach\n")?;
     close_pipe(pipe);
+    rlog("client-attach sent");
 
     let last_path = format!("{}\\.psmux\\last_session", home);
     let _ = std::fs::write(&last_path, &name);
@@ -1772,24 +1845,39 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
     let current_session = name.clone();
 
     // Helper to send command to server via named pipe - returns response if any
+    // Includes retry logic to handle race conditions with pipe recreation
+    // Uses larger buffer and multiple reads to handle large responses
     let pipe_command = |cmd: &[u8]| -> Option<String> {
-        if let Ok(pipe) = connect_to_pipe(&name, 100) {
-            let _ = pipe_write(pipe, cmd);
-            let mut buf = [0u8; 65536];
-            let response = if let Ok(n) = pipe_read(pipe, &mut buf) {
-                if n > 0 {
-                    Some(String::from_utf8_lossy(&buf[..n]).to_string())
-                } else {
-                    None
+        for attempt in 0..5 {
+            if let Ok(pipe) = connect_to_pipe(&name, 100) {
+                let _ = pipe_write(pipe, cmd);
+                // Read in a loop to get all data
+                let mut result = Vec::new();
+                let mut buf = [0u8; 65536];
+                loop {
+                    match pipe_read(pipe, &mut buf) {
+                        Ok(n) if n > 0 => {
+                            result.extend_from_slice(&buf[..n]);
+                            if n < buf.len() {
+                                // Got less than buffer size, likely done
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
                 }
-            } else {
-                None
-            };
-            close_pipe(pipe);
-            response
-        } else {
-            None
+                close_pipe(pipe);
+                if !result.is_empty() {
+                    return Some(String::from_utf8_lossy(&result).to_string());
+                }
+                return None;
+            }
+            // Wait briefly before retrying
+            if attempt < 4 {
+                thread::sleep(Duration::from_millis(10));
+            }
         }
+        None
     };
 
     // Helper to send command without expecting response
@@ -1807,17 +1895,25 @@ fn run_remote(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Resu
     #[derive(serde::Deserialize, Default)]
     struct WinStatus { id: usize, name: String, active: bool }
 
+    rlog("entering main loop");
+    let mut loop_count = 0;
     loop {
+        loop_count += 1;
+        if loop_count <= 3 { rlog(&format!("loop iteration {}", loop_count)); }
+
         // Fetch layout BEFORE draw - this also serves as liveness check
         let root: LayoutJson = if let Some(buf) = pipe_command(b"dump-layout\n") {
+            if loop_count <= 3 { rlog(&format!("dump-layout response len={}", buf.len())); }
             if !buf.is_empty() {
                 serde_json::from_str(&buf).unwrap_or(LayoutJson::Leaf { id: 0, rows: 0, cols: 0, cursor_row: 0, cursor_col: 0, active: true, copy_mode: false, scroll_offset: 0, content: Vec::new() })
             } else {
                 // Server closed connection or sent no data - exit
+                rlog("dump-layout returned empty, breaking");
                 break;
             }
         } else {
             // Server connection failed - exit immediately
+            rlog("dump-layout failed to connect, breaking");
             break;
         };
 
@@ -2377,12 +2473,19 @@ fn pipe_exists(session_name: &str) -> bool {
     }
 }
 
-/// Write data to pipe and optionally read response
+/// Write data to pipe - handles large writes by looping
 fn pipe_write(pipe: HANDLE, data: &[u8]) -> io::Result<()> {
     unsafe {
-        let mut written = 0u32;
-        WriteFile(pipe, Some(data), Some(&mut written), None)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("WriteFile failed: {}", e)))?;
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let mut written = 0u32;
+            WriteFile(pipe, Some(&data[offset..]), Some(&mut written), None)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("WriteFile failed: {}", e)))?;
+            if written == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "pipe write returned 0"));
+            }
+            offset += written as usize;
+        }
         let _ = FlushFileBuffers(pipe);
         Ok(())
     }
@@ -2477,9 +2580,7 @@ fn send_control_with_response(line: String) -> io::Result<String> {
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
-    let pty_system = PtySystemSelection::default()
-        .get()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+    let pty_system = native_pty_system();
 
     let mut app = AppState {
         windows: Vec::new(),
@@ -2811,7 +2912,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
             let Some(req) = req else { break; };
             match req {
                 CtrlReq::NewWindow => {
-                    let pty_system = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+                    let pty_system = native_pty_system();
                     create_window(&*pty_system, &mut app)?;
                     resize_all_panes(&mut app);
                 }
@@ -2898,10 +2999,26 @@ fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppState) -
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
 
     let shell_cmd = detect_shell();
+    // Log what shell we're spawning
+    if std::env::var("PSMUX_DEBUG").is_ok() {
+        use std::io::Write;
+        let log_path = std::env::current_dir().unwrap_or_default().join("psmux_debug.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            let _ = writeln!(f, "[SERVER {}] spawning shell command", std::process::id());
+        }
+    }
     let child = pair
         .slave
         .spawn_command(shell_cmd)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
+    // Log child process info
+    if std::env::var("PSMUX_DEBUG").is_ok() {
+        use std::io::Write;
+        let log_path = std::env::current_dir().unwrap_or_default().join("psmux_debug.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            let _ = writeln!(f, "[SERVER {}] shell spawned, child pid: {:?}", std::process::id(), child.process_id());
+        }
+    }
 
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
     let term_reader = term.clone();
@@ -2909,22 +3026,73 @@ fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppState) -
         .master
         .try_clone_reader()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone writer error: {e}")))?;
 
+    // Wrap writer in Arc<Mutex<>> so it can be shared with reader thread for DSR responses
+    let writer = Arc::new(Mutex::new(writer));
+    let writer_for_reader = writer.clone();
+
+    let debug_pty = std::env::var("PSMUX_DEBUG").is_ok();
     thread::spawn(move || {
+        // PTY reader debug logging helper
+        fn pty_log(msg: &str) {
+            use std::io::Write;
+            let log_path = std::env::current_dir().unwrap_or_default().join("psmux_debug.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                let _ = writeln!(f, "[PTY-READER {}] {}", std::process::id(), msg);
+            }
+        }
+
+        if debug_pty { pty_log("reader thread started"); }
         let mut local = [0u8; 8192];
+        let mut total_bytes = 0usize;
+        let mut read_count = 0usize;
         loop {
             match reader.read(&mut local) {
                 Ok(n) if n > 0 => {
+                    total_bytes += n;
+                    read_count += 1;
+                    if debug_pty && read_count <= 5 {
+                        pty_log(&format!("read {} bytes (total: {})", n, total_bytes));
+                    }
+
+                    // Check for DSR (Device Status Report) cursor position query: ESC [ 6 n
+                    // PowerShell sends this and waits for response before showing prompt
+                    let data = &local[..n];
+                    if let Some(pos) = data.windows(4).position(|w| w == b"\x1b[6n") {
+                        if debug_pty { pty_log("detected DSR cursor query, sending response"); }
+                        // Get cursor position from parser and send response
+                        let (row, col) = {
+                            let parser = term_reader.lock().unwrap();
+                            let screen = parser.screen();
+                            let (r, c) = screen.cursor_position();
+                            (r + 1, c + 1)  // Convert to 1-based
+                        };
+                        // Send cursor position report: ESC [ row ; col R
+                        let response = format!("\x1b[{};{}R", row, col);
+                        if let Ok(mut w) = writer_for_reader.lock() {
+                            let _ = w.write_all(response.as_bytes());
+                            let _ = w.flush();
+                        }
+                    }
+
                     let mut parser = term_reader.lock().unwrap();
                     parser.process(&local[..n]);
                 }
                 Ok(_) => thread::sleep(Duration::from_millis(5)),
-                Err(_) => break,
+                Err(e) => {
+                    if debug_pty { pty_log(&format!("reader error: {:?}, total bytes: {}", e, total_bytes)); }
+                    break;
+                }
             }
         }
+        if debug_pty { pty_log(&format!("reader thread exiting, total bytes read: {}", total_bytes)); }
     });
 
-    let pane = Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id) };
+    let pane = Pane { master: pair.master, writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id) };
     app.next_pane_id += 1;
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: format!("win {}", app.windows.len()+1), id: app.next_win_id });
     app.next_win_id += 1;
@@ -2961,9 +3129,7 @@ fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                     true
                 }
                 KeyCode::Char('c') => {
-                    let pty_system = PtySystemSelection::default()
-                        .get()
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+                    let pty_system = native_pty_system();
                     create_window(&*pty_system, app)?;
                     true
                 }
@@ -3261,30 +3427,31 @@ fn move_focus(app: &mut AppState, dir: FocusDir) {
 fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()> {
     let win = &mut app.windows[app.active_idx];
     let Some(active) = active_pane_mut(&mut win.root, &win.active_path) else { return Ok(()); };
+    let Ok(mut writer) = active.writer.lock() else { return Ok(()); };
     match key.code {
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
             // Send control character (Ctrl+C = 0x03, Ctrl+D = 0x04, etc.)
             let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
-            let _ = active.master.write_all(&[ctrl_char]);
+            let _ = writer.write_all(&[ctrl_char]);
         }
         KeyCode::Char(c) => {
-            let _ = write!(active.master, "{}", c);
+            let _ = write!(writer, "{}", c);
         }
-        KeyCode::Enter => { let _ = write!(active.master, "\r"); }
-        KeyCode::Tab => { let _ = write!(active.master, "\t"); }
-        KeyCode::Backspace => { let _ = write!(active.master, "\x08"); }
-        KeyCode::Esc => { let _ = write!(active.master, "\x1b"); }
-        KeyCode::Left => { let _ = write!(active.master, "\x1b[D"); }
-        KeyCode::Right => { let _ = write!(active.master, "\x1b[C"); }
-        KeyCode::Up => { let _ = write!(active.master, "\x1b[A"); }
-        KeyCode::Down => { let _ = write!(active.master, "\x1b[B"); }
+        KeyCode::Enter => { let _ = write!(writer, "\r"); }
+        KeyCode::Tab => { let _ = write!(writer, "\t"); }
+        KeyCode::Backspace => { let _ = write!(writer, "\x08"); }
+        KeyCode::Esc => { let _ = write!(writer, "\x1b"); }
+        KeyCode::Left => { let _ = write!(writer, "\x1b[D"); }
+        KeyCode::Right => { let _ = write!(writer, "\x1b[C"); }
+        KeyCode::Up => { let _ = write!(writer, "\x1b[A"); }
+        KeyCode::Down => { let _ = write!(writer, "\x1b[B"); }
         _ => {}
     }
     Ok(())
 }
 
 fn split_active(app: &mut AppState, kind: LayoutKind) -> io::Result<()> {
-    let pty_system = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+    let pty_system = native_pty_system();
     let size = PtySize { rows: 30, cols: 120, pixel_width: 0, pixel_height: 0 };
     let pair = pty_system.openpty(size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
     let shell_cmd = detect_shell();
@@ -3292,17 +3459,41 @@ fn split_active(app: &mut AppState, kind: LayoutKind) -> io::Result<()> {
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, 1000)));
     let term_reader = term.clone();
     let mut reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
+    let writer = pair.master.take_writer().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone writer error: {e}")))?;
+
+    // Wrap writer in Arc<Mutex<>> so it can be shared with reader thread for DSR responses
+    let writer = Arc::new(Mutex::new(writer));
+    let writer_for_reader = writer.clone();
+
     thread::spawn(move || {
         let mut local = [0u8; 8192];
         loop {
             match reader.read(&mut local) {
-                Ok(n) if n > 0 => { let mut parser = term_reader.lock().unwrap(); parser.process(&local[..n]); }
+                Ok(n) if n > 0 => {
+                    // Check for DSR (Device Status Report) cursor position query: ESC [ 6 n
+                    let data = &local[..n];
+                    if data.windows(4).any(|w| w == b"\x1b[6n") {
+                        let (row, col) = {
+                            let parser = term_reader.lock().unwrap();
+                            let screen = parser.screen();
+                            let (r, c) = screen.cursor_position();
+                            (r + 1, c + 1)
+                        };
+                        let response = format!("\x1b[{};{}R", row, col);
+                        if let Ok(mut w) = writer_for_reader.lock() {
+                            let _ = w.write_all(response.as_bytes());
+                            let _ = w.flush();
+                        }
+                    }
+                    let mut parser = term_reader.lock().unwrap();
+                    parser.process(&local[..n]);
+                }
                 Ok(_) => thread::sleep(Duration::from_millis(5)),
                 Err(_) => break,
             }
         }
     });
-    let new_leaf = Node::Leaf(Pane { master: pair.master, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id) });
+    let new_leaf = Node::Leaf(Pane { master: pair.master, writer, child, term, last_rows: size.rows, last_cols: size.cols, id: app.next_pane_id, title: format!("pane %{}", app.next_pane_id) });
     app.next_pane_id += 1;
     let win = &mut app.windows[app.active_idx];
     replace_leaf_with_split(&mut win.root, &win.active_path, kind, new_leaf);
@@ -3360,10 +3551,10 @@ fn handle_mouse(app: &mut AppState, me: crossterm::event::MouseEvent, window_are
         }
         MouseEventKind::Up(MouseButton::Left) => { app.drag = None; }
         MouseEventKind::ScrollUp => {
-            if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(active.master, "\x1b[A"); }
+            if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) { if let Ok(mut w) = active.writer.lock() { let _ = write!(w, "\x1b[A"); } }
         }
         MouseEventKind::ScrollDown => {
-            if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(active.master, "\x1b[B"); }
+            if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) { if let Ok(mut w) = active.writer.lock() { let _ = write!(w, "\x1b[B"); } }
         }
         _ => {}
     }
@@ -3379,6 +3570,13 @@ fn kill_active_pane(app: &mut AppState) -> io::Result<()> {
 }
 
 fn detect_shell() -> CommandBuilder {
+    // DEBUG: Test with a simple long-running command to verify PTY works
+    if std::env::var("PSMUX_TEST_PTY").is_ok() {
+        let mut builder = CommandBuilder::new("cmd.exe");
+        builder.args(["/k", "echo PTY TEST && ping -t localhost"]);
+        return builder;
+    }
+
     let pwsh = which::which("pwsh").ok().map(|p| p.to_string_lossy().into_owned());
     let cmd = which::which("cmd").ok().map(|p| p.to_string_lossy().into_owned());
     match pwsh.or(cmd) {
@@ -3387,7 +3585,7 @@ fn detect_shell() -> CommandBuilder {
             // If it's PowerShell, disable inline predictions (ghost text) which doesn't render well in PTY
             if path.to_lowercase().contains("pwsh") {
                 // Use -NoExit with a command to disable predictions, then continue interactive
-                builder.args(["-NoLogo", "-NoExit", "-Command", 
+                builder.args(["-NoLogo", "-NoExit", "-Command",
                     "Set-PSReadLineOption -PredictionSource None -ErrorAction SilentlyContinue"]);
             }
             builder
@@ -3403,7 +3601,7 @@ fn execute_command_prompt(app: &mut AppState) -> io::Result<()> {
     if parts.is_empty() { return Ok(()); }
     match parts[0] {
         "new-window" => {
-            let pty_system = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+            let pty_system = native_pty_system();
             create_window(&*pty_system, app)?;
         }
         "split-window" => {
@@ -3671,6 +3869,8 @@ fn get_active_pane_id(node: &Node, path: &[usize]) -> Option<usize> {
 }
 
 fn reap_children(app: &mut AppState) -> io::Result<bool> {
+    let debug = std::env::var("PSMUX_DEBUG").is_ok();
+    let initial_count = app.windows.len();
     // Transform each window's split tree by pruning exited leaves.
     for i in (0..app.windows.len()).rev() {
         let root = std::mem::replace(&mut app.windows[i].root, Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
@@ -3682,7 +3882,29 @@ fn reap_children(app: &mut AppState) -> io::Result<bool> {
                     app.windows[i].active_path = first_leaf_path(&app.windows[i].root);
                 }
             }
-            None => { app.windows.remove(i); }
+            None => {
+                if debug {
+                    use std::io::Write;
+                    let log_path = std::env::current_dir().unwrap_or_default().join("psmux_debug.log");
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                        let _ = writeln!(f, "[SERVER {}] reap_children: removing window {} (prune_exited returned None)", std::process::id(), i);
+                    }
+                }
+                app.windows.remove(i);
+                // Adjust active_idx if needed
+                if !app.windows.is_empty() {
+                    if app.active_idx >= app.windows.len() {
+                        app.active_idx = app.windows.len() - 1;
+                    }
+                }
+            }
+        }
+    }
+    if debug && app.windows.is_empty() && initial_count > 0 {
+        use std::io::Write;
+        let log_path = std::env::current_dir().unwrap_or_default().join("psmux_debug.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            let _ = writeln!(f, "[SERVER {}] reap_children: all {} windows removed, server will exit", std::process::id(), initial_count);
         }
     }
     Ok(app.windows.is_empty())
@@ -4063,7 +4285,18 @@ fn prune_exited(n: Node) -> Option<Node> {
     match n {
         Node::Leaf(mut p) => {
             match p.child.try_wait() {
-                Ok(Some(_)) => None,
+                Ok(Some(status)) => {
+                    // Only log when a child actually exits
+                    if std::env::var("PSMUX_DEBUG").is_ok() {
+                        use std::io::Write;
+                        let log_path = std::env::current_dir().unwrap_or_default().join("psmux_debug.log");
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                            let _ = writeln!(f, "[SERVER {}] Child process pane {} (pid {:?}) exited with status: {:?}",
+                                std::process::id(), p.id, p.child.process_id(), status);
+                        }
+                    }
+                    None
+                }
                 _ => Some(Node::Leaf(p)),
             }
         }
@@ -4651,6 +4884,22 @@ fn parse_status(fmt: &str, app: &AppState, time_str: &str) -> Vec<Span<'static>>
 }
 
 fn map_color(name: &str) -> Color {
+    // Handle indexed colors: "idx:N"
+    if let Some(idx_str) = name.strip_prefix("idx:") {
+        if let Ok(idx) = idx_str.parse::<u8>() {
+            return Color::Indexed(idx);
+        }
+    }
+    // Handle RGB colors: "rgb:R,G,B"
+    if let Some(rgb_str) = name.strip_prefix("rgb:") {
+        let parts: Vec<&str> = rgb_str.split(',').collect();
+        if parts.len() == 3 {
+            if let (Ok(r), Ok(g), Ok(b)) = (parts[0].parse::<u8>(), parts[1].parse::<u8>(), parts[2].parse::<u8>()) {
+                return Color::Rgb(r, g, b);
+            }
+        }
+    }
+    // Handle named colors
     match name.to_lowercase().as_str() {
         "black" => Color::Black,
         "red" => Color::Red,
@@ -4743,7 +4992,7 @@ fn yank_selection(app: &mut AppState) -> io::Result<()> {
 fn paste_latest(app: &mut AppState) -> io::Result<()> {
     if let Some(buf) = app.paste_buffers.last() {
         let win = &mut app.windows[app.active_idx];
-        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.master, "{}", buf); }
+        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { if let Ok(mut w) = p.writer.lock() { let _ = write!(w, "{}", buf); } }
     }
     Ok(())
 }
@@ -4934,9 +5183,21 @@ fn focus_pane_by_id(app: &mut AppState, pid: usize) {
     if let Some(p) = found { win.active_path = p; }
 }
 fn run_server(session_name: String) -> io::Result<()> {
-    let pty_system = PtySystemSelection::default()
-        .get()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+    // Server debug helper - writes to file
+    fn slog(msg: &str) {
+        if std::env::var("PSMUX_DEBUG").is_ok() {
+            use std::io::Write;
+            let log_path = std::env::current_dir().unwrap_or_default().join("psmux_debug.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                let _ = writeln!(f, "[SERVER {}] {}", std::process::id(), msg);
+            }
+        }
+    }
+
+    slog(&format!("run_server started, session={}", session_name));
+    slog("calling native_pty_system()");
+    let pty_system = native_pty_system();
+    slog("native_pty_system() returned");
 
     let mut app = AppState {
         windows: Vec::new(),
@@ -4970,20 +5231,42 @@ fn run_server(session_name: String) -> io::Result<()> {
         last_window_idx: 0,
         last_pane_path: Vec::new(),
     };
-    create_window(&*pty_system, &mut app)?;
+    slog("AppState created, calling create_window");
+    if let Err(e) = create_window(&*pty_system, &mut app) {
+        slog(&format!("create_window FAILED: {:?}", e));
+        return Err(e);
+    }
+    slog("create_window succeeded");
     let (tx, rx) = mpsc::channel::<CtrlReq>();
     app.control_rx = Some(rx);
 
     // Create named pipe server with user-only security
     let session_name_for_pipe = app.session_name.clone();
+    slog(&format!("registering session: {}", &app.session_name));
     let _ = register_session(&app.session_name);
+    slog("starting named pipe server thread");
 
+    let debug_pipe = std::env::var("PSMUX_DEBUG").is_ok();
     thread::spawn(move || {
+        // Pipe thread logging helper
+        fn plog(msg: &str) {
+            use std::io::Write;
+            let log_path = std::env::current_dir().unwrap_or_default().join("psmux_debug.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                let _ = writeln!(f, "[PIPE {}] {}", std::process::id(), msg);
+            }
+        }
+
+        let mut conn_count = 0u32;
         loop {
             // Create a new pipe instance for each connection
             let pipe = match create_named_pipe_server(&session_name_for_pipe) {
                 Ok(p) => p,
-                Err(_) => { thread::sleep(Duration::from_millis(100)); continue; }
+                Err(e) => {
+                    if debug_pipe { plog(&format!("create_named_pipe_server error: {:?}", e)); }
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
             };
 
             // Wait for client connection
@@ -4991,17 +5274,23 @@ fn run_server(session_name: String) -> io::Result<()> {
                 close_pipe(pipe);
                 continue;
             }
+            conn_count += 1;
+            if debug_pipe { plog(&format!("connection #{}", conn_count)); }
 
             // Read command from pipe
             let mut buf = [0u8; 4096];
             let n = match pipe_read(pipe, &mut buf) {
                 Ok(n) if n > 0 => n,
-                _ => { disconnect_pipe(pipe); close_pipe(pipe); continue; }
+                _ => {
+                    if debug_pipe { plog(&format!("conn #{}: read failed or empty", conn_count)); }
+                    disconnect_pipe(pipe); close_pipe(pipe); continue;
+                }
             };
 
             let line = String::from_utf8_lossy(&buf[..n]).to_string();
             let mut parts = line.split_whitespace();
             let cmd = parts.next().unwrap_or("");
+            if debug_pipe { plog(&format!("conn #{}: cmd={}", conn_count, cmd)); }
             let args: Vec<&str> = parts.by_ref().collect();
             let mut target_win: Option<usize> = None;
             let mut target_pane: Option<usize> = None;
@@ -5400,6 +5689,7 @@ fn run_server(session_name: String) -> io::Result<()> {
                 }
                 _ => {}
             }
+            if debug_pipe { plog(&format!("conn #{}: done", conn_count)); }
             disconnect_pipe(pipe);
             close_pipe(pipe);
         }
@@ -6054,11 +6344,13 @@ fn run_server(session_name: String) -> io::Result<()> {
         // Check if all windows/panes have exited
         if reap_children(&mut app)? {
             // All windows are gone - unregister session and exit server
+            slog("all windows gone, exiting server");
             unregister_session(&app.session_name);
             break;
         }
         thread::sleep(Duration::from_millis(5));  // Faster response, lower latency
     }
+    slog("server main loop ended");
     Ok(())
 }
 
@@ -6109,7 +6401,9 @@ fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                         if let Some(cell) = screen.cell(r, c) {
                             let fg = color_to_name(cell.fgcolor());
                             let bg = color_to_name(cell.bgcolor());
-                            let text = cell.contents().to_string();
+                            // Treat empty cells as spaces (important for tab stops)
+                            let contents = cell.contents();
+                            let text = if contents.is_empty() { " ".to_string() } else { contents.to_string() };
                             row.push(CellJson { text, fg, bg, bold: cell.bold(), italic: cell.italic(), underline: cell.underline(), inverse: cell.inverse(), dim: cell.dim() });
                         } else {
                             row.push(CellJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), bold: false, italic: false, underline: false, inverse: false, dim: false });
@@ -6300,7 +6594,7 @@ fn color_to_name(c: vt100::Color) -> String {
 
 fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
     let win = &mut app.windows[app.active_idx];
-    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.master, "{}", text); }
+    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { if let Ok(mut w) = p.writer.lock() { let _ = write!(w, "{}", text); } }
     Ok(())
 }
 
@@ -6334,25 +6628,27 @@ fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
     
     let win = &mut app.windows[app.active_idx];
     if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-        match k {
-            "enter" => { let _ = write!(p.master, "\r"); }
-            "tab" => { let _ = write!(p.master, "\t"); }
-            "backspace" => { let _ = write!(p.master, "\x08"); }
-            "esc" => { let _ = write!(p.master, "\x1b"); }
-            "left" => { let _ = write!(p.master, "\x1b[D"); }
-            "right" => { let _ = write!(p.master, "\x1b[C"); }
-            "up" => { let _ = write!(p.master, "\x1b[A"); }
-            "down" => { let _ = write!(p.master, "\x1b[B"); }
-            "pageup" => { let _ = write!(p.master, "\x1b[5~"); }
-            "pagedown" => { let _ = write!(p.master, "\x1b[6~"); }
-            "space" => { let _ = write!(p.master, " "); }
-            // Control keys: C-c, C-d, C-z, etc.
-            s if s.starts_with("C-") && s.len() == 3 => {
-                let c = s.chars().nth(2).unwrap_or('c');
-                let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
-                let _ = p.master.write_all(&[ctrl_char]);
+        if let Ok(mut w) = p.writer.lock() {
+            match k {
+                "enter" => { let _ = write!(w, "\r"); }
+                "tab" => { let _ = write!(w, "\t"); }
+                "backspace" => { let _ = write!(w, "\x08"); }
+                "esc" => { let _ = write!(w, "\x1b"); }
+                "left" => { let _ = write!(w, "\x1b[D"); }
+                "right" => { let _ = write!(w, "\x1b[C"); }
+                "up" => { let _ = write!(w, "\x1b[A"); }
+                "down" => { let _ = write!(w, "\x1b[B"); }
+                "pageup" => { let _ = write!(w, "\x1b[5~"); }
+                "pagedown" => { let _ = write!(w, "\x1b[6~"); }
+                "space" => { let _ = write!(w, " "); }
+                // Control keys: C-c, C-d, C-z, etc.
+                s if s.starts_with("C-") && s.len() == 3 => {
+                    let c = s.chars().nth(2).unwrap_or('c');
+                    let ctrl_char = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a' - 1);
+                    let _ = w.write_all(&[ctrl_char]);
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
     Ok(())
@@ -6513,8 +6809,8 @@ fn remote_mouse_down(app: &mut AppState, x: u16, y: u16) {
 
 fn remote_mouse_drag(app: &mut AppState, x: u16, y: u16) { let win = &mut app.windows[app.active_idx]; if let Some(d) = &app.drag { adjust_split_sizes(&mut win.root, d, x, y); } }
 
-fn remote_scroll_up(app: &mut AppState) { let win = &mut app.windows[app.active_idx]; if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.master, "\x1b[A"); } }
-fn remote_scroll_down(app: &mut AppState) { let win = &mut app.windows[app.active_idx]; if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.master, "\x1b[B"); } }
+fn remote_scroll_up(app: &mut AppState) { let win = &mut app.windows[app.active_idx]; if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { if let Ok(mut w) = p.writer.lock() { let _ = write!(w, "\x1b[A"); } } }
+fn remote_scroll_down(app: &mut AppState) { let win = &mut app.windows[app.active_idx]; if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { if let Ok(mut w) = p.writer.lock() { let _ = write!(w, "\x1b[B"); } } }
 
 // New helper functions for tmux compatibility
 
@@ -6621,16 +6917,13 @@ fn rotate_panes(app: &mut AppState, _reverse: bool) {
 fn break_pane_to_window(app: &mut AppState) {
     // This would require extracting the current pane from its split and creating a new window
     // For now, just create a new window
-    let pty_system = match PtySystemSelection::default().get() {
-        Ok(p) => p,
-        Err(_) => return,
-    };
+    let pty_system = native_pty_system();
     let _ = create_window(&*pty_system, app);
 }
 
 fn respawn_active_pane(app: &mut AppState) -> io::Result<()> {
     // Respawn the shell in the active pane
-    let pty_system = PtySystemSelection::default().get().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("pty system error: {e}")))?;
+    let pty_system = native_pty_system();
     let win = &mut app.windows[app.active_idx];
     let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) else { return Ok(()); };
     

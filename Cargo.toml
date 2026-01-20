@@ -24,10 +24,14 @@ path = "src/main.rs"
 name = "tmux"
 path = "src/main.rs"
 
+[[bin]]
+name = "pty_test"
+path = "src/bin/pty_test.rs"
+
 [dependencies]
 ratatui = "0.26"
 crossterm = "0.28"
-portable-pty = "0.2"
+portable-pty = "0.9"
 which = "6"
 chrono = "0.4"
 vt100 = "0.16"
