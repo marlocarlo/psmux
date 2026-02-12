@@ -72,12 +72,6 @@ To uninstall:
 irm https://raw.githubusercontent.com/marlocarlo/psmux/master/scripts/uninstall.ps1 | iex
 ```
 
-### Using Cargo
-
-```powershell
-cargo install psmux
-```
-
 ### Using Scoop
 
 ```powershell
