@@ -1582,8 +1582,27 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
             }
         }
         MouseEventKind::Moved => {
-            // Don't forward bare motion - only forward drag events
-            // Most TUI apps don't want constant mouse position updates
+            // Forward bare mouse motion (hover) to child PTY only when the
+            // active pane is in alternate screen mode (real TUI app like
+            // htop, vim, opencode).  Shell prompts are excluded — PSReadLine
+            // spuriously enables mouse tracking on ConPTY.
+            let child_in_alt = active_pane(&win.root, &win.active_path)
+                .map_or(false, |p| {
+                    if let Ok(parser) = p.term.lock() {
+                        return parser.screen().alternate_screen();
+                    }
+                    false
+                });
+            if child_in_alt {
+                if let Some(area) = active_area {
+                    if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                        // SGR button 35 = bare motion (no button held)
+                        forward_mouse_to_pane_ex(active, area, me.column, me.row,
+                            0, crate::platform::mouse_inject::MOUSE_MOVED,
+                            35, true);
+                    }
+                }
+            }
         }
         MouseEventKind::ScrollUp => {
             if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. }) {

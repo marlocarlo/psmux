@@ -550,10 +550,37 @@ pub fn remote_mouse_button(app: &mut AppState, x: u16, y: u16, button: u8, press
     }
 }
 
-/// Forward mouse motion to the child PTY - currently disabled to avoid garbage.
-/// Most TUI apps don't want constant mouse position updates without button held.
-pub fn remote_mouse_motion(_app: &mut AppState, _x: u16, _y: u16) {
-    // Don't forward bare motion - only forward drag events
+/// Forward bare mouse motion (hover) to the child PTY.
+/// Only forwarded when the active pane is in alternate screen mode (real TUI
+/// apps like htop, vim, opencode).  Shell prompts (PSReadLine) are excluded
+/// because they spuriously enable mouse tracking on ConPTY.
+/// SGR button 35 = bare motion with no button held.
+pub fn remote_mouse_motion(app: &mut AppState, x: u16, y: u16) {
+    let win = &mut app.windows[app.active_idx];
+    let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
+    compute_rects(&win.root, app.last_window_area, &mut rects);
+
+    // Only forward hover when the active pane is in alternate screen
+    // (reliable TUI detection — matches scroll-event gating logic).
+    let in_alt = active_pane(&win.root, &win.active_path)
+        .map_or(false, |p| {
+            if let Ok(parser) = p.term.lock() {
+                return parser.screen().alternate_screen();
+            }
+            false
+        });
+    if !in_alt {
+        return;
+    }
+
+    if let Some(area) = rects.iter().find(|(path, _)| *path == win.active_path).map(|(_, a)| *a) {
+        let (col, row) = pane_inner_cell_0based(area, x, y);
+        let win_name = win.name.clone();
+        if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+            inject_mouse_combined(active, col, row, 35, true,
+                0, mouse_inject::MOUSE_MOVED, &win_name);
+        }
+    }
 }
 
 fn wheel_cell_for_area(area: Rect, x: u16, y: u16) -> (u16, u16) {

@@ -1438,7 +1438,18 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                             MouseEventKind::Up(MouseButton::Right) => {}
                             MouseEventKind::Up(MouseButton::Middle) => {}
                             MouseEventKind::Moved => {
-                                // Don't send bare mouse-move to server - wasteful and server ignores it
+                                // Forward bare mouse motion (hover) to server only when the
+                                // active pane is in alternate screen mode (real TUI app like
+                                // htop, vim, opencode).  At a shell prompt, hover is not sent
+                                // to avoid wasteful socket traffic.
+                                let tui_active = if !prev_dump_buf.is_empty() {
+                                    serde_json::from_str::<DumpState>(&prev_dump_buf)
+                                        .map(|s| active_pane_in_alt_screen(&s.layout))
+                                        .unwrap_or(false)
+                                } else { false };
+                                if tui_active {
+                                    cmd_batch.push(format!("mouse-move {} {}\n", me.column, me.row));
+                                }
                             }
                             MouseEventKind::ScrollUp => {
                                 // Clear client-side selection when scrolling — server may
