@@ -785,6 +785,8 @@ fn lookup_option(name: &str, app: &AppState) -> Option<String> {
         "automatic-rename" => Some(if app.automatic_rename { "on".into() } else { "off".into() }),
         "monitor-activity" => Some(if app.monitor_activity { "on".into() } else { "off".into() }),
         "remain-on-exit" => Some(if app.remain_on_exit { "on".into() } else { "off".into() }),
+        "destroy-unattached" => Some(if app.destroy_unattached { "on".into() } else { "off".into() }),
+        "exit-empty" => Some(if app.exit_empty { "on".into() } else { "off".into() }),
         "set-titles" => Some(if app.set_titles { "on".into() } else { "off".into() }),
         "set-titles-string" => Some(app.set_titles_string.clone()),
         "pane-border-style" => Some(app.pane_border_style.clone()),

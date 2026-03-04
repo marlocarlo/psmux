@@ -422,7 +422,30 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let _ = resp.send(line);
                 }
                 CtrlReq::ClientAttach => { app.attached_clients = app.attached_clients.saturating_add(1); hook_event = Some("client-attached"); }
-                CtrlReq::ClientDetach => { app.attached_clients = app.attached_clients.saturating_sub(1); hook_event = Some("client-detached"); }
+                CtrlReq::ClientDetach => {
+                    app.attached_clients = app.attached_clients.saturating_sub(1);
+                    hook_event = Some("client-detached");
+                    if app.attached_clients == 0 && app.destroy_unattached {
+                        // 仅在没有可用 pane 时才跟随最后客户端 detach 退出；
+                        // 否则保持会话存活，避免 destroy-unattached 抢先于 exit-empty/off 语义。
+                        let has_live_pane = app.windows.iter().any(|w| {
+                            crate::tree::count_panes(&w.root) > 0
+                        });
+                        if !has_live_pane {
+                            for win in app.windows.iter_mut() {
+                                kill_all_children(&mut win.root);
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                            let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
+                            let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
+                            let _ = std::fs::remove_file(&regpath);
+                            let _ = std::fs::remove_file(&keypath);
+                            crate::types::shutdown_persistent_streams();
+                            std::process::exit(0);
+                        }
+                    }
+                }
                 CtrlReq::DumpLayout(resp) => {
                     let json = dump_layout_json(&mut app)?;
                     let _ = resp.send(json);
@@ -1402,6 +1425,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             "status-style" => { app.status_style = String::new(); }
                             "renumber-windows" => { app.renumber_windows = false; }
                             "remain-on-exit" => { app.remain_on_exit = false; }
+                            "destroy-unattached" => { app.destroy_unattached = false; }
+                            "exit-empty" => { app.exit_empty = true; }
                             "automatic-rename" => { app.automatic_rename = true; }
                             "pane-border-style" => { app.pane_border_style = String::new(); }
                             "pane-active-border-style" => { app.pane_active_border_style = "fg=green".to_string(); }
@@ -1456,6 +1481,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     output.push_str(&format!("monitor-activity {}\n", if app.monitor_activity { "on" } else { "off" }));
                     output.push_str(&format!("synchronize-panes {}\n", if app.sync_input { "on" } else { "off" }));
                     output.push_str(&format!("remain-on-exit {}\n", if app.remain_on_exit { "on" } else { "off" }));
+                    output.push_str(&format!("destroy-unattached {}\n", if app.destroy_unattached { "on" } else { "off" }));
+                    output.push_str(&format!("exit-empty {}\n", if app.exit_empty { "on" } else { "off" }));
                     output.push_str(&format!("set-titles {}\n", if app.set_titles { "on" } else { "off" }));
                     if !app.set_titles_string.is_empty() {
                         output.push_str(&format!("set-titles-string \"{}\"\n", app.set_titles_string));
@@ -2063,7 +2090,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             state_dirty = true;
             meta_dirty = true;
         }
-        if all_empty {
+        if app.exit_empty && all_empty {
             let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
             let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
             let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());

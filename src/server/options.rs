@@ -48,6 +48,8 @@ pub(crate) fn get_option_value(app: &AppState, name: &str) -> String {
         "monitor-activity" => if app.monitor_activity { "on".into() } else { "off".into() },
         "synchronize-panes" => if app.sync_input { "on".into() } else { "off".into() },
         "remain-on-exit" => if app.remain_on_exit { "on".into() } else { "off".into() },
+        "destroy-unattached" => if app.destroy_unattached { "on".into() } else { "off".into() },
+        "exit-empty" => if app.exit_empty { "on".into() } else { "off".into() },
         "set-titles" => if app.set_titles { "on".into() } else { "off".into() },
         "set-titles-string" => app.set_titles_string.clone(),
         "prediction-dimming" => if app.prediction_dimming { "on".into() } else { "off".into() },
@@ -236,6 +238,8 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, qu
         "focus-events" => { app.focus_events = matches!(value, "on" | "true" | "1"); }
         "renumber-windows" => { app.renumber_windows = matches!(value, "on" | "true" | "1"); }
         "remain-on-exit" => { app.remain_on_exit = matches!(value, "on" | "true" | "1"); }
+        "destroy-unattached" => { app.destroy_unattached = matches!(value, "on" | "true" | "1"); }
+        "exit-empty" => { app.exit_empty = matches!(value, "on" | "true" | "1"); }
         "set-titles" => { app.set_titles = matches!(value, "on" | "true" | "1"); }
         "set-titles-string" => { app.set_titles_string = value.to_string(); }
         "default-command" | "default-shell" => { app.default_shell = value.to_string(); }

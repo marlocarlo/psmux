@@ -310,6 +310,10 @@ pub struct AppState {
     pub visual_activity: bool,
     /// remain-on-exit: keep panes open after process exits
     pub remain_on_exit: bool,
+    /// destroy-unattached: exit server when no clients remain attached
+    pub destroy_unattached: bool,
+    /// exit-empty: exit server when all panes/windows are empty
+    pub exit_empty: bool,
     /// aggressive-resize: resize window to smallest attached client
     pub aggressive_resize: bool,
     /// set-titles: update terminal title
@@ -476,6 +480,8 @@ impl AppState {
             monitor_activity: false,
             visual_activity: false,
             remain_on_exit: false,
+            destroy_unattached: false,
+            exit_empty: true,
             aggressive_resize: false,
             set_titles: false,
             set_titles_string: String::new(),

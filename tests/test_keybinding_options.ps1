@@ -323,6 +323,72 @@ Write-Info "  session_name = $msg"
 if ($msg -eq $SESSION) { Write-Pass "display-message format works" } else { Write-Fail "display-message: $msg != $SESSION" }
 
 # ============================================================
+Write-Host ""
+Write-Host ("=" * 60)
+Write-Host "13. NEW EXIT STRATEGY OPTIONS"
+Write-Host ("=" * 60)
+
+Write-Test "13.1 show-options includes destroy-unattached and exit-empty"
+$allOptions = (& $PSMUX show-options -t $SESSION -g 2>&1 | Out-String)
+$hasDestroy = $allOptions -match "destroy-unattached"
+$hasExitEmpty = $allOptions -match "exit-empty"
+if ($hasDestroy -and $hasExitEmpty) {
+    Write-Pass "show-options includes new exit strategy options"
+} else {
+    Write-Fail "show-options missing new options (destroy=$hasDestroy exit-empty=$hasExitEmpty)"
+}
+
+Write-Test "13.2 set/show destroy-unattached on/off"
+Psmux set -g destroy-unattached on | Out-Null
+$val = (& $PSMUX show-options -t $SESSION -g -v destroy-unattached 2>&1 | Out-String).Trim()
+$okOn = ($val -match "on")
+Psmux set -g destroy-unattached off | Out-Null
+$val2 = (& $PSMUX show-options -t $SESSION -g -v destroy-unattached 2>&1 | Out-String).Trim()
+$okOff = ($val2 -match "off")
+if ($okOn -and $okOff) { Write-Pass "destroy-unattached set/show works" } else { Write-Fail "destroy-unattached set/show failed: on='$val' off='$val2'" }
+
+Write-Test "13.3 unset destroy-unattached defaults to off"
+Psmux set -g destroy-unattached on | Out-Null
+Psmux set -u destroy-unattached | Out-Null
+$val = (& $PSMUX show-options -t $SESSION -g -v destroy-unattached 2>&1 | Out-String).Trim()
+if ($val -match "off") { Write-Pass "destroy-unattached unset -> off" } else { Write-Fail "destroy-unattached unset default wrong: $val" }
+
+Write-Test "13.4 set/show exit-empty on/off"
+Psmux set -g exit-empty off | Out-Null
+$val = (& $PSMUX show-options -t $SESSION -g -v exit-empty 2>&1 | Out-String).Trim()
+$okOff = ($val -match "off")
+Psmux set -g exit-empty on | Out-Null
+$val2 = (& $PSMUX show-options -t $SESSION -g -v exit-empty 2>&1 | Out-String).Trim()
+$okOn = ($val2 -match "on")
+if ($okOn -and $okOff) { Write-Pass "exit-empty set/show works" } else { Write-Fail "exit-empty set/show failed: off='$val' on='$val2'" }
+
+Write-Test "13.5 unset exit-empty defaults to on"
+Psmux set -g exit-empty off | Out-Null
+Psmux set -u exit-empty | Out-Null
+$val = (& $PSMUX show-options -t $SESSION -g -v exit-empty 2>&1 | Out-String).Trim()
+if ($val -match "on") { Write-Pass "exit-empty unset -> on" } else { Write-Fail "exit-empty unset default wrong: $val" }
+
+Write-Test "13.6 source-file applies destroy-unattached/exit-empty"
+$tempConf = Join-Path $env:TEMP ("psmux_exit_opts_" + [guid]::NewGuid().ToString() + ".conf")
+@(
+    "set -g destroy-unattached on"
+    "set -g exit-empty off"
+) | Set-Content -Path $tempConf -Encoding UTF8
+Psmux source-file $tempConf | Out-Null
+$fromConf1 = (& $PSMUX show-options -t $SESSION -g -v destroy-unattached 2>&1 | Out-String).Trim()
+$fromConf2 = (& $PSMUX show-options -t $SESSION -g -v exit-empty 2>&1 | Out-String).Trim()
+Remove-Item $tempConf -Force -ErrorAction SilentlyContinue
+if (($fromConf1 -match "on") -and ($fromConf2 -match "off")) {
+    Write-Pass "source-file applies new options"
+} else {
+    Write-Fail "source-file new options failed: destroy='$fromConf1' exit-empty='$fromConf2'"
+}
+
+# reset for subsequent behavior consistency
+Psmux set -g destroy-unattached off | Out-Null
+Psmux set -g exit-empty on | Out-Null
+
+# ============================================================
 # CLEANUP
 # ============================================================
 Write-Host ""

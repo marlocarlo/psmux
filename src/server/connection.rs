@@ -119,17 +119,27 @@ if line.trim().starts_with("TARGET ") {
 }
 
 // Process commands in a loop to handle batching
+let mut attached_sent = false;
 loop {
     if line.trim().is_empty() {
         // Try to read another command with timeout
         line.clear();
         match r.read_line(&mut line) {
-            Ok(0) => break, // EOF - client disconnected
+            Ok(0) => {
+                // EOF - client disconnected
+                if attached_sent {
+                    let _ = tx.send(CtrlReq::ClientDetach);
+                }
+                break;
+            }
             Err(e) => {
                 // In persistent mode, timeouts are expected - keep waiting
                 if persistent && (e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut) {
                     line.clear(); // Clear any partial data from interrupted read
                     continue;
+                }
+                if attached_sent {
+                    let _ = tx.send(CtrlReq::ClientDetach);
                 }
                 break; // Real error or non-persistent timeout
             }
@@ -671,8 +681,18 @@ match cmd {
         if let Ok(line) = rrx.recv() { let _ = write!(write_stream, "{}\n", line); let _ = write_stream.flush(); }
         if !persistent { break; }
     }
-    "client-attach" => { let _ = tx.send(CtrlReq::ClientAttach); if !persistent { let _ = write!(write_stream, "ok\n"); } }
-    "client-detach" => { let _ = tx.send(CtrlReq::ClientDetach); if !persistent { let _ = write!(write_stream, "ok\n"); } }
+    "client-attach" => {
+        if !attached_sent {
+            let _ = tx.send(CtrlReq::ClientAttach);
+            attached_sent = true;
+        }
+        if !persistent { let _ = write!(write_stream, "ok\n"); }
+    }
+    "client-detach" => {
+        let _ = tx.send(CtrlReq::ClientDetach);
+        attached_sent = false;
+        if !persistent { let _ = write!(write_stream, "ok\n"); }
+    }
     "bind-key" | "bind" => {
         let mut table = "prefix".to_string();
         let mut repeatable = false;
@@ -979,8 +999,16 @@ match cmd {
         let _ = tx.send(CtrlReq::ConfirmBefore(prompt_str, command));
     }
     // tmux standard aliases
-    "detach-client" | "detach" => { let _ = tx.send(CtrlReq::ClientDetach); }
-    "attach-session" | "attach" => { let _ = tx.send(CtrlReq::ClientAttach); }
+    "detach-client" | "detach" => {
+        let _ = tx.send(CtrlReq::ClientDetach);
+        attached_sent = false;
+    }
+    "attach-session" | "attach" => {
+        if !attached_sent {
+            let _ = tx.send(CtrlReq::ClientAttach);
+            attached_sent = true;
+        }
+    }
     "kill-server" => { let _ = tx.send(CtrlReq::KillServer); }
     "choose-tree" | "choose-window" | "choose-session" => {
         // These are interactive choosers — send a dump that client handles
@@ -1137,11 +1165,20 @@ match cmd {
     // Try to read next command for batching (with timeout)
     line.clear();
     match r.read_line(&mut line) {
-        Ok(0) => break, // EOF - client disconnected
+        Ok(0) => {
+            // EOF - client disconnected
+            if attached_sent {
+                let _ = tx.send(CtrlReq::ClientDetach);
+            }
+            break;
+        }
         Err(e) => {
             if persistent && (e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut) {
                 line.clear(); // Clear any partial data from interrupted read
                 continue; // Persistent mode - keep waiting
+            }
+            if attached_sent {
+                let _ = tx.send(CtrlReq::ClientDetach);
             }
             break; // Non-persistent timeout or real error
         }

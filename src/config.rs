@@ -511,6 +511,12 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         "remain-on-exit" => {
             app.remain_on_exit = matches!(value, "on" | "true" | "1");
         }
+        "destroy-unattached" => {
+            app.destroy_unattached = matches!(value, "on" | "true" | "1");
+        }
+        "exit-empty" => {
+            app.exit_empty = matches!(value, "on" | "true" | "1");
+        }
         "aggressive-resize" => {
             app.aggressive_resize = matches!(value, "on" | "true" | "1");
         }
