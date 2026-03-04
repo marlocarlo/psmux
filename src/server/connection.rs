@@ -430,6 +430,7 @@ match cmd {
     "set-pane-title" => { let title = args.join(" "); let _ = tx.send(CtrlReq::SetPaneTitle(title)); }
     "send-keys" => {
         let literal = args.iter().any(|a| *a == "-l");
+        let paste_mode = args.iter().any(|a| *a == "-p");
         let has_x = args.iter().any(|a| *a == "-X");
         // Parse -N <count> for repeat
         let mut repeat_count: usize = 1;
@@ -455,7 +456,12 @@ match cmd {
                 .map(|(_, a)| *a)
                 .collect();
             for _ in 0..repeat_count {
-                let _ = tx.send(CtrlReq::SendKeys(keys.join(" "), literal));
+                if paste_mode {
+                    // Legacy compatibility: send-keys -p pastes text as bracketed paste.
+                    let _ = tx.send(CtrlReq::SendPaste(keys.join(" ")));
+                } else {
+                    let _ = tx.send(CtrlReq::SendKeys(keys.join(" "), literal));
+                }
             }
         }
     }
@@ -615,11 +621,44 @@ match cmd {
         if !persistent { break; }
     }
     "display-message" | "display" => {
-        let fmt = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<&str>>().join(" ");
+        // Parse tmux-like display-message flags without dropping message text.
+        // Supported (parsing): -p, -I <input>, -d <ms>, -F, --
+        // Note: -t is handled globally before this match arm.
+        let mut print_stdout = false;
+        let mut parts: Vec<&str> = Vec::new();
+        let mut end_of_opts = false;
+        let mut i = 0;
+        while i < args.len() {
+            let a = args[i];
+            if end_of_opts {
+                parts.push(a);
+                i += 1;
+                continue;
+            }
+            match a {
+                "--" => { end_of_opts = true; }
+                "-p" => { print_stdout = true; }
+                "-F" => { /* format mode; message is expanded server-side */ }
+                "-I" | "-d" => {
+                    // Consume argument for compatibility even if currently unused.
+                    i += 1;
+                }
+                _ if a.starts_with('-') => {
+                    // Unknown switch: keep as message text for best compatibility.
+                    parts.push(a);
+                }
+                _ => parts.push(a),
+            }
+            i += 1;
+        }
+
+        let fmt = parts.join(" ");
         let (rtx, rrx) = mpsc::channel::<String>();
         let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt));
-        if let Ok(text) = rrx.recv() { let _ = writeln!(write_stream, "{}", text); let _ = write_stream.flush(); }
-        if !persistent { break; }
+        if print_stdout {
+            if let Ok(text) = rrx.recv() { let _ = writeln!(write_stream, "{}", text); let _ = write_stream.flush(); }
+            if !persistent { break; }
+        }
     }
     "last-window" | "last" => { let _ = tx.send(CtrlReq::LastWindow); }
     "last-pane" | "lastp" => { let _ = tx.send(CtrlReq::LastPane); }
@@ -702,6 +741,15 @@ match cmd {
         }
     }
     "show-options" | "show" | "show-window-options" | "showw" => {
+        let has_a = args.iter().any(|a| *a == "-A");
+        let _has_h = args.iter().any(|a| *a == "-H");
+        let _has_g = args.iter().any(|a| *a == "-g");
+        let has_s = args.iter().any(|a| *a == "-s");
+        let has_w = args.iter().any(|a| *a == "-w");
+        // tmux-like scoping: show-window-options/showw imply window scope,
+        // while show-options defaults to session scope unless -w is present.
+        let window_scope = matches!(cmd, "show-window-options" | "showw") || has_w;
+        let _session_scope = has_s || !window_scope;
         let has_v = args.iter().any(|a| *a == "-v");
         let has_q = args.iter().any(|a| *a == "-q");
         let opt_name: Option<&str> = args.iter()
@@ -712,27 +760,74 @@ match cmd {
             // Single-option query: show-options -v <name> or show <name>
             if let Some(name) = opt_name {
                 let (rtx, rrx) = mpsc::channel::<String>();
-                let _ = tx.send(CtrlReq::ShowOptionValue(rtx, name.to_string()));
+                if window_scope {
+                    let _ = tx.send(CtrlReq::ShowWindowOptionValue(rtx, name.to_string()));
+                } else {
+                    let _ = tx.send(CtrlReq::ShowOptionValue(rtx, name.to_string()));
+                }
                 if let Ok(text) = rrx.recv() {
-                    if has_v {
-                        let _ = write!(write_stream, "{}\n", text);
+                    let resolved = if text.is_empty() && window_scope && has_a {
+                        // -A inherited: fall back to session scope when a window
+                        // option is not found.
+                        let (frtx, frrx) = mpsc::channel::<String>();
+                        let _ = tx.send(CtrlReq::ShowOptionValue(frtx, name.to_string()));
+                        frrx.recv().unwrap_or_default()
                     } else {
-                        let _ = write!(write_stream, "{} {}\n", name, text);
+                        text
+                    };
+                    // -q suppresses empty/missing values in single-option mode.
+                    if !(has_q && resolved.is_empty()) {
+                        if has_v {
+                            let _ = write!(write_stream, "{}\n", resolved);
+                        } else {
+                            let _ = write!(write_stream, "{} {}\n", name, resolved);
+                        }
+                        let _ = write_stream.flush();
                     }
-                    let _ = write_stream.flush();
                 }
             }
         } else {
-            let (rtx, rrx) = mpsc::channel::<String>();
-            let _ = tx.send(CtrlReq::ShowOptions(rtx));
-            if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
+            if window_scope {
+                let (rtx, rrx) = mpsc::channel::<String>();
+                let _ = tx.send(CtrlReq::ShowWindowOptions(rtx));
+                if let Ok(mut text) = rrx.recv() {
+                    if has_a {
+                        let (srtx, srrx) = mpsc::channel::<String>();
+                        let _ = tx.send(CtrlReq::ShowOptions(srtx));
+                        if let Ok(session_text) = srrx.recv() {
+                            if !text.ends_with('\n') && !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(&session_text);
+                        }
+                    }
+                    let _ = write!(write_stream, "{}\n", text);
+                    let _ = write_stream.flush();
+                }
+            } else {
+                let (rtx, rrx) = mpsc::channel::<String>();
+                let _ = tx.send(CtrlReq::ShowOptions(rtx));
+                if let Ok(text) = rrx.recv() { let _ = write!(write_stream, "{}\n", text); let _ = write_stream.flush(); }
+            }
         }
         if !persistent { break; }
     }
     "source-file" | "source" => {
+        // Preserve key source-file semantics used by tmux scripts:
+        // -F expands formats in path, -n parses-only (no execute).
+        // -q/-v are accepted for compatibility but currently no-op here.
+        let format_expand = args.iter().any(|a| *a == "-F");
+        let parse_only = args.iter().any(|a| *a == "-n");
         let non_flag_args: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).copied().collect();
-        if let Some(path) = non_flag_args.first() {
-            let _ = tx.send(CtrlReq::SourceFile(path.to_string()));
+        if !parse_only {
+            if let Some(path) = non_flag_args.first() {
+                let source_spec = if format_expand {
+                    format!("-F {}", path)
+                } else {
+                    path.to_string()
+                };
+                let _ = tx.send(CtrlReq::SourceFile(source_spec));
+            }
         }
     }
     "move-window" | "movew" => {

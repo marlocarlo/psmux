@@ -664,6 +664,7 @@ pub enum CtrlReq {
     SetOptionUnset(String),  // set-option -u
     SetOptionAppend(String, String),  // set-option -a
     ShowOptions(mpsc::Sender<String>),
+    ShowWindowOptions(mpsc::Sender<String>),
     SourceFile(String),
     MoveWindow(Option<usize>),
     SwapWindow(usize),
@@ -697,6 +698,7 @@ pub enum CtrlReq {
     ResizePaneAbsolute(String, u16),
     ResizePanePercent(String, u8), // axis, percentage (0-100)
     ShowOptionValue(mpsc::Sender<String>, String),
+    ShowWindowOptionValue(mpsc::Sender<String>, String),
     ChooseBuffer(mpsc::Sender<String>),
     ServerInfo(mpsc::Sender<String>),
     SendPrefix,

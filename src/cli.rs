@@ -102,6 +102,7 @@ KEY BINDING COMMANDS:
     list-keys, lsk          List all key bindings
     send-keys, send         Send keys to a pane
         -l                  Send literally (no key parsing)
+        -p                  Paste text (legacy compatibility)
         -t <target>         Target pane
 
 CONFIGURATION COMMANDS:
@@ -111,7 +112,7 @@ CONFIGURATION COMMANDS:
         -a                  Append to current value
         -q                  Quiet (no error on unknown option)
     show-options, show      Show all options and values
-    show-window-options, showw  (Alias for show-options)
+    show-window-options, showw  Show window-scoped options
     source-file, source     Execute commands from a config file
     set-environment, setenv Set an environment variable
     show-environment, showenv Show environment variables

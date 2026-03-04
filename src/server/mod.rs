@@ -22,7 +22,7 @@ use crate::tree::{self, active_pane, active_pane_mut, resize_all_panes, kill_all
 
 use helpers::{collect_pane_paths_server, serialize_bindings_json, json_escape_string,
     list_windows_json_with_tabs, combined_data_version, TMUX_COMMANDS};
-use options::{get_option_value, apply_set_option};
+use options::{get_option_value, get_window_option_value, render_window_options, apply_set_option};
 
 use crate::input::{send_text_to_active, send_key_to_active, send_paste_to_active, move_focus};
 use crate::copy_mode::{enter_copy_mode, exit_copy_mode, move_copy_cursor, current_prompt_pos,
@@ -1511,15 +1511,17 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let _ = resp.send(output);
                 }
                 CtrlReq::SourceFile(path) => {
-                    // Reuse full config parser for source-file (handles all options, binds, etc.)
-                    let expanded = if path.starts_with('~') {
-                        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                        path.replacen('~', &home, 1)
-                    } else {
-                        path.clone()
-                    };
-                    // Support glob patterns (needed by tpm: source ~/.tmux/plugins/*/*.tmux)
-                    if expanded.contains('*') || expanded.contains('?') {
+                    // Use config helper for standard source-file behavior (-F support,
+                    // nested parse context). Keep direct glob handling for wildcard sources.
+                    let is_format_expand = path.starts_with("-F ") || path.starts_with("-F\t");
+                    let path_for_glob = if is_format_expand { path[3..].trim() } else { &path };
+                    if !is_format_expand && (path_for_glob.contains('*') || path_for_glob.contains('?')) {
+                        let expanded = if path_for_glob.starts_with('~') {
+                            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                            path_for_glob.replacen('~', &home, 1)
+                        } else {
+                            path_for_glob.to_string()
+                        };
                         if let Ok(entries) = glob::glob(&expanded) {
                             for entry in entries.flatten() {
                                 if let Ok(contents) = std::fs::read_to_string(&entry) {
@@ -1527,8 +1529,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 }
                             }
                         }
-                    } else if let Ok(contents) = std::fs::read_to_string(&expanded) {
-                        parse_config_content(&mut app, &contents);
+                    } else {
+                        crate::config::source_file(&mut app, &path);
                     }
                 }
                 CtrlReq::MoveWindow(target) => {
@@ -1876,6 +1878,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::ShowOptionValue(resp, name) => {
                     let val = get_option_value(&app, &name);
                     let _ = resp.send(val);
+                }
+                CtrlReq::ShowWindowOptionValue(resp, name) => {
+                    let val = get_window_option_value(&app, &name);
+                    let _ = resp.send(val);
+                }
+                CtrlReq::ShowWindowOptions(resp) => {
+                    let _ = resp.send(render_window_options(&app));
                 }
                 CtrlReq::ChooseBuffer(resp) => {
                     let mut output = String::new();
