@@ -41,11 +41,21 @@ use crate::util::{list_windows_json, list_tree_json, list_windows_tmux, base64_e
 use crate::format::{expand_format, format_list_windows, format_list_panes, set_buffer_idx_override};
 use crate::help;
 
+fn should_spawn_warm_server(app: &AppState) -> bool {
+    app.session_name != "__warm__" && !app.destroy_unattached
+}
+
 /// Spawn a standby "warm server" process that pre-loads config + shell.
 /// When `psmux new-session` is run later, the CLI claims this warm server
 /// via `claim-session` instead of cold-spawning, making session creation
 /// nearly instant.  The warm server uses session name `__warm__`.
 fn spawn_warm_server(app: &AppState) {
+    // destroy-unattached means the user expects the session to be torn down
+    // when the last client leaves; keeping a hidden warm server alive breaks
+    // that expectation and makes exit-empty appear ineffective.
+    if !should_spawn_warm_server(app) {
+        return;
+    }
     // Skip if a warm server already exists
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let warm_base = if let Some(ref sn) = app.socket_name {
@@ -291,8 +301,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             parse_config_line(&mut app, &cmd);
         }
     }
-    // Spawn a warm server for the NEXT new-session, unless we ARE the warm server.
-    if app.session_name != "__warm__" {
+    // Spawn a warm server for the NEXT new-session when the current session
+    // is allowed to keep background state alive.
+    if should_spawn_warm_server(&app) {
         spawn_warm_server(&app);
     }
     let mut state_dirty = true;
@@ -612,25 +623,20 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                     hook_event = Some("client-detached");
                     if app.attached_clients == 0 && app.destroy_unattached {
-                        // Only exit on last detach when no live panes remain;
-                        // otherwise keep the session alive so exit-empty=off
-                        // semantics are not preempted by destroy-unattached.
-                        let has_live_pane = app.windows.iter().any(|w| {
-                            crate::tree::count_panes(&w.root) > 0
-                        });
-                        if !has_live_pane {
-                            for win in app.windows.iter_mut() {
-                                kill_all_children(&mut win.root);
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                            let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                            let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                            let _ = std::fs::remove_file(&regpath);
-                            let _ = std::fs::remove_file(&keypath);
-                            crate::types::shutdown_persistent_streams();
-                            std::process::exit(0);
+                        for win in app.windows.iter_mut() {
+                            kill_all_children(&mut win.root);
                         }
+                        if let Some(mut wp) = app.warm_pane.take() {
+                            wp.child.kill().ok();
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                        let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
+                        let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
+                        let _ = std::fs::remove_file(&regpath);
+                        let _ = std::fs::remove_file(&keypath);
+                        crate::types::shutdown_persistent_streams();
+                        std::process::exit(0);
                     }
                 }
                 CtrlReq::DumpLayout(resp) => {
@@ -2425,4 +2431,29 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     }
     #[allow(unreachable_code)]
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_spawn_warm_server;
+    use crate::types::AppState;
+
+    #[test]
+    fn warm_server_is_disabled_for_destroy_unattached_sessions() {
+        let mut app = AppState::new("demo".to_string());
+        app.destroy_unattached = true;
+        assert!(!should_spawn_warm_server(&app));
+    }
+
+    #[test]
+    fn warm_server_is_disabled_for_warm_session_itself() {
+        let app = AppState::new("__warm__".to_string());
+        assert!(!should_spawn_warm_server(&app));
+    }
+
+    #[test]
+    fn warm_server_is_allowed_for_normal_sessions() {
+        let app = AppState::new("demo".to_string());
+        assert!(should_spawn_warm_server(&app));
+    }
 }
