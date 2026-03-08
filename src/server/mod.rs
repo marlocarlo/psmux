@@ -380,7 +380,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 // non-temp command so the user's view doesn't jump.
                 let mut temp_focus_restore: Option<(usize, Vec<usize>)> = None;
                 for req in pending {
-                    let mutates_state = !matches!(&req, CtrlReq::DumpState(..));
+                    let mutates_state = !matches!(&req,
+                        CtrlReq::DumpState(..)
+                        | CtrlReq::SendText(_)
+                        | CtrlReq::SendKey(_)
+                        | CtrlReq::SendPaste(_)
+                    );
                     let is_temp_focus = matches!(&req,
                         CtrlReq::FocusWindowTemp(_) | CtrlReq::FocusPaneTemp(_) | CtrlReq::FocusPaneByIndexTemp(_));
                     let mut hook_event: Option<&str> = None;
