@@ -1921,7 +1921,7 @@ pub fn send_paste_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
             false
         }
     };
-    crate::debug_log::input_log("paste", &format!("use_bracket={} text_len={} text_preview={:?}", use_bracket, text.len(), &text[..text.len().min(100)]));
+    crate::debug_log::input_log("paste", &format!("use_bracket={} text_len={} text_preview={:?}", use_bracket, text.len(), &text.chars().take(100).collect::<String>()));
 
     // On Windows, ConPTY strips bracketed paste VT sequences (\x1b[200~/201~)
     // from the input pipe.  To deliver them to the child, we must inject

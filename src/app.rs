@@ -997,7 +997,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             bracket_paste_detect::Action::Paste(text) => {
                                 crate::debug_log::input_log("paste", &format!(
                                     "bracket_paste_detect: captured paste len={} preview={:?}",
-                                    text.len(), &text[..text.len().min(100)]));
+                                    text.len(), &text.chars().take(100).collect::<String>()));
                                 send_paste_to_active(&mut app, &text)?;
                             }
                         }
@@ -1028,7 +1028,7 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     }
                 }
                 Event::Paste(text) => {
-                    crate::debug_log::input_log("paste", &format!("Event::Paste received, len={} text={:?}", text.len(), &text[..text.len().min(200)]));
+                    crate::debug_log::input_log("paste", &format!("Event::Paste received, len={} text={:?}", text.len(), &text.chars().take(200).collect::<String>()));
                     send_paste_to_active(&mut app, &text)?;
                 }
                 _ => {}

@@ -604,7 +604,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     if !paste_pend.is_empty() {
                         if input_log_enabled() {
                             input_log("paste", &format!("paste CONFIRMED (top), sending {} chars as send-paste: {:?}",
-                                paste_pend.len(), &paste_pend[..paste_pend.len().min(200)]));
+                                paste_pend.len(), &paste_pend.chars().take(200).collect::<String>()));
                         }
                         let encoded = base64_encode(&paste_pend);
                         cmd_batch.push(format!("send-paste {}\n", encoded));
@@ -1536,7 +1536,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             if paste_confirmed && !paste_pend.is_empty() {
                 if input_log_enabled() {
                     input_log("paste", &format!("paste CONFIRMED (post-event), sending {} chars as send-paste: {:?}",
-                        paste_pend.len(), &paste_pend[..paste_pend.len().min(200)]));
+                        paste_pend.len(), &paste_pend.chars().take(200).collect::<String>()));
                 }
                 let encoded = base64_encode(&paste_pend);
                 cmd_batch.push(format!("send-paste {}\n", encoded));
