@@ -54,6 +54,15 @@ psmux is a **native Windows terminal multiplexer** built from the ground up in R
 winget install psmux
 ```
 
+WinGet installs the latest published release, not the current `master` branch.
+If you are comparing behavior against a source build from git, the versions may
+be significantly different. Check with:
+
+```powershell
+psmux -V
+tmux -V
+```
+
 ### Using Cargo
 
 ```powershell

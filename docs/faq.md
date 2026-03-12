@@ -18,6 +18,9 @@ A: Yes. psmux supports 14 style options with 24-bit true color, 256 indexed colo
 **Q: Can I use tmux commands with psmux?**
 A: Yes! psmux includes a `tmux` alias. Commands like `tmux new-session`, `tmux attach`, `tmux ls`, `tmux split-window` all work. 76 commands in total.
 
+**Q: Why does the WinGet build behave differently from a git/source build?**
+A: WinGet installs the latest published release. A local build from git uses whatever commit you have checked out, which can be much newer than the packaged release. If you're comparing behavior, check `psmux -V` and `tmux -V` first.
+
 **Q: How fast is psmux?**
 A: Session creation takes < 100ms. New windows/panes add < 80ms overhead. The bottleneck is your shell's startup time, not psmux. Compiled with opt-level 3 and full LTO.
 
