@@ -1269,6 +1269,7 @@ pub fn parse_modified_special_key(s: &str) -> Option<String> {
     if m <= 1 { return None; } // no modifiers found
     // Match the base key name
     match rest {
+        "ENTER" | "RETURN" | "CR" => Some(format!("\x1b[13;{}~", m)),
         "TAB" => Some(format!("\x1b[9;{}~", m)),
         "BTAB" | "BACKTAB" => {
             // Shift is implicit in BackTab; ensure Shift bit is set
@@ -1362,7 +1363,15 @@ pub fn encode_key_event(key: &KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Char(c) => {
             format!("{}", c).into_bytes()
         }
-        KeyCode::Enter => b"\r".to_vec(),
+        KeyCode::Enter => {
+            let m = modifier_param(key.modifiers);
+            if m > 1 {
+                // xterm modified-Enter: CSI 13 ; mod ~
+                format!("\x1b[13;{}~", m).into_bytes()
+            } else {
+                b"\r".to_vec()
+            }
+        }
         KeyCode::Tab => {
             let m = modifier_param(key.modifiers);
             if m > 1 {
