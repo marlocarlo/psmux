@@ -1259,20 +1259,22 @@ pub fn parse_modified_special_key(s: &str) -> Option<String> {
     let upper = s.to_uppercase();
     // Extract modifier prefixes and base key name
     let mut rest = upper.as_str();
-    let mut m: u8 = 1;
+    let mut bits: u8 = 0;
     loop {
-        if rest.starts_with("C-") { m |= 4; rest = &rest[2..]; }
-        else if rest.starts_with("M-") { m |= 2; rest = &rest[2..]; }
-        else if rest.starts_with("S-") { m |= 1; rest = &rest[2..]; }
+        if rest.starts_with("C-") { bits |= 4; rest = &rest[2..]; }
+        else if rest.starts_with("M-") { bits |= 2; rest = &rest[2..]; }
+        else if rest.starts_with("S-") { bits |= 1; rest = &rest[2..]; }
         else { break; }
     }
-    if m <= 1 { return None; } // no modifiers found
+    if bits == 0 { return None; } // no modifiers found
+    let m = bits + 1; // xterm modifier param = 1 + modifier bits
     // Match the base key name
     match rest {
+        "ENTER" | "RETURN" | "CR" => Some(format!("\x1b[13;{}~", m)),
         "TAB" => Some(format!("\x1b[9;{}~", m)),
         "BTAB" | "BACKTAB" => {
-            // Shift is implicit in BackTab; ensure Shift bit is set
-            let sm = m | 1; // set Shift bit
+            // Shift is implicit in BackTab; ensure Shift bit is set in the bitmask
+            let sm = (bits | 1) + 1;
             Some(format!("\x1b[9;{}~", sm))
         }
         "LEFT" => Some(format!("\x1b[1;{}D", m)),
@@ -1362,7 +1364,15 @@ pub fn encode_key_event(key: &KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Char(c) => {
             format!("{}", c).into_bytes()
         }
-        KeyCode::Enter => b"\r".to_vec(),
+        KeyCode::Enter => {
+            let m = modifier_param(key.modifiers);
+            if m > 1 {
+                // xterm modified-Enter: CSI 13 ; mod ~
+                format!("\x1b[13;{}~", m).into_bytes()
+            } else {
+                b"\r".to_vec()
+            }
+        }
         KeyCode::Tab => {
             let m = modifier_param(key.modifiers);
             if m > 1 {
@@ -2762,5 +2772,82 @@ mod tests {
         let ev = key(KeyCode::Char('\\'), KeyModifiers::NONE);
         let bytes = encode_key_event(&ev).unwrap();
         assert_eq!(bytes, b"\\");
+    }
+
+    // ── Modified Enter key tests ──
+
+    #[test]
+    fn plain_enter_produces_cr() {
+        let ev = key(KeyCode::Enter, KeyModifiers::NONE);
+        let bytes = encode_key_event(&ev).unwrap();
+        assert_eq!(bytes, b"\r", "plain Enter must produce CR");
+    }
+
+    #[test]
+    fn shift_enter_produces_csi_13_2() {
+        let ev = key(KeyCode::Enter, KeyModifiers::SHIFT);
+        let bytes = encode_key_event(&ev).unwrap();
+        assert_eq!(bytes, b"\x1b[13;2~", "Shift+Enter must produce CSI 13;2~");
+    }
+
+    #[test]
+    fn ctrl_enter_produces_csi_13_5() {
+        let ev = key(KeyCode::Enter, KeyModifiers::CONTROL);
+        let bytes = encode_key_event(&ev).unwrap();
+        assert_eq!(bytes, b"\x1b[13;5~", "Ctrl+Enter must produce CSI 13;5~");
+    }
+
+    #[test]
+    fn ctrl_shift_enter_produces_csi_13_6() {
+        let ev = key(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        let bytes = encode_key_event(&ev).unwrap();
+        assert_eq!(bytes, b"\x1b[13;6~", "Ctrl+Shift+Enter must produce CSI 13;6~");
+    }
+
+    #[test]
+    fn alt_enter_produces_csi_13_3() {
+        let ev = key(KeyCode::Enter, KeyModifiers::ALT);
+        let bytes = encode_key_event(&ev).unwrap();
+        assert_eq!(bytes, b"\x1b[13;3~", "Alt+Enter must produce CSI 13;3~");
+    }
+
+    // ── parse_modified_special_key tests ──
+
+    #[test]
+    fn parse_shift_enter() {
+        assert_eq!(parse_modified_special_key("S-Enter"), Some("\x1b[13;2~".to_string()));
+    }
+
+    #[test]
+    fn parse_ctrl_enter() {
+        assert_eq!(parse_modified_special_key("C-Enter"), Some("\x1b[13;5~".to_string()));
+    }
+
+    #[test]
+    fn parse_ctrl_shift_enter() {
+        assert_eq!(parse_modified_special_key("C-S-Enter"), Some("\x1b[13;6~".to_string()));
+    }
+
+    #[test]
+    fn parse_plain_enter_returns_none() {
+        assert_eq!(parse_modified_special_key("enter"), None, "no modifiers should return None");
+    }
+
+    #[test]
+    fn parse_shift_left_works() {
+        // Regression: S-Left was broken because m started at 1 and S- did m|=1 (no-op)
+        assert_eq!(parse_modified_special_key("S-Left"), Some("\x1b[1;2D".to_string()));
+    }
+
+    #[test]
+    fn parse_ctrl_tab_unchanged() {
+        // Regression check: C-Tab must still produce CSI 9;5~
+        assert_eq!(parse_modified_special_key("C-Tab"), Some("\x1b[9;5~".to_string()));
+    }
+
+    #[test]
+    fn parse_ctrl_left_unchanged() {
+        // Regression check: C-Left must still produce CSI 1;5D
+        assert_eq!(parse_modified_special_key("C-Left"), Some("\x1b[1;5D".to_string()));
     }
 }

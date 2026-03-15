@@ -1512,11 +1512,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                         if !paste_pend.is_empty() {
                                             paste_pend.push('\n');
                                         } else {
-                                            cmd_batch.push("send-key enter\n".into());
+                                            cmd_batch.push(format!("send-key {}\n", modified_key_name("Enter", key.modifiers)));
                                         }
                                     }
                                     #[cfg(not(windows))]
-                                    { cmd_batch.push("send-key enter\n".into()); }
+                                    { cmd_batch.push(format!("send-key {}\n", modified_key_name("Enter", key.modifiers))); }
                                 }
                                 KeyCode::Tab => {
                                     #[cfg(windows)]
