@@ -1767,6 +1767,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     rsel_end = None;
                                     rsel_dragged = false;
                                     selection_changed = true;
+                                    // Suppress paste_pend — VS Code's "smart
+                                    // copy/paste" also injects clipboard text
+                                    // as key events after copying.
+                                    paste_suppress_until = Some(Instant::now() + Duration::from_secs(2));
+                                    paste_pend.clear();
+                                    paste_pend_start = None;
+                                    paste_stage2 = false;
                                 } else {
                                     // No selection, no TUI — paste from clipboard (pwsh-style)
                                     rsel_start = None;
