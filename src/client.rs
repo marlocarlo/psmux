@@ -363,6 +363,25 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     // Set to true when Ctrl+V Release is seen — confirms the burst was a paste.
     #[cfg(windows)]
     let mut paste_confirmed: bool = false;
+    // Track paste_pend growth to detect ongoing paste during stage2 timeout.
+    #[cfg(windows)]
+    let mut last_paste_pend_len: usize = 0;
+    // After any non-paste_pend send-paste (right-click clipboard, etc.),
+    // suppress paste_pend to avoid duplicate sends from ConPTY key echoes.
+    #[cfg(windows)]
+    let mut paste_suppress_until: Option<Instant> = None;
+
+    // ── Bracket paste detection state (Windows) ──────────────────────
+    // Detects \e[200~...\e[201~ sequences that arrive as individual
+    // Key events from the outer terminal (VS Code / Windows Terminal).
+    // When a complete bracket paste is detected, the inner text is sent
+    // as a single send-paste command, bypassing paste_pend entirely.
+    #[cfg(windows)]
+    let mut bp_state = crate::app::bracket_paste_detect::State::new();
+    #[cfg(windows)]
+    let mut bp_coalesce_buf: String = String::new();
+    #[cfg(windows)]
+    let mut bp_coalesce_deadline: Option<Instant> = None;
 
     // list-keys overlay state (C-b ?)
     let mut keys_viewer = false;
@@ -642,8 +661,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // dump-state requests (each one is ~50-100KB of JSON over TCP).
         // When idle: 50ms refresh (20fps) saves CPU.
         // Use fast poll when paste chars are pending (need timely detection)
+        // or when bracket paste detector has buffered an ESC / coalesce pending.
         #[cfg(windows)]
-        let paste_pend_active = !paste_pend.is_empty();
+        let paste_pend_active = !paste_pend.is_empty()
+            || matches!(bp_state, crate::app::bracket_paste_detect::State::MatchOpen { .. })
+            || bp_coalesce_deadline.is_some();
         #[cfg(not(windows))]
         let paste_pend_active = false;
 
@@ -675,37 +697,56 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // Flush or promote chars based on how long they've been buffered.
         #[cfg(windows)]
         {
+            // If a send-paste was already sent (right-click clipboard),
+            // discard ConPTY echo chars that duplicate the content.
+            if let Some(until) = paste_suppress_until {
+                if Instant::now() < until {
+                    if !paste_pend.is_empty() {
+                        if input_log_enabled() {
+                            input_log("paste", &format!(
+                                "suppressing {} duplicate chars (right-click paste active)", paste_pend.len()));
+                        }
+                        paste_pend.clear();
+                        paste_pend_start = None;
+                        paste_stage2 = false;
+                    }
+                } else {
+                    paste_suppress_until = None;
+                }
+            }
             if let Some(start) = paste_pend_start {
                 let elapsed = start.elapsed();
                 if paste_confirmed {
-                    // Ctrl+V Release already seen — send as paste now
+                    // Ctrl+V Release already seen — promote to stage2 and
+                    // let growth detection wait for ConPTY to finish.
                     if !paste_pend.is_empty() {
                         if input_log_enabled() {
-                            input_log("paste", &format!("paste CONFIRMED (top), sending {} chars as send-paste: {:?}",
-                                paste_pend.len(), &paste_pend.chars().take(200).collect::<String>()));
+                            input_log("paste", &format!("paste CONFIRMED (top), promoting {} chars to stage2", paste_pend.len()));
                         }
-                        let encoded = base64_encode(&paste_pend);
-                        cmd_batch.push(format!("send-paste {}\n", encoded));
+                        paste_stage2 = true;
+                        last_paste_pend_len = paste_pend.len();
+                        paste_pend_start = Some(Instant::now() - Duration::from_millis(21));
                     }
-                    paste_pend.clear();
-                    paste_pend_start = None;
-                    paste_stage2 = false;
                     paste_confirmed = false;
                 } else if !paste_stage2 && elapsed > Duration::from_millis(20) {
                     // 20ms window expired
                     let has_non_ascii = paste_pend.chars().any(|c| !c.is_ascii());
-                    if paste_pend.len() >= 3 && !has_non_ascii {
+                    if paste_pend.len() >= 3 && (!has_non_ascii || paste_pend.len() >= 20) {
                         // ≥3 ASCII chars in 20ms → likely paste, enter stage 2.
                         // Non-ASCII chars (IME composition, CJK input) are excluded
                         // because IME routinely generates 3+ chars in <20ms and would
                         // trigger a false-positive 300ms delay (fixes #91).
+                        // Exception: ≥20 chars with non-ASCII is almost certainly a
+                        // paste (not IME), so allow it into stage 2.
                         paste_stage2 = true;
+                        last_paste_pend_len = paste_pend.len();
                         if input_log_enabled() {
                             input_log("paste", &format!("stage2: {} chars in 20ms, waiting for Ctrl+V Release", paste_pend.len()));
                         }
                     } else if paste_pend.len() >= 3 && has_non_ascii {
-                        // ≥3 chars but contains non-ASCII (IME input) — flush
-                        // immediately as normal text to avoid 300ms delay.
+                        // 3-19 chars with non-ASCII (IME input) — flush immediately
+                        // as normal text to avoid 300ms delay. Larger buffers (≥20)
+                        // are caught by the stage2 branch above.
                         if input_log_enabled() {
                             input_log("paste", &format!("flush {} chars as normal (non-ASCII / IME detected)", paste_pend.len()));
                         }
@@ -755,14 +796,42 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     // paste.  Send as send-paste so the server wraps it in
                     // bracketed paste sequences and child apps (nvim, etc.) can
                     // distinguish paste from typed input (fixes autoindent).
-                    if input_log_enabled() {
-                        input_log("paste", &format!("stage2 timeout, sending {} chars as send-paste", paste_pend.len()));
+                    // BUT: if chars arrived recently (within 100ms), the paste
+                    // is still in progress (e.g. right-click paste via ConPTY
+                    // which sends text slowly over ~1s).  Reset the timer.
+                    if paste_pend.len() > last_paste_pend_len {
+                        last_paste_pend_len = paste_pend.len();
+                        paste_pend_start = Some(Instant::now() - Duration::from_millis(21));
+                    } else {
+                        if input_log_enabled() {
+                            input_log("paste", &format!("stage2 timeout, sending {} chars as send-paste", paste_pend.len()));
+                        }
+                        let encoded = base64_encode(&paste_pend);
+                        cmd_batch.push(format!("send-paste {}\n", encoded));
+                        paste_pend.clear();
+                        paste_pend_start = None;
+                        paste_stage2 = false;
+                        last_paste_pend_len = 0;
                     }
-                    let encoded = base64_encode(&paste_pend);
+                }
+            }
+        }
+
+        // ── Bracket paste coalesce flush (Windows) ───────────────────
+        // If bracket paste fragments were buffered, flush them as a
+        // single send-paste once the 50ms coalesce deadline expires.
+        #[cfg(windows)]
+        {
+            if let Some(deadline) = bp_coalesce_deadline {
+                if Instant::now() >= deadline {
+                    if input_log_enabled() {
+                        input_log("paste", &format!(
+                            "bp_coalesce: flushing {} chars", bp_coalesce_buf.len()));
+                    }
+                    let encoded = base64_encode(&bp_coalesce_buf);
                     cmd_batch.push(format!("send-paste {}\n", encoded));
-                    paste_pend.clear();
-                    paste_pend_start = None;
-                    paste_stage2 = false;
+                    bp_coalesce_buf.clear();
+                    bp_coalesce_deadline = None;
                 }
             }
         }
@@ -815,6 +884,62 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         paste_confirmed = true;
                     }
                     Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
+                        // ── Bracket paste detection (Windows) ─────────────
+                        // Feed each key through the bracket paste state
+                        // machine BEFORE any other processing.  When a
+                        // complete \e[200~...\e[201~ sequence is detected,
+                        // the inner text is sent as a single send-paste,
+                        // bypassing paste_pend entirely.
+                        #[cfg(windows)]
+                        let key = {
+                            use crate::app::bracket_paste_detect::{self as bpd, Action};
+                            match bpd::feed(&mut bp_state, key) {
+                                Action::Consumed => {
+                                    _pending_evt = input.try_read()?;
+                                    continue;
+                                }
+                                Action::Paste(text) => {
+                                    if input_log_enabled() {
+                                        input_log("paste", &format!(
+                                            "bracket_paste_detect: captured paste len={} preview={:?}",
+                                            text.len(), &text.chars().take(100).collect::<String>()));
+                                    }
+                                    // Buffer for coalescing — VS Code may
+                                    // split one paste into multiple bracket
+                                    // paste events.  Wait 50ms for more.
+                                    bp_coalesce_buf.push_str(&text);
+                                    bp_coalesce_deadline = Some(Instant::now() + Duration::from_millis(50));
+                                    if input_log_enabled() {
+                                        input_log("paste", &format!(
+                                            "bp_coalesce: buffered, total len={}", bp_coalesce_buf.len()));
+                                    }
+                                    _pending_evt = input.try_read()?;
+                                    continue;
+                                }
+                                Action::Forward(k) => k,
+                                Action::Replay(pending, current) => {
+                                    // Replay buffered keys (fragments of a
+                                    // failed \e[200~ match) as send-key commands.
+                                    for pk in pending {
+                                        match pk.code {
+                                            KeyCode::Esc => { cmd_batch.push("send-key escape\n".into()); }
+                                            KeyCode::Char(c) => {
+                                                let escaped = match c {
+                                                    '"' => "\\\"".to_string(),
+                                                    '\\' => "\\\\".to_string(),
+                                                    _ => c.to_string(),
+                                                };
+                                                cmd_batch.push(format!("send-text \"{}\"\n", escaped));
+                                            }
+                                            KeyCode::Enter => { cmd_batch.push("send-key enter\n".into()); }
+                                            _ => {}
+                                        }
+                                    }
+                                    current
+                                }
+                            }
+                        };
+
                         // Flush pending paste buffer before processing any non-bufferable key.
                         // Bufferable keys are: plain Char, Space, Enter (if pend non-empty), Tab (if pend non-empty).
                         #[cfg(windows)]
@@ -1549,8 +1674,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         }
                     }
                     Event::Paste(data) => {
-                        let encoded = base64_encode(&data);
-                        cmd_batch.push(format!("send-paste {}\n", encoded));
+                        #[cfg(windows)]
+                        {
+                            bp_coalesce_buf.push_str(&data);
+                            bp_coalesce_deadline = Some(Instant::now() + Duration::from_millis(50));
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            let encoded = base64_encode(&data);
+                            cmd_batch.push(format!("send-paste {}\n", encoded));
+                        }
                     }
                     Event::Mouse(me) => {
                         use crossterm::event::{MouseEventKind, MouseButton};
@@ -1643,6 +1776,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                         if !text.is_empty() {
                                             let encoded = base64_encode(&text);
                                             cmd_batch.push(format!("send-paste {}\n", encoded));
+                                            // Suppress paste_pend for 2s — VS Code
+                                            // also injects the same text as ConPTY
+                                            // key events which would duplicate.
+                                            paste_suppress_until = Some(Instant::now() + Duration::from_secs(2));
+                                            paste_pend.clear();
+                                            paste_pend_start = None;
+                                            paste_stage2 = false;
                                         }
                                     }
                                 }
@@ -1749,21 +1889,51 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         }
         if quit { break; }
 
+        // ── Bracket paste detector timeout flush (Windows) ───────────
+        // If ESC was buffered but no follow-up key arrived within the
+        // timeout (5ms), flush pending events as normal keys.  Without
+        // this, pressing Ctrl+[ (ESC) would be swallowed indefinitely.
+        #[cfg(windows)]
+        {
+            use crate::app::bracket_paste_detect::{self as bpd, TimeoutAction};
+            match bpd::flush_timeout(&mut bp_state) {
+                TimeoutAction::Replay(pending) => {
+                    for pk in pending {
+                        match pk.code {
+                            KeyCode::Esc => { cmd_batch.push("send-key escape\n".into()); }
+                            KeyCode::Char(c) => {
+                                let escaped = match c {
+                                    '"' => "\\\"".to_string(),
+                                    '\\' => "\\\\".to_string(),
+                                    _ => c.to_string(),
+                                };
+                                cmd_batch.push(format!("send-text \"{}\"\n", escaped));
+                            }
+                            KeyCode::Enter => { cmd_batch.push("send-key enter\n".into()); }
+                            _ => {}
+                        }
+                    }
+                }
+                TimeoutAction::None => {}
+            }
+        }
+
         // ── Windows paste buffer flush (post-event) ────────────────────
         // If Ctrl+V Release was seen in this iteration AND we have pending
         // chars, immediately send as send-paste (don't wait for top-of-loop).
         #[cfg(windows)]
         {
             if paste_confirmed && !paste_pend.is_empty() {
+                // Ctrl+V Release confirms this IS a paste, but ConPTY may
+                // still be injecting chars.  Promote to stage2 and let
+                // growth detection wait for delivery to finish — flushing
+                // now would split the paste into two chunks.
                 if input_log_enabled() {
-                    input_log("paste", &format!("paste CONFIRMED (post-event), sending {} chars as send-paste: {:?}",
-                        paste_pend.len(), &paste_pend.chars().take(200).collect::<String>()));
+                    input_log("paste", &format!("Ctrl+V Release, promoting {} chars to stage2", paste_pend.len()));
                 }
-                let encoded = base64_encode(&paste_pend);
-                cmd_batch.push(format!("send-paste {}\n", encoded));
-                paste_pend.clear();
-                paste_pend_start = None;
-                paste_stage2 = false;
+                paste_stage2 = true;
+                last_paste_pend_len = paste_pend.len();
+                paste_pend_start = Some(Instant::now() - Duration::from_millis(21));
                 paste_confirmed = false;
             } else if paste_confirmed && paste_pend.is_empty() {
                 // Ctrl+V with no buffered chars — read clipboard as fallback
