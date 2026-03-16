@@ -242,6 +242,17 @@ fn compute_effective_client_size(app: &AppState) -> Option<(u16, u16)> {
     }
 }
 
+/// Update latest_client_id when a mouse event arrives from a different client,
+/// and recompute the effective window size so coordinate mapping is correct.
+fn activate_mouse_client(app: &mut AppState, cid: u64) {
+    if app.latest_client_id == Some(cid) { return; }
+    app.latest_client_id = Some(cid);
+    if let Some((w, h)) = compute_effective_client_size(app) {
+        app.last_window_area = Rect { x: 0, y: 0, width: w, height: h };
+        resize_all_panes(app);
+    }
+}
+
 /// Process a single CtrlReq during the post-config plugin drain loop.
 /// Handles the subset of requests that plugin scripts send (set, show, bind,
 /// source-file) and silently drops others.
@@ -1181,16 +1192,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     meta_dirty = true;
                 }
                 CtrlReq::FocusWindowCmd(wid) => { switch_with_copy_save(&mut app, |app| { if let Some(idx) = find_window_index_by_id(app, wid) { app.active_idx = idx; } }); resize_all_panes(&mut app); meta_dirty = true; }
-                CtrlReq::MouseDown(x,y) => { if app.mouse_enabled { remote_mouse_down(&mut app, x, y); state_dirty = true; meta_dirty = true; echo_pending_until = Some(Instant::now()); } }
-                CtrlReq::MouseDownRight(x,y) => { if app.mouse_enabled { remote_mouse_button(&mut app, x, y, 2, true); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
-                CtrlReq::MouseDownMiddle(x,y) => { if app.mouse_enabled { remote_mouse_button(&mut app, x, y, 1, true); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
-                CtrlReq::MouseDrag(x,y) => { if app.mouse_enabled { remote_mouse_drag(&mut app, x, y); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
-                CtrlReq::MouseUp(x,y) => { if app.mouse_enabled { remote_mouse_up(&mut app, x, y); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
-                CtrlReq::MouseUpRight(x,y) => { if app.mouse_enabled { remote_mouse_button(&mut app, x, y, 2, false); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
-                CtrlReq::MouseUpMiddle(x,y) => { if app.mouse_enabled { remote_mouse_button(&mut app, x, y, 1, false); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
-                CtrlReq::MouseMove(x,y) => { if app.mouse_enabled { remote_mouse_motion(&mut app, x, y); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
-                CtrlReq::ScrollUp(x, y) => { if app.mouse_enabled { remote_scroll_up(&mut app, x, y); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
-                CtrlReq::ScrollDown(x, y) => { if app.mouse_enabled { remote_scroll_down(&mut app, x, y); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
+                CtrlReq::MouseDown(cid,x,y) => { if app.mouse_enabled { activate_mouse_client(&mut app, cid); remote_mouse_down(&mut app, x, y); state_dirty = true; meta_dirty = true; echo_pending_until = Some(Instant::now()); } }
+                CtrlReq::MouseDownRight(cid,x,y) => { if app.mouse_enabled { activate_mouse_client(&mut app, cid); remote_mouse_button(&mut app, x, y, 2, true); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
+                CtrlReq::MouseDownMiddle(cid,x,y) => { if app.mouse_enabled { activate_mouse_client(&mut app, cid); remote_mouse_button(&mut app, x, y, 1, true); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
+                CtrlReq::MouseDrag(cid,x,y) => { if app.mouse_enabled { activate_mouse_client(&mut app, cid); remote_mouse_drag(&mut app, x, y); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
+                CtrlReq::MouseUp(cid,x,y) => { if app.mouse_enabled { activate_mouse_client(&mut app, cid); remote_mouse_up(&mut app, x, y); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
+                CtrlReq::MouseUpRight(cid,x,y) => { if app.mouse_enabled { activate_mouse_client(&mut app, cid); remote_mouse_button(&mut app, x, y, 2, false); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
+                CtrlReq::MouseUpMiddle(cid,x,y) => { if app.mouse_enabled { activate_mouse_client(&mut app, cid); remote_mouse_button(&mut app, x, y, 1, false); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
+                CtrlReq::MouseMove(cid,x,y) => { if app.mouse_enabled { activate_mouse_client(&mut app, cid); remote_mouse_motion(&mut app, x, y); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
+                CtrlReq::ScrollUp(cid,x,y) => { if app.mouse_enabled { activate_mouse_client(&mut app, cid); remote_scroll_up(&mut app, x, y); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
+                CtrlReq::ScrollDown(cid,x,y) => { if app.mouse_enabled { activate_mouse_client(&mut app, cid); remote_scroll_down(&mut app, x, y); state_dirty = true; echo_pending_until = Some(Instant::now()); } }
                 CtrlReq::NextWindow => { if !app.windows.is_empty() { switch_with_copy_save(&mut app, |app| { app.last_window_idx = app.active_idx; app.active_idx = (app.active_idx + 1) % app.windows.len(); }); resize_all_panes(&mut app); } meta_dirty = true; hook_event = Some("after-select-window"); }
                 CtrlReq::PrevWindow => { if !app.windows.is_empty() { switch_with_copy_save(&mut app, |app| { app.last_window_idx = app.active_idx; app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len(); }); resize_all_panes(&mut app); } meta_dirty = true; hook_event = Some("after-select-window"); }
                 CtrlReq::RenameWindow(name) => { let win = &mut app.windows[app.active_idx]; win.name = name; win.manual_rename = true; meta_dirty = true; hook_event = Some("after-rename-window"); }
@@ -1934,6 +1945,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     } else {
                         expand_format(&fmt, &app)
                     };
+                    // Show the message on the status bar (tmux parity)
+                    app.status_message = Some((result.clone(), Instant::now()));
+                    state_dirty = true;
                     let _ = resp.send(result);
                 }
                 CtrlReq::LastWindow => {
@@ -2592,6 +2606,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 Some(PopupPty { master: pair.master, writer: pty_writer, child, term })
                             });
                         
+                        // Give the PTY reader thread time to process initial output
+                        // before the first frame is serialized to the client.
+                        // Without this, fast commands (e.g. `echo test`) exit before
+                        // the reader thread populates the vt100 parser, resulting in
+                        // an empty popup that immediately closes.
+                        std::thread::sleep(std::time::Duration::from_millis(50));
                         app.mode = Mode::PopupMode {
                             command: command.clone(),
                             output: String::new(),

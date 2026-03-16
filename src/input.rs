@@ -1977,11 +1977,11 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
 /// Chunked PTY write for paste delivery.  The PTY pipe can silently
 /// drop bytes when a large payload (140+ lines) is written in a single
 /// call because the OS pipe buffer fills up.  We split the text into
-/// ~2 KiB chunks with small yields between them so the consumer
+/// ~4 KiB chunks with small yields between them so the consumer
 /// (shell / PSReadLine / nvim) has time to drain.  Bracket sequences
 /// are tiny and always written in one shot.
 fn write_paste_chunked(writer: &mut dyn std::io::Write, text: &[u8], bracket: bool) {
-    const CHUNK: usize = 512;
+    const CHUNK: usize = 4096;
     if bracket { let _ = writer.write_all(b"\x1b[200~"); }
     let mut offset: usize = 0;
     while offset < text.len() {

@@ -508,6 +508,14 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
     let mut quit = false;
     #[cfg(windows)]
     let mut bp_state = bracket_paste_detect::State::new();
+    // Coalescing buffer for fragmented bracket paste sequences.
+    // VS Code's older ConPTY sends large pastes as multiple bracket paste
+    // events in rapid succession.  We buffer them and flush once 50ms
+    // passes without a new paste starting.
+    #[cfg(windows)]
+    let mut paste_coalesce_buf: String = String::new();
+    #[cfg(windows)]
+    let mut paste_coalesce_deadline: Option<Instant> = None;
     // Cache last-sent DECSCUSR code to avoid redundant writes that
     // reset Windows Terminal's cursor blink timer every frame.
     let mut last_cursor_style: u8 = 255;
@@ -1014,8 +1022,11 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
         let has_pty_data = crate::types::PTY_DATA_READY.swap(false, std::sync::atomic::Ordering::AcqRel);
         // Use fast polling when bracket paste detector has buffered an ESC
         // so the timeout flush fires promptly (within ~1-2ms).
+        // Also use fast polling when paste coalesce buffer is waiting for
+        // the 50ms deadline, so we flush promptly once it expires.
         #[cfg(windows)]
-        let bp_pending = matches!(bp_state, bracket_paste_detect::State::MatchOpen { .. });
+        let bp_pending = matches!(bp_state, bracket_paste_detect::State::MatchOpen { .. })
+            || paste_coalesce_deadline.is_some();
         #[cfg(not(windows))]
         let bp_pending = false;
         let poll_ms = if bp_pending { 1 } else if has_pty_data { 1 } else { 20 };
@@ -1047,7 +1058,14 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 crate::debug_log::input_log("paste", &format!(
                                     "bracket_paste_detect: captured paste len={} preview={:?}",
                                     text.len(), &text.chars().take(100).collect::<String>()));
-                                send_paste_to_active(&mut app, &text)?;
+                                // Buffer the paste for coalescing — VS Code's
+                                // older ConPTY may split a single user paste
+                                // into multiple bracket paste events.  We wait
+                                // 50ms for more fragments before flushing.
+                                paste_coalesce_buf.push_str(&text);
+                                paste_coalesce_deadline = Some(Instant::now() + Duration::from_millis(50));
+                                crate::debug_log::input_log("paste", &format!(
+                                    "coalesce: buffered, total len={}", paste_coalesce_buf.len()));
                             }
                         }
                     }
@@ -1097,6 +1115,21 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     }
                 }
                 bracket_paste_detect::TimeoutAction::None => {}
+            }
+        }
+
+        // Flush coalesced paste buffer once the 50ms deadline expires
+        // without another bracket paste fragment arriving.
+        #[cfg(windows)]
+        {
+            if let Some(deadline) = paste_coalesce_deadline {
+                if Instant::now() >= deadline {
+                    crate::debug_log::input_log("paste", &format!(
+                        "coalesce: flushing {} chars", paste_coalesce_buf.len()));
+                    send_paste_to_active(&mut app, &paste_coalesce_buf)?;
+                    paste_coalesce_buf.clear();
+                    paste_coalesce_deadline = None;
+                }
             }
         }
 
@@ -1166,16 +1199,16 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 }
                 CtrlReq::FocusPaneCmd(pid) => { focus_pane_by_id(&mut app, pid); }
                 CtrlReq::FocusWindowCmd(wid) => { if let Some(idx) = find_window_index_by_id(&app, wid) { app.active_idx = idx; } }
-                CtrlReq::MouseDown(x,y) => { remote_mouse_down(&mut app, x, y); }
-                CtrlReq::MouseDownRight(x,y) => { remote_mouse_button(&mut app, x, y, 2, true); }
-                CtrlReq::MouseDownMiddle(x,y) => { remote_mouse_button(&mut app, x, y, 1, true); }
-                CtrlReq::MouseDrag(x,y) => { remote_mouse_drag(&mut app, x, y); }
-                CtrlReq::MouseUp(x,y) => { remote_mouse_up(&mut app, x, y); }
-                CtrlReq::MouseUpRight(x,y) => { remote_mouse_button(&mut app, x, y, 2, false); }
-                CtrlReq::MouseUpMiddle(x,y) => { remote_mouse_button(&mut app, x, y, 1, false); }
-                CtrlReq::MouseMove(x,y) => { remote_mouse_motion(&mut app, x, y); }
-                CtrlReq::ScrollUp(x, y) => { remote_scroll_up(&mut app, x, y); }
-                CtrlReq::ScrollDown(x, y) => { remote_scroll_down(&mut app, x, y); }
+                CtrlReq::MouseDown(_,x,y) => { remote_mouse_down(&mut app, x, y); }
+                CtrlReq::MouseDownRight(_,x,y) => { remote_mouse_button(&mut app, x, y, 2, true); }
+                CtrlReq::MouseDownMiddle(_,x,y) => { remote_mouse_button(&mut app, x, y, 1, true); }
+                CtrlReq::MouseDrag(_,x,y) => { remote_mouse_drag(&mut app, x, y); }
+                CtrlReq::MouseUp(_,x,y) => { remote_mouse_up(&mut app, x, y); }
+                CtrlReq::MouseUpRight(_,x,y) => { remote_mouse_button(&mut app, x, y, 2, false); }
+                CtrlReq::MouseUpMiddle(_,x,y) => { remote_mouse_button(&mut app, x, y, 1, false); }
+                CtrlReq::MouseMove(_,x,y) => { remote_mouse_motion(&mut app, x, y); }
+                CtrlReq::ScrollUp(_,x,y) => { remote_scroll_up(&mut app, x, y); }
+                CtrlReq::ScrollDown(_,x,y) => { remote_scroll_down(&mut app, x, y); }
                 CtrlReq::NextWindow => { if !app.windows.is_empty() { app.active_idx = (app.active_idx + 1) % app.windows.len(); } }
                 CtrlReq::PrevWindow => { if !app.windows.is_empty() { app.active_idx = (app.active_idx + app.windows.len() - 1) % app.windows.len(); } }
                 CtrlReq::RenameWindow(name) => { let win = &mut app.windows[app.active_idx]; win.name = name; }
