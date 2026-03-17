@@ -851,6 +851,22 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         paste_confirmed = true;
                     }
                     Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
+                        // During paste suppression, discard text keys (chars,
+                        // Enter, Tab, Space) that VS Code injects as ConPTY
+                        // echoes after a right-click clipboard paste/copy.
+                        #[cfg(windows)]
+                        {
+                            if paste_suppress_until.is_some() {
+                                let is_text_key = matches!(key.code,
+                                    KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab
+                                ) && !key.modifiers.contains(KeyModifiers::CONTROL)
+                                  && !key.modifiers.contains(KeyModifiers::ALT);
+                                if is_text_key {
+                                    _pending_evt = input.try_read()?;
+                                    continue;
+                                }
+                            }
+                        }
                         // Flush pending paste buffer before processing any non-bufferable key.
                         // Bufferable keys are: plain Char, Space, Enter (if pend non-empty), Tab (if pend non-empty).
                         #[cfg(windows)]
@@ -1683,6 +1699,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     rsel_end = None;
                                     selection_changed = true;
                                     if let Some(text) = read_from_system_clipboard() {
+                                        // Normalize \r\n → \n (Windows clipboard preserves \r)
+                                        // and trim trailing newlines to avoid blank lines.
+                                        let text = text.replace("\r\n", "\n").trim_end_matches('\n').to_string();
                                         if !text.is_empty() {
                                             let encoded = base64_encode(&text);
                                             cmd_batch.push(format!("send-paste {}\n", encoded));
@@ -1819,6 +1838,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             } else if paste_confirmed && paste_pend.is_empty() {
                 // Ctrl+V with no buffered chars — read clipboard as fallback
                 if let Some(text) = read_from_system_clipboard() {
+                    let text = text.replace("\r\n", "\n");
                     if !text.is_empty() {
                         if input_log_enabled() {
                             input_log("paste", &format!("paste CONFIRMED (no buffer), clipboard read len={}", text.len()));
