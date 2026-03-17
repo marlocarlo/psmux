@@ -44,7 +44,7 @@ use crate::util::{list_windows_json, list_tree_json};
 // this detector covers the local (non-SSH, crossterm) input path on Windows.
 
 #[cfg(windows)]
-pub mod bracket_paste_detect {
+mod bracket_paste_detect {
     use crossterm::event::{KeyCode, KeyEvent};
     use std::time::Instant;
 
