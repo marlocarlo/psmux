@@ -1992,6 +1992,28 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
 /// are tiny and always written in one shot.
 fn write_paste_chunked(writer: &mut dyn std::io::Write, text: &[u8], bracket: bool) {
     const CHUNK: usize = 512;
+    // Normalize line endings to CR for ConPTY.  Clipboard text may arrive
+    // with LF (\n) or CRLF (\r\n), but ConPTY's input parser expects CR
+    // (\r) for Enter.  Bare LF is misinterpreted by PSReadLine, causing
+    // multi-line pastes to appear in reverse order.
+    let text = {
+        let mut out = Vec::with_capacity(text.len());
+        let mut i = 0;
+        while i < text.len() {
+            if text[i] == b'\r' && i + 1 < text.len() && text[i + 1] == b'\n' {
+                out.push(b'\r');
+                i += 2; // CRLF → CR
+            } else if text[i] == b'\n' {
+                out.push(b'\r');
+                i += 1; // LF → CR
+            } else {
+                out.push(text[i]);
+                i += 1;
+            }
+        }
+        out
+    };
+    let text = &text[..];
     if bracket { let _ = writer.write_all(b"\x1b[200~"); }
     let mut offset: usize = 0;
     while offset < text.len() {
