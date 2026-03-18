@@ -838,7 +838,13 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         }
                         paste_confirmed = true;
                     }
-                    Event::Key(key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
+                    Event::Key(mut key) if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat => {
+                        // On Windows, VS Code's xterm.js sends ESC+CR for
+                        // Shift+Enter.  ConPTY interprets the ESC as Alt, so
+                        // crossterm reports Alt+Enter.  Poll the physical
+                        // keyboard to detect the real modifier.
+                        #[cfg(windows)]
+                        crate::platform::augment_enter_shift(&mut key);
                         // Flush pending paste buffer before processing any non-bufferable key.
                         // Bufferable keys are: plain Char, Space, Enter (if pend non-empty), Tab (if pend non-empty).
                         #[cfg(windows)]

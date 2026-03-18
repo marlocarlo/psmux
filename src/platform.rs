@@ -2071,3 +2071,45 @@ pub mod caret {
     pub fn update(_col: u16, _row: u16) {}
     pub fn destroy() {}
 }
+
+/// On Windows ConPTY, Shift+Enter is misreported by crossterm:
+///
+/// VS Code's xterm.js sends `\x1b\r` (ESC + CR) for Shift+Enter.
+/// ConPTY interprets the ESC prefix as Alt, so crossterm reports
+/// `KeyModifiers::ALT` instead of `KeyModifiers::SHIFT`.
+///
+/// This function polls the physical keyboard state to detect the real
+/// modifiers and remaps accordingly.
+///
+/// See: <https://github.com/crossterm-rs/crossterm/issues/773>
+#[cfg(windows)]
+pub fn augment_enter_shift(key: &mut crossterm::event::KeyEvent) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    if !matches!(key.code, KeyCode::Enter) {
+        return;
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        return;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetAsyncKeyState(vKey: i32) -> i16;
+    }
+
+    const VK_SHIFT: i32 = 0x10;
+    const VK_MENU: i32 = 0x12; // Alt
+
+    unsafe {
+        let shift_down = GetAsyncKeyState(VK_SHIFT) < 0;
+        let alt_down = GetAsyncKeyState(VK_MENU) < 0;
+
+        if shift_down && !alt_down {
+            key.modifiers.remove(KeyModifiers::ALT);
+            key.modifiers.insert(KeyModifiers::SHIFT);
+        } else if shift_down {
+            key.modifiers.insert(KeyModifiers::SHIFT);
+        }
+    }
+}

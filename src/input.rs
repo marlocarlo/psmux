@@ -2609,6 +2609,40 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                     let _ = p.writer.write_all(&[0x1b, ctrl_char]);
                 }
             }
+            // Modified Enter: send ESC + CR (\x1b\r) for Shift/Alt+Enter.
+            //
+            // This matches what VS Code's xterm.js sends for Shift+Enter.
+            // The round-trip is: \x1b\r → ConPTY interprets ESC as Alt →
+            // KEY_EVENT_RECORD(VK_RETURN, LEFT_ALT_PRESSED) → libuv
+            // translates Alt back to ESC prefix → child gets \x1b\r.
+            // Claude Code (and other Node.js apps) interpret \x1b\r as
+            // Shift+Enter.  PSReadLine also handles this correctly when
+            // Alt+Enter is bound to AddLine.
+            //
+            // The CSI \x1b[13;2~ encoding (from parse_modified_special_key)
+            // is dropped by ConPTY — it doesn't recognize code 13 in ~
+            // format.  Win32-input-mode doesn't work for Node.js because
+            // libuv's uv_tty_read_raw ignores SHIFT on VK_RETURN.
+            #[cfg(windows)]
+            s if {
+                let u = s.to_uppercase();
+                let r = u.trim_start_matches("C-").trim_start_matches("M-").trim_start_matches("S-");
+                r == "ENTER" || r == "RETURN" || r == "CR"
+            } => {
+                let upper = s.to_uppercase();
+                let has_shift = upper.contains("S-");
+                let has_ctrl = upper.contains("C-");
+                let has_alt = upper.contains("M-");
+                if (has_shift || has_alt) && !has_ctrl {
+                    // Shift+Enter or Alt+Enter: ESC + CR, same as xterm.js
+                    let _ = p.writer.write_all(b"\x1b\r");
+                } else {
+                    // Ctrl+Enter and other combos: fall through to CSI encoding
+                    if let Some(seq) = parse_modified_special_key(s) {
+                        let _ = p.writer.write_all(seq.as_bytes());
+                    }
+                }
+            }
             // Modifier + special key combos: C-Left, S-Right, C-S-Up, C-M-Home, etc.
             s if parse_modified_special_key(s).is_some() => {
                 let seq = parse_modified_special_key(s).unwrap();
