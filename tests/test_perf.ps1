@@ -44,9 +44,9 @@ Write-Info "Performance test session started: $SESSION_NAME"
 Write-Host ""
 
 # Read session key and port for low-level TCP tests
-$home = $env:USERPROFILE
-$port = (Get-Content "$home\.psmux\$SESSION_NAME.port" -ErrorAction SilentlyContinue).Trim()
-$key = (Get-Content "$home\.psmux\$SESSION_NAME.key" -ErrorAction SilentlyContinue).Trim()
+$homeDir = $env:USERPROFILE
+$port = (Get-Content "$homeDir\.psmux\$SESSION_NAME.port" -ErrorAction SilentlyContinue).Trim()
+$key = (Get-Content "$homeDir\.psmux\$SESSION_NAME.key" -ErrorAction SilentlyContinue).Trim()
 Write-Info "Server port: $port, Key: $($key.Substring(0,4))..."
 Write-Host ""
 
@@ -307,7 +307,7 @@ for ($c = 0; $c -lt $cycles; $c++) {
     $p = Start-Process -FilePath $PSMUX -ArgumentList "new-session", "-s", "perf_cycle_$c", "-d" -PassThru -WindowStyle Hidden
     
     # Wait for port file
-    $portPath = "$home\.psmux\perf_cycle_$c.port"
+    $portPath = "$homeDir\.psmux\perf_cycle_$c.port"
     $maxWait = 30
     while (-not (Test-Path $portPath) -and $maxWait -gt 0) {
         Start-Sleep -Milliseconds 100

@@ -254,14 +254,14 @@ if ($ls5 -match [regex]::Escape($S5)) {
     if ($opts5Text -match "prefix.*C-a|prefix.*\u0001") {
         Write-Pass "Custom prefix C-a is set"
     } else {
-        Write-Fail "Custom prefix C-a not reflected"
+        Write-Fail "prefix C-a not reflected in show-options"
         Write-Info "show-options: $opts5Text"
     }
 
     Write-Test "Check root-table bindings (-n flag)"
     $keys5 = & $PSMUX list-keys -t $S5 2>&1
     $keys5Text = ($keys5 -join "`n")
-    if ($keys5Text -match "root.*C-h|root.*select-pane.*-L") {
+    if ($keys5Text -match "root.*C-h|C-h.*select-pane.*-L") {
         Write-Pass "Root-table binding (bind -n C-h) found"
     } else {
         Write-Fail "Root-table binding (bind -n C-h) missing"

@@ -5,7 +5,10 @@
 # =============================================================================
 
 $ErrorActionPreference = "Continue"
-$exe = "psmux"
+$exe = "$PSScriptRoot\..\target\release\psmux.exe"
+if (-not (Test-Path $exe)) { $exe = "$PSScriptRoot\..\target\debug\psmux.exe" }
+if (-not (Test-Path $exe)) { $exe = (Get-Command psmux -ErrorAction SilentlyContinue).Source }
+if (-not $exe -or -not (Test-Path $exe)) { Write-Error "psmux binary not found"; exit 1 }
 $pass = 0; $fail = 0; $skip = 0
 $SESSION = "test_cap_$(Get-Random -Maximum 9999)"
 
@@ -175,9 +178,9 @@ Write-Host "`n--- TEST 11: Multi-pane capture ---" -ForegroundColor Yellow
 
 # Split to create pane 1
 & $exe split-window -t $SESSION -h
-Start-Sleep -Seconds 2
+Start-Sleep -Seconds 3
 & $exe send-keys -t $SESSION "echo PANE_ONE_CONTENT" Enter
-Start-Sleep -Seconds 1
+Start-Sleep -Seconds 2
 
 $out11 = & $exe capture-pane -t $SESSION -p 2>&1 | Out-String
 Check "Capture from active pane after split" ($out11 -match "PANE_ONE_CONTENT")
@@ -189,9 +192,9 @@ Write-Host "`n--- TEST 12: Multi-window setup ---" -ForegroundColor Yellow
 
 # Create window 1
 & $exe new-window -t $SESSION
-Start-Sleep -Seconds 2
+Start-Sleep -Seconds 3
 & $exe send-keys -t $SESSION "echo WINDOW_TWO_TEXT" Enter
-Start-Sleep -Seconds 1
+Start-Sleep -Seconds 2
 
 $out12 = & $exe capture-pane -t $SESSION -p 2>&1 | Out-String
 Check "Capture from window 1 active pane" ($out12 -match "WINDOW_TWO_TEXT")
@@ -214,7 +217,7 @@ Check "capturep alias works" ($out13.Length -gt 0)
 Write-Host "`n--- TEST 14: Large output capture ---" -ForegroundColor Yellow
 
 & $exe send-keys -t $SESSION "1..25 | ForEach-Object { Write-Host LINE_`$_ }" Enter
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 4
 
 $out14 = & $exe capture-pane -t $SESSION -p 2>&1 | Out-String
 Check "Large output capture works" ($out14.Length -gt 100)
@@ -348,9 +351,9 @@ Write-Host "`n--- TEST 23: Targeted pane capture ---" -ForegroundColor Yellow
 Start-Sleep -Seconds 1
 # Send unique markers to each pane in window 0
 & $exe send-keys -t "${SESSION}:0.0" "echo TARGET_P0_MARKER" Enter
-Start-Sleep -Seconds 1
+Start-Sleep -Seconds 2
 & $exe send-keys -t "${SESSION}:0.1" "echo TARGET_P1_MARKER" Enter
-Start-Sleep -Seconds 1
+Start-Sleep -Seconds 2
 
 $cap_p0 = & $exe capture-pane -t "${SESSION}:0.0" -p 2>&1 | Out-String
 $cap_p1 = & $exe capture-pane -t "${SESSION}:0.1" -p 2>&1 | Out-String
@@ -366,7 +369,7 @@ Write-Host "`n--- TEST 24: Cross-window pane capture ---" -ForegroundColor Yello
 
 # Window 1 was created in TEST 12 - send a marker there
 & $exe send-keys -t "${SESSION}:1" "echo CROSSWIN_MARKER" Enter
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 4
 
 # Capture from window 1 while staying on window 0
 $cap_w1 = & $exe capture-pane -t "${SESSION}:1.0" -p 2>&1 | Out-String
@@ -383,17 +386,17 @@ Write-Host "`n--- TEST 25: 4-pane tiled layout capture ---" -ForegroundColor Yel
 
 # Create a new window with 4 panes
 & $exe new-window -t $SESSION
-Start-Sleep -Seconds 2
+Start-Sleep -Seconds 3
 & $exe send-keys -t $SESSION "echo QUAD_A" Enter
-Start-Sleep -Seconds 1
+Start-Sleep -Seconds 2
 & $exe split-window -t $SESSION -h
-Start-Sleep -Seconds 2
+Start-Sleep -Seconds 3
 & $exe send-keys -t $SESSION "echo QUAD_B" Enter
-Start-Sleep -Seconds 1
-& $exe split-window -t $SESSION -v
 Start-Sleep -Seconds 2
+& $exe split-window -t $SESSION -v
+Start-Sleep -Seconds 3
 & $exe send-keys -t $SESSION "echo QUAD_C" Enter
-Start-Sleep -Seconds 1
+Start-Sleep -Seconds 2
 
 # Window 2 was just created (0=setup, 1=TEST12, 2=this)
 $capA = & $exe capture-pane -t "${SESSION}:2.0" -p 2>&1 | Out-String
@@ -409,7 +412,7 @@ Check "Quad pane 2 has QUAD_C" ($capC -match "QUAD_C")
 Write-Host "`n--- TEST 26: Targeted -e capture ---" -ForegroundColor Yellow
 
 & $exe send-keys -t "${SESSION}:0.0" 'Write-Host "STYLED_TARGET" -ForegroundColor Magenta' Enter
-Start-Sleep -Seconds 1
+Start-Sleep -Seconds 2
 
 $styled_target = & $exe capture-pane -t "${SESSION}:0.0" -p -e 2>&1 | Out-String
 Check "Targeted -e capture has escape codes" ($styled_target -match [char]27)

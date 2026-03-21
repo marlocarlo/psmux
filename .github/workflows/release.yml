@@ -8,6 +8,11 @@ on:
 permissions:
   contents: write
 
+# Prevent duplicate runs from overwriting release assets / submitting duplicate PRs
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -22,12 +27,15 @@ jobs:
           - target: x86_64-pc-windows-msvc
             label: Windows x64
             artifact: windows-x64
+            nsis_arch: x64
           - target: i686-pc-windows-msvc
             label: Windows x86
             artifact: windows-x86
+            nsis_arch: x86
           - target: aarch64-pc-windows-msvc
             label: Windows ARM64 (Snapdragon)
             artifact: windows-arm64
+            nsis_arch: arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -76,22 +84,158 @@ jobs:
           }
           Write-Output "Zip contains: $($entries -join ', ')"
 
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          # Install EnVar plugin for PATH manipulation
+          $nsisDir = "C:\Program Files (x86)\NSIS"
+          $pluginUrl = "https://nsis.sourceforge.io/mediawiki/images/7/7f/EnVar_plugin.zip"
+          $pluginZip = "$env:TEMP\EnVar_plugin.zip"
+          Invoke-WebRequest -Uri $pluginUrl -OutFile $pluginZip
+          Expand-Archive -Path $pluginZip -DestinationPath "$env:TEMP\EnVar" -Force
+          Copy-Item "$env:TEMP\EnVar\Plugins\x86-ansi\*" "$nsisDir\Plugins\x86-ansi\" -Force
+          Copy-Item "$env:TEMP\EnVar\Plugins\x86-unicode\*" "$nsisDir\Plugins\x86-unicode\" -Force
+
+      - name: Build NSIS installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          $releaseDir = Resolve-Path "target/${{ matrix.target }}/release"
+          $repoDir = Resolve-Path "."
+          New-Item -ItemType Directory -Path "target\installer" -Force | Out-Null
+
+          & "C:\Program Files (x86)\NSIS\makensis.exe" /NOCD `
+            /DVERSION=$version `
+            /DARCH=${{ matrix.nsis_arch }} `
+            "/DSOURCE_DIR=$releaseDir" `
+            "/DREPO_DIR=$repoDir" `
+            "installer\psmux.nsi"
+          if ($LASTEXITCODE -ne 0) { Write-Error "NSIS build failed"; exit 1 }
+
+          $setup = "target\installer\psmux-v${version}-${{ matrix.nsis_arch }}-setup.exe"
+          if (-not (Test-Path $setup)) { Write-Error "Setup not found: $setup"; exit 1 }
+          $sizeMB = [math]::Round((Get-Item $setup).Length / 1MB, 2)
+          Write-Output "NSIS installer: $setup ($sizeMB MB)"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: psmux-${{ matrix.artifact }}
-          path: psmux-*-${{ matrix.artifact }}.zip
+          path: |
+            psmux-*-${{ matrix.artifact }}.zip
+            target/installer/*-${{ matrix.nsis_arch }}-setup.exe
 
   release:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Find the previous tag
+          CURRENT_TAG="${{ github.ref_name }}"
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${CURRENT_TAG}$" | head -n 1)
+
+          if [ -z "$PREV_TAG" ]; then
+            echo "No previous tag found — generating changelog from all commits"
+            LOG=$(git log --pretty=format:"- %s (%h)" --no-merges "$CURRENT_TAG")
+          else
+            echo "Generating changelog: $PREV_TAG → $CURRENT_TAG"
+            LOG=$(git log --pretty=format:"- %s (%h)" --no-merges "${PREV_TAG}..${CURRENT_TAG}")
+          fi
+
+          # Write to file to preserve multiline content
+          echo "$LOG" > /tmp/changelog.md
+          echo "prev_tag=$PREV_TAG" >> $GITHUB_OUTPUT
+
+      - name: Build release body
+        id: body
+        run: |
+          CURRENT_TAG="${{ github.ref_name }}"
+          PREV_TAG="${{ steps.changelog.outputs.prev_tag }}"
+
+          {
+            echo "## psmux ${CURRENT_TAG}"
+            echo ""
+            echo "Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal."
+            echo ""
+            if [ -n "$PREV_TAG" ]; then
+              echo "### Changelog (${PREV_TAG} → ${CURRENT_TAG})"
+            else
+              echo "### Changelog"
+            fi
+            echo ""
+            cat /tmp/changelog.md
+            echo ""
+            echo ""
+            echo "### Downloads"
+            echo ""
+            echo "**Portable (zip):**"
+            echo "| Platform | File |"
+            echo "|----------|------|"
+            echo "| Windows x64 (Intel/AMD 64-bit) | \`psmux-${CURRENT_TAG}-windows-x64.zip\` |"
+            echo "| Windows x86 (Intel/AMD 32-bit) | \`psmux-${CURRENT_TAG}-windows-x86.zip\` |"
+            echo "| Windows ARM64 (Snapdragon/Surface Pro X) | \`psmux-${CURRENT_TAG}-windows-arm64.zip\` |"
+            echo ""
+            echo "**Installer (NSIS setup — kills running instances, adds to PATH, warmup):**"
+            echo "| Platform | File |"
+            echo "|----------|------|"
+            VERSION_NO_V="${CURRENT_TAG#v}"
+            echo "| Windows x64 | \`psmux-v${VERSION_NO_V}-x64-setup.exe\` |"
+            echo "| Windows x86 | \`psmux-v${VERSION_NO_V}-x86-setup.exe\` |"
+            echo "| Windows ARM64 | \`psmux-v${VERSION_NO_V}-arm64-setup.exe\` |"
+            echo ""
+            echo "### Installation"
+            echo ""
+            echo "**Via Scoop (recommended):**"
+            echo "\`\`\`powershell"
+            echo "scoop bucket add psmux https://github.com/psmux/scoop-psmux"
+            echo "scoop install psmux"
+            echo "\`\`\`"
+            echo ""
+            echo "**Via Chocolatey:**"
+            echo "\`\`\`powershell"
+            echo "choco install psmux"
+            echo "\`\`\`"
+            echo ""
+            echo "**Via WinGet:**"
+            echo "\`\`\`powershell"
+            echo "winget install marlocarlo.psmux"
+            echo "\`\`\`"
+            echo ""
+            echo "**Via Cargo:**"
+            echo "\`\`\`powershell"
+            echo "cargo install psmux"
+            echo "\`\`\`"
+            echo ""
+            echo "**Via PowerShell:**"
+            echo "\`\`\`powershell"
+            echo "irm https://raw.githubusercontent.com/psmux/psmux/master/scripts/install.ps1 | iex"
+            echo "\`\`\`"
+            echo ""
+            echo "**Manual Installation:**"
+            echo "1. Download the zip matching your architecture"
+            echo "2. Extract to a folder in your PATH"
+            echo "3. \`psmux\`, \`pmux\`, and \`tmux\` commands will all be available"
+            echo ""
+            echo "### What's Included"
+            echo "- \`psmux.exe\` - Main executable"
+            echo "- \`pmux.exe\` - Alias"
+            echo "- \`tmux.exe\` - Alias for tmux compatibility"
+          } > /tmp/release_body.md
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
 
       - name: List artifacts
-        run: find . -type f -name "*.zip"
+        run: find . -type f \( -name "*.zip" -o -name "*-setup.exe" \)
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
@@ -100,55 +244,10 @@ jobs:
             psmux-windows-x64/*.zip
             psmux-windows-x86/*.zip
             psmux-windows-arm64/*.zip
-          body: |
-            ## psmux ${{ github.ref_name }}
-            
-            Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal.
-            
-            ### Downloads
-            | Platform | File |
-            |----------|------|
-            | Windows x64 (Intel/AMD 64-bit) | `psmux-${{ github.ref_name }}-windows-x64.zip` |
-            | Windows x86 (Intel/AMD 32-bit) | `psmux-${{ github.ref_name }}-windows-x86.zip` |
-            | Windows ARM64 (Snapdragon/Surface Pro X) | `psmux-${{ github.ref_name }}-windows-arm64.zip` |
-            
-            ### Installation
-            
-            **Via Scoop (recommended):**
-            ```powershell
-            scoop bucket add psmux https://github.com/marlocarlo/scoop-psmux
-            scoop install psmux
-            ```
-            
-            **Via Chocolatey:**
-            ```powershell
-            choco install psmux
-            ```
-            
-            **Via WinGet:**
-            ```powershell
-            winget install marlocarlo.psmux
-            ```
-            
-            **Via Cargo:**
-            ```powershell
-            cargo install psmux
-            ```
-            
-            **Via PowerShell:**
-            ```powershell
-            irm https://raw.githubusercontent.com/marlocarlo/psmux/master/scripts/install.ps1 | iex
-            ```
-            
-            **Manual Installation:**
-            1. Download the zip matching your architecture
-            2. Extract to a folder in your PATH
-            3. `psmux`, `pmux`, and `tmux` commands will all be available
-            
-            ### What's Included
-            - `psmux.exe` - Main executable
-            - `pmux.exe` - Alias
-            - `tmux.exe` - Alias for tmux compatibility
+            psmux-windows-x64/**/*-setup.exe
+            psmux-windows-x86/**/*-setup.exe
+            psmux-windows-arm64/**/*-setup.exe
+          body_path: /tmp/release_body.md
           draft: false
           prerelease: false
         env:
@@ -164,8 +263,34 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Publish to crates.io
-        run: cargo publish --no-verify --allow-dirty
+      - name: Verify crate compiles with crates.io dependencies
+        run: |
+          cargo check 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Crate fails to compile with crates.io dependencies! Fix before publishing."
+            exit 1
+          }
+        shell: pwsh
+
+      - name: Publish sub-crates then main crate to crates.io
+        shell: pwsh
+        run: |
+          # Sub-crates must be published first so crates.io can resolve path deps
+          cargo publish --allow-dirty -p portable-pty-psmux 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "portable-pty-psmux publish failed (may already be published)"
+          }
+          Start-Sleep 15
+          cargo publish --allow-dirty -p vt100-psmux 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "vt100-psmux publish failed (may already be published)"
+          }
+          Start-Sleep 15
+          cargo publish --allow-dirty
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "psmux publish failed!"
+            exit 1
+          }
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -175,6 +300,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Wait for release assets to stabilize on GitHub CDN
+        shell: pwsh
+        run: |
+          Write-Output "Waiting 60s for GitHub release CDN propagation..."
+          Start-Sleep 60
 
       - name: Extract version from tag
         id: version
@@ -226,102 +357,86 @@ jobs:
           }
           Write-Output "Checksum verified: $hash1"
 
-      - name: Generate chocolateyinstall.ps1
+      - name: Build and push Chocolatey package
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $ver = "${{ steps.version.outputs.VERSION }}"
           $tag = "${{ steps.version.outputs.TAG }}"
           $hash = "${{ steps.checksum.outputs.SHA256 }}"
           $url = "https://github.com/${{ github.repository }}/releases/download/$tag/psmux-$tag-windows-x64.zip"
-
-          $script = @"
-          `$ErrorActionPreference = 'Stop'
-
-          `$toolsDir = "`$(Split-Path -Parent `$MyInvocation.MyCommand.Definition)"
-          `$url64 = '$url'
-
-          `$packageArgs = @{
-            packageName    = `$env:ChocolateyPackageName
-            unzipLocation  = `$toolsDir
-            url64bit       = `$url64
-            checksum64     = '$hash'
-            checksumType64 = 'sha256'
-          }
-
-          Install-ChocolateyZipPackage @packageArgs
-
-          # Create shims for psmux, pmux, and tmux
-          `$psmuxPath = Join-Path `$toolsDir "psmux.exe"
-          `$pmuxPath = Join-Path `$toolsDir "pmux.exe"
-          `$tmuxPath = Join-Path `$toolsDir "tmux.exe"
-
-          Install-BinFile -Name "psmux" -Path `$psmuxPath
-          Install-BinFile -Name "pmux" -Path `$pmuxPath
-          Install-BinFile -Name "tmux" -Path `$tmuxPath
-          "@
-
-          # Remove leading whitespace from here-string indentation
-          $script = ($script -split "`n" | ForEach-Object { $_.TrimStart() }) -join "`n"
+          $utf8 = New-Object System.Text.UTF8Encoding $false
 
           New-Item -ItemType Directory -Path "choco-pkg/tools" -Force | Out-Null
-          Set-Content -Path "choco-pkg/tools/chocolateyinstall.ps1" -Value $script -NoNewline
-          Write-Output "Generated chocolateyinstall.ps1 with checksum $hash"
 
-      - name: Generate chocolateyuninstall.ps1
-        shell: pwsh
-        run: |
-          $script = @"
-          Uninstall-BinFile -Name "psmux"
-          Uninstall-BinFile -Name "pmux"
-          Uninstall-BinFile -Name "tmux"
-          "@
-          $script = ($script -split "`n" | ForEach-Object { $_.TrimStart() }) -join "`n"
-          Set-Content -Path "choco-pkg/tools/chocolateyuninstall.ps1" -Value $script -NoNewline
+          # --- chocolateyinstall.ps1 ---
+          $install = @(
+            '$ErrorActionPreference = ''Stop'''
+            ''
+            '$toolsDir = "$(Split-Path -Parent $MyInvocation.MyCommand.Definition)"'
+            ('$url64 = ''{0}''' -f $url)
+            ''
+            '$packageArgs = @{'
+            '  packageName    = $env:ChocolateyPackageName'
+            '  unzipLocation  = $toolsDir'
+            '  url64bit       = $url64'
+            ('  checksum64     = ''{0}''' -f $hash)
+            '  checksumType64 = ''sha256'''
+            '}'
+            ''
+            'Install-ChocolateyZipPackage @packageArgs'
+            ''
+            '$psmuxPath = Join-Path $toolsDir "psmux.exe"'
+            '$pmuxPath = Join-Path $toolsDir "pmux.exe"'
+            '$tmuxPath = Join-Path $toolsDir "tmux.exe"'
+            ''
+            'Install-BinFile -Name "psmux" -Path $psmuxPath'
+            'Install-BinFile -Name "pmux" -Path $pmuxPath'
+            'Install-BinFile -Name "tmux" -Path $tmuxPath'
+          ) -join "`n"
+          [IO.File]::WriteAllText("$PWD/choco-pkg/tools/chocolateyinstall.ps1", $install, $utf8)
 
-      - name: Generate nuspec
-        shell: pwsh
-        run: |
-          $ver = "${{ steps.version.outputs.VERSION }}"
-          $nuspec = @"
-          <?xml version="1.0" encoding="utf-8"?>
-          <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
-            <metadata>
-              <id>psmux</id>
-              <version>$ver</version>
-              <title>psmux - Terminal Multiplexer for Windows</title>
-              <authors>marlocarlo</authors>
-              <owners>marlocarlo</owners>
-              <licenseUrl>https://github.com/marlocarlo/psmux/blob/master/LICENSE</licenseUrl>
-              <projectUrl>https://github.com/marlocarlo/psmux</projectUrl>
-              <requireLicenseAcceptance>false</requireLicenseAcceptance>
-              <description>Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal. Includes psmux, pmux, and tmux commands.</description>
-              <summary>Terminal multiplexer for Windows (tmux alternative)</summary>
-              <releaseNotes>https://github.com/marlocarlo/psmux/releases</releaseNotes>
-              <tags>terminal multiplexer tmux powershell cli windows psmux pmux</tags>
-              <packageSourceUrl>https://github.com/marlocarlo/psmux</packageSourceUrl>
-              <docsUrl>https://github.com/marlocarlo/psmux#readme</docsUrl>
-              <bugTrackerUrl>https://github.com/marlocarlo/psmux/issues</bugTrackerUrl>
-            </metadata>
-            <files>
-              <file src="tools\**" target="tools" />
-            </files>
-          </package>
-          "@
-          $nuspec = ($nuspec -split "`n" | ForEach-Object { $_.TrimStart() }) -join "`n"
-          Set-Content -Path "choco-pkg/psmux.nuspec" -Value $nuspec -NoNewline
+          # --- chocolateyuninstall.ps1 ---
+          $uninstall = @(
+            'Uninstall-BinFile -Name "psmux"'
+            'Uninstall-BinFile -Name "pmux"'
+            'Uninstall-BinFile -Name "tmux"'
+          ) -join "`n"
+          [IO.File]::WriteAllText("$PWD/choco-pkg/tools/chocolateyuninstall.ps1", $uninstall, $utf8)
 
-      - name: Pack Chocolatey package
-        shell: pwsh
-        run: |
+          # --- nuspec ---
+          $nuspec = @(
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">'
+            '  <metadata>'
+            '    <id>psmux</id>'
+            ('    <version>{0}</version>' -f $ver)
+            '    <title>psmux - Terminal Multiplexer for Windows</title>'
+            '    <authors>Josh</authors>'
+            '    <owners>Josh</owners>'
+            '    <licenseUrl>https://github.com/psmux/psmux/blob/master/LICENSE</licenseUrl>'
+            '    <projectUrl>https://github.com/psmux/psmux</projectUrl>'
+            '    <requireLicenseAcceptance>false</requireLicenseAcceptance>'
+            '    <description>Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal. Includes psmux, pmux, and tmux commands.</description>'
+            '    <summary>Terminal multiplexer for Windows (tmux alternative)</summary>'
+            '    <releaseNotes>https://github.com/psmux/psmux/releases</releaseNotes>'
+            '    <tags>terminal multiplexer tmux powershell cli windows psmux pmux</tags>'
+            '    <packageSourceUrl>https://github.com/psmux/psmux</packageSourceUrl>'
+            '    <docsUrl>https://github.com/psmux/psmux#readme</docsUrl>'
+            '    <bugTrackerUrl>https://github.com/psmux/psmux/issues</bugTrackerUrl>'
+            '  </metadata>'
+            '  <files>'
+            '    <file src="tools\**" target="tools" />'
+            '  </files>'
+            '</package>'
+          ) -join "`n"
+          [IO.File]::WriteAllText("$PWD/choco-pkg/psmux.nuspec", $nuspec, $utf8)
+
+          # --- Pack and push ---
           cd choco-pkg
           choco pack psmux.nuspec
-          Get-ChildItem *.nupkg
-
-      - name: Push to Chocolatey
-        shell: pwsh
-        run: |
-          cd choco-pkg
           $nupkg = (Get-ChildItem *.nupkg)[0].Name
+          Write-Output "Packed: $nupkg"
           choco push $nupkg --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}
           Write-Output "Successfully pushed $nupkg to Chocolatey"
 
@@ -330,6 +445,11 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
+      - name: Wait for release assets to stabilize on GitHub CDN
+        run: |
+          echo "Waiting 60s for GitHub release CDN propagation..."
+          sleep 60
+
       - name: Extract version from tag
         id: version
         shell: bash
@@ -364,7 +484,7 @@ jobs:
       - name: Clone scoop bucket repo
         shell: bash
         run: |
-          git clone https://x-access-token:${{ secrets.WINGET_PAT }}@github.com/marlocarlo/scoop-psmux.git scoop-bucket
+          git clone https://x-access-token:${{ secrets.WINGET_PAT }}@github.com/psmux/scoop-psmux.git scoop-bucket
 
       - name: Update scoop manifest
         shell: bash
@@ -381,7 +501,7 @@ jobs:
           {
               "version": "$ver",
               "description": "Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal",
-              "homepage": "https://github.com/marlocarlo/psmux",
+              "homepage": "https://github.com/psmux/psmux",
               "license": "MIT",
               "architecture": {
                   "64bit": {
@@ -403,18 +523,18 @@ jobs:
                   "tmux.exe"
               ],
               "checkver": {
-                  "github": "https://github.com/marlocarlo/psmux"
+                  "github": "https://github.com/psmux/psmux"
               },
               "autoupdate": {
                   "architecture": {
                       "64bit": {
-                          "url": "https://github.com/marlocarlo/psmux/releases/download/v\$version/psmux-v\$version-windows-x64.zip"
+                          "url": "https://github.com/psmux/psmux/releases/download/v\$version/psmux-v\$version-windows-x64.zip"
                       },
                       "32bit": {
-                          "url": "https://github.com/marlocarlo/psmux/releases/download/v\$version/psmux-v\$version-windows-x86.zip"
+                          "url": "https://github.com/psmux/psmux/releases/download/v\$version/psmux-v\$version-windows-x86.zip"
                       },
                       "arm64": {
-                          "url": "https://github.com/marlocarlo/psmux/releases/download/v\$version/psmux-v\$version-windows-arm64.zip"
+                          "url": "https://github.com/psmux/psmux/releases/download/v\$version/psmux-v\$version-windows-arm64.zip"
                       }
                   }
               }
@@ -448,6 +568,12 @@ jobs:
     needs: release
     runs-on: windows-latest
     steps:
+      - name: Wait for release assets to stabilize on GitHub CDN
+        shell: pwsh
+        run: |
+          Write-Output "Waiting 90s for GitHub release CDN propagation..."
+          Start-Sleep 90
+
       - name: Extract version from tag
         id: version
         shell: pwsh
@@ -541,6 +667,7 @@ jobs:
 
           # ---- Version manifest ----
           @"
+          # yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.1.9.0.schema.json
           PackageIdentifier: $pkgId
           PackageVersion: $ver
           DefaultLocale: en-US
@@ -550,6 +677,7 @@ jobs:
 
           # ---- Installer manifest ----
           @"
+          # yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.1.9.0.schema.json
           PackageIdentifier: $pkgId
           PackageVersion: $ver
           Platform:
@@ -580,17 +708,18 @@ jobs:
 
           # ---- Default locale manifest ----
           @"
+          # yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.1.9.0.schema.json
           PackageIdentifier: $pkgId
           PackageVersion: $ver
           PackageLocale: en-US
-          Publisher: marlocarlo
-          PublisherUrl: https://github.com/marlocarlo
-          PublisherSupportUrl: https://github.com/marlocarlo/psmux/issues
+          Publisher: Josh
+          PublisherUrl: https://github.com/psmux
+          PublisherSupportUrl: https://github.com/psmux/psmux/issues
           PackageName: psmux
-          PackageUrl: https://github.com/marlocarlo/psmux
+          PackageUrl: https://github.com/psmux/psmux
           License: MIT
-          LicenseUrl: https://github.com/marlocarlo/psmux/blob/master/LICENSE
-          Copyright: Copyright (c) marlocarlo
+          LicenseUrl: https://github.com/psmux/psmux/blob/master/LICENSE
+          Copyright: Copyright (c) Josh
           ShortDescription: Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal
           Description: |-
             psmux is a terminal multiplexer for Windows, bringing tmux-style split panes,
@@ -608,7 +737,7 @@ jobs:
           - pane
           - session
           - pmux
-          ReleaseNotesUrl: https://github.com/marlocarlo/psmux/releases/tag/$tag
+          ReleaseNotesUrl: https://github.com/psmux/psmux/releases/tag/$tag
           ManifestType: defaultLocale
           ManifestVersion: 1.9.0
           "@ -replace '(?m)^\s{10}','' | Set-Content "$outDir/$pkgId.locale.en-US.yaml" -Encoding utf8NoBOM

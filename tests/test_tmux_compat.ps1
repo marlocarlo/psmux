@@ -8,7 +8,10 @@
 # 5. TMUX env var resolution with -L namespaces
 
 $ErrorActionPreference = "Continue"
-$exe = "psmux"
+$exe = "$PSScriptRoot\..\target\release\psmux.exe"
+if (-not (Test-Path $exe)) { $exe = "$PSScriptRoot\..\target\debug\psmux.exe" }
+if (-not (Test-Path $exe)) { $exe = (Get-Command psmux -ErrorAction SilentlyContinue).Source }
+if (-not $exe -or -not (Test-Path $exe)) { Write-Error "psmux binary not found"; exit 1 }
 
 # Helper: cleanup sessions
 function Cleanup-All {

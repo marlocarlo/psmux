@@ -38,7 +38,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$RepoOwner = "marlocarlo"
+$RepoOwner = "psmux"
 $RepoName = "psmux"
 $PackageId = "psmux"
 
@@ -133,8 +133,8 @@ $nuspec = @"
     <id>$PackageId</id>
     <version>$Version</version>
     <title>psmux - Terminal Multiplexer for Windows</title>
-    <authors>marlocarlo</authors>
-    <owners>marlocarlo</owners>
+    <authors>Josh</authors>
+    <owners>Josh</owners>
     <licenseUrl>https://github.com/$RepoOwner/$RepoName/blob/master/LICENSE</licenseUrl>
     <projectUrl>https://github.com/$RepoOwner/$RepoName</projectUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>

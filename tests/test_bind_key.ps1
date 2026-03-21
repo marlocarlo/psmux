@@ -283,11 +283,11 @@ bind-key -T prefix g display-message
 bind-key -n F10 new-window
 "@ | Set-Content $configPath -Force
 
-# Kill and restart session so config is loaded
-Start-Process -FilePath $PSMUX -ArgumentList "kill-session -t bindtest" -WindowStyle Hidden
-Start-Sleep -Seconds 2
+# Kill server (not just session) so config is re-loaded on fresh start
+Start-Process -FilePath $PSMUX -ArgumentList "kill-server" -WindowStyle Hidden
+Start-Sleep -Seconds 3
 New-PsmuxSession -Name "bindtest"
-Start-Sleep -Seconds 2
+Start-Sleep -Seconds 3
 
 $keys = Psmux list-keys -t bindtest | Out-String
 if ("$keys" -match "prefix.*g.*display-message") {

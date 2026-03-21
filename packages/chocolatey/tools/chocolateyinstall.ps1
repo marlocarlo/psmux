@@ -12,7 +12,7 @@
 $ErrorActionPreference = 'Stop'
 
 $toolsDir = "$(Split-Path -Parent $MyInvocation.MyCommand.Definition)"
-$url64 = 'https://github.com/marlocarlo/psmux/releases/download/v__VERSION__/psmux-v__VERSION__-windows-x64.zip'
+$url64 = 'https://github.com/psmux/psmux/releases/download/v__VERSION__/psmux-v__VERSION__-windows-x64.zip'
 
 $packageArgs = @{
   packageName    = $env:ChocolateyPackageName
@@ -32,3 +32,7 @@ $tmuxPath = Join-Path $toolsDir "tmux.exe"
 Install-BinFile -Name "psmux" -Path $psmuxPath
 Install-BinFile -Name "pmux" -Path $pmuxPath
 Install-BinFile -Name "tmux" -Path $tmuxPath
+
+# Pre-warm: trigger Windows Defender scan cache and spawn a warm server
+# so the user's first 'psmux new-session' is instant.
+Start-Process -FilePath $psmuxPath -ArgumentList 'warmup' -WindowStyle Hidden

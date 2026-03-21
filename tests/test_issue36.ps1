@@ -4,7 +4,7 @@
 #   cursor-style, cursor-blink, history-limit, prediction-dimming,
 #   bind-key -T prefix h/v split-window
 #
-# https://github.com/marlocarlo/psmux/issues/36
+# https://github.com/psmux/psmux/issues/36
 
 $ErrorActionPreference = "Continue"
 $script:TestsPassed = 0

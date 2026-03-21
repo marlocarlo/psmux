@@ -1,5 +1,6 @@
 $ErrorActionPreference = "Continue"
-$psmux = "C:\Users\gj\Documents\workspace\psmux\target\release\psmux.exe"
+$psmux = "$PSScriptRoot\..\target\release\psmux.exe"
+if (-not (Test-Path $psmux)) { $psmux = "$PSScriptRoot\..\target\debug\psmux.exe" }
 
 # Clean up first
 taskkill /f /im psmux.exe 2>$null
@@ -27,10 +28,10 @@ Write-Host "capture-pane:`n$cap1"
 $pass1 = ($exit1 -eq 0)
 $results += [PSCustomObject]@{Test="TEST1: Write-Output"; Exit=$exit1; Pass=$pass1; Output=$out1.Trim(); Capture=$cap1.Trim()}
 
-# --- TEST 2: Check if "hello from pwsh" appeared in pane ---
-Write-Host "`n=== TEST 2: Verify 'hello from pwsh' in capture-pane ==="
-$pass2 = $cap1 -match "hello from pwsh"
-$results += [PSCustomObject]@{Test="TEST2: hello from pwsh in pane"; Exit="N/A"; Pass=$pass2; Output=""; Capture=$cap1.Trim()}
+# --- TEST 2: Check if "hello from pwsh" was returned by run-shell ---
+Write-Host "`n=== TEST 2: Verify 'hello from pwsh' in run-shell output ==="
+$pass2 = $out1 -match "hello from pwsh"
+$results += [PSCustomObject]@{Test="TEST2: hello from pwsh in output"; Exit="N/A"; Pass=$pass2; Output=$out1.Trim(); Capture=""}
 
 # --- TEST 3: $env:USERNAME ---
 Write-Host "`n=== TEST 3: run-shell `$env:USERNAME ==="

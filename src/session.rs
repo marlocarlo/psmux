@@ -2,6 +2,56 @@ use std::io::{self, Write};
 use std::time::Duration;
 use std::env;
 
+/// Returns true if this port-file base name belongs to a warm (standby) server.
+/// Warm sessions should be hidden from user-facing lists and never auto-attached.
+pub fn is_warm_session(base: &str) -> bool {
+    base == "__warm__" || base.ends_with("____warm__")
+}
+
+/// Find the next available numeric session name (tmux-compatible).
+/// tmux uses a monotonically incrementing counter, but since psmux has
+/// no persistent server state, we scan existing port files and pick
+/// the lowest non-negative integer not already in use.
+/// When `ns_prefix` is Some("foo"), names are checked as "foo__0", "foo__1", etc.
+pub fn next_session_name(ns_prefix: Option<&str>) -> String {
+    let home = match env::var("USERPROFILE").or_else(|_| env::var("HOME")) {
+        Ok(h) => h,
+        Err(_) => return "0".to_string(),
+    };
+    let psmux_dir = format!("{}\\.psmux", home);
+    let mut used: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    if let Ok(entries) = std::fs::read_dir(&psmux_dir) {
+        for entry in entries.flatten() {
+            if let Some(fname) = entry.file_name().to_str() {
+                if let Some((base, ext)) = fname.rsplit_once('.') {
+                    if ext != "port" { continue; }
+                    if is_warm_session(base) { continue; }
+                    // Extract the session name part (after namespace prefix if any)
+                    let session_part = if let Some(pfx) = ns_prefix {
+                        let full_pfx = format!("{}__", pfx);
+                        if base.starts_with(&full_pfx) {
+                            &base[full_pfx.len()..]
+                        } else {
+                            continue; // different namespace
+                        }
+                    } else {
+                        if base.contains("__") { continue; } // namespaced session
+                        base
+                    };
+                    if let Ok(n) = session_part.parse::<u32>() {
+                        used.insert(n);
+                    }
+                }
+            }
+        }
+    }
+    let mut id = 0u32;
+    while used.contains(&id) {
+        id += 1;
+    }
+    id.to_string()
+}
+
 /// Clean up any stale port files (where server is not actually running)
 pub fn cleanup_stale_port_files() {
     let home = match env::var("USERPROFILE").or_else(|_| env::var("HOME")) {
@@ -18,12 +68,18 @@ pub fn cleanup_stale_port_files() {
                         let addr = format!("127.0.0.1:{}", port);
                         if std::net::TcpStream::connect_timeout(
                             &addr.parse().unwrap(),
-                            Duration::from_millis(20)
+                            Duration::from_millis(5)
                         ).is_err() {
                             let _ = std::fs::remove_file(&path);
+                            // Also remove the matching .key file to prevent
+                            // orphaned keys from accumulating (issue #136).
+                            let key_path = path.with_extension("key");
+                            let _ = std::fs::remove_file(&key_path);
                         }
                     } else {
                         let _ = std::fs::remove_file(&path);
+                        let key_path = path.with_extension("key");
+                        let _ = std::fs::remove_file(&key_path);
                     }
                 }
             }
@@ -42,6 +98,7 @@ pub fn read_session_key(session: &str) -> io::Result<String> {
 pub fn send_auth_cmd(addr: &str, key: &str, cmd: &[u8]) -> io::Result<()> {
     let sock_addr: std::net::SocketAddr = addr.parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     if let Ok(mut s) = std::net::TcpStream::connect_timeout(&sock_addr, Duration::from_millis(50)) {
+        let _ = s.set_nodelay(true);
         let _ = write!(s, "AUTH {}\n", key);
         let _ = std::io::Write::write_all(&mut s, cmd);
         let _ = s.flush();
@@ -52,6 +109,7 @@ pub fn send_auth_cmd(addr: &str, key: &str, cmd: &[u8]) -> io::Result<()> {
 /// Send an authenticated command and get response
 pub fn send_auth_cmd_response(addr: &str, key: &str, cmd: &[u8]) -> io::Result<String> {
     let mut s = std::net::TcpStream::connect(addr)?;
+    let _ = s.set_nodelay(true);
     let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
     let _ = write!(s, "AUTH {}\n", key);
     let _ = std::io::Write::write_all(&mut s, cmd);
@@ -66,14 +124,19 @@ pub fn send_auth_cmd_response(addr: &str, key: &str, cmd: &[u8]) -> io::Result<S
 
 pub fn send_control(line: String) -> io::Result<()> {
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
+    let mut target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
+    // Never target a warm (standby) session — resolve to a real session instead
+    if is_warm_session(&target) {
+        target = resolve_last_session_name().unwrap_or_else(|| "default".to_string());
+    }
     let full_target = env::var("PSMUX_TARGET_FULL").ok();
     let path = format!("{}\\.psmux\\{}.port", home, target);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
     let session_key = read_session_key(&target).unwrap_or_default();
-    let addr = format!("127.0.0.1:{}", port);
-    let mut stream = std::net::TcpStream::connect(addr)?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100))?;
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
     let _ = write!(stream, "AUTH {}\n", session_key);
     if let Some(ref ft) = full_target {
         let _ = write!(stream, "TARGET {}\n", ft);
@@ -90,13 +153,18 @@ pub fn send_control(line: String) -> io::Result<()> {
 
 pub fn send_control_with_response(line: String) -> io::Result<String> {
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
+    let mut target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
+    // Never target a warm (standby) session — resolve to a real session instead
+    if is_warm_session(&target) {
+        target = resolve_last_session_name().unwrap_or_else(|| "default".to_string());
+    }
     let full_target = env::var("PSMUX_TARGET_FULL").ok();
     let path = format!("{}\\.psmux\\{}.port", home, target);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = std::net::TcpStream::connect(&addr)?;
+    let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
     let _ = write!(stream, "AUTH {}\n", session_key);
     if let Some(ref ft) = full_target {
@@ -126,11 +194,18 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
     Ok(result)
 }
 
-/// Send a control message to a specific port
-pub fn send_control_to_port(port: u16, msg: &str) -> io::Result<()> {
+/// Send a control message to a specific port with authentication
+pub fn send_control_to_port(port: u16, msg: &str, session_key: &str) -> io::Result<()> {
     let addr = format!("127.0.0.1:{}", port);
     if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
+        let _ = stream.set_nodelay(true);
+        let _ = write!(stream, "AUTH {}\n", session_key);
         let _ = stream.write_all(msg.as_bytes());
+        let _ = stream.flush();
+        // Drain the OK response to prevent RST
+        let mut buf = [0u8; 64];
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+        let _ = std::io::Read::read(&mut stream, &mut buf);
     }
     Ok(())
 }
@@ -154,6 +229,8 @@ pub fn resolve_last_session_name() -> Option<String> {
             }
         }
     }
+    // Exclude warm (standby) sessions — users should never auto-attach to them
+    picks.retain(|(n, _)| !is_warm_session(n));
     picks.sort_by_key(|(_, t)| *t);
     picks.last().map(|(n, _)| n.clone())
 }
@@ -208,6 +285,8 @@ pub fn list_all_sessions_tree(current_session: &str, current_windows: &[(String,
             let path = entry.path();
             if path.extension().map(|e| e == "port").unwrap_or(false) {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    // Hide warm (standby) sessions from choose-tree
+                    if is_warm_session(stem) { continue; }
                     if let Ok(port_str) = std::fs::read_to_string(&path) {
                         if let Ok(port) = port_str.trim().parse::<u16>() {
                             let mtime = entry.metadata()

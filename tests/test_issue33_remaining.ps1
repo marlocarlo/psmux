@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 # test_issue33_remaining.ps1
 # Tests for the 4 remaining issues from GitHub Issue #33 comment:
-# https://github.com/marlocarlo/psmux/issues/33#issuecomment-3912890080
+# https://github.com/psmux/psmux/issues/33#issuecomment-3912890080
 #
 # Issue 1: -L <socket> flag not supported (High)
 # Issue 2: new-session -P -F '#{pane_id}' returns empty (Medium)
@@ -9,12 +9,16 @@
 # Issue 4: Commands without -t default to session "default" (Medium)
 
 $ErrorActionPreference = "Continue"
-$exe = "psmux"
+$exe = "$PSScriptRoot\..\target\release\psmux.exe"
+if (-not (Test-Path $exe)) { $exe = "$PSScriptRoot\..\target\debug\psmux.exe" }
+if (-not (Test-Path $exe)) { $exe = (Get-Command psmux -ErrorAction SilentlyContinue).Source }
+if (-not $exe -or -not (Test-Path $exe)) { Write-Error "psmux binary not found"; exit 1 }
 
 # Helper: cleanup sessions
 function Cleanup-Sessions {
     & $exe kill-session -t test-issue33 2>$null
     & $exe -L test-L-socket kill-session -t default 2>$null
+    & $exe -L test-L-socket kill-session -t nstest 2>$null
     & $exe -L test-L-socket kill-session -t test-L-socket 2>$null
     & $exe kill-session -t test-pf 2>$null
     & $exe kill-session -t test-newwin 2>$null
@@ -67,10 +71,12 @@ Test-Assert "new-session with -L flag does not error" (-not $hasUnknown) "Output
 & $exe -L test-L-socket kill-session -t test-L-socket 2>$null
 Start-Sleep -Milliseconds 300
 
-# Test 1.2: -L as a namespace with default session name
+# Test 1.2: -L as a namespace with explicit session name
 # In tmux: tmux -L mysocket new-session -d creates a server named "mysocket"
-# For psmux, -L creates a namespace: port file = "test-L-socket__default.port"
-$output2 = & $exe -L test-L-socket new-session -d 2>&1
+# For psmux, -L creates a namespace: port file = "test-L-socket__nstest.port"
+# NOTE: We use -s to give an explicit name because psmux auto-numbers sessions
+# (0, 1, 2, ...) when no -s is given, matching tmux behavior.
+$output2 = & $exe -L test-L-socket new-session -d -s nstest 2>&1
 $exitCode2 = $LASTEXITCODE
 $errorStr2 = ($output2 | Out-String)
 $hasUnknown2 = $errorStr2 -match "unknown"
@@ -78,12 +84,12 @@ Test-Assert "-L <name> new-session -d works (creates namespaced session)" (-not 
 
 # Verify session exists using -L namespace
 Start-Sleep -Milliseconds 500
-& $exe -L test-L-socket has-session -t default 2>$null
+& $exe -L test-L-socket has-session -t nstest 2>$null
 $hasExit = $LASTEXITCODE
 Test-Assert "-L created session findable via -L has-session" ($hasExit -eq 0) "Exit code: $hasExit"
 
 # Cleanup
-& $exe -L test-L-socket kill-session -t default 2>$null
+& $exe -L test-L-socket kill-session -t nstest 2>$null
 Start-Sleep -Milliseconds 300
 
 # ============================================================

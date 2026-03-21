@@ -1,6 +1,15 @@
-$bin = "C:\Users\gj\Documents\workspace\psmux\target\release\psmux.exe"
+$bin = (Resolve-Path "$PSScriptRoot\..\target\release\psmux.exe" -ErrorAction SilentlyContinue).Path
+if (-not $bin) { $bin = (Resolve-Path "$PSScriptRoot\..\target\debug\psmux.exe" -ErrorAction SilentlyContinue).Path }
+if (-not $bin) { $bin = "psmux" }
 $pass_count = 0
 $fail_count = 0
+
+# Setup: create the fmttest session with a split pane
+& $bin kill-session -t fmttest 2>$null
+& $bin new-session -d -s fmttest 2>&1 | Out-Null
+Start-Sleep -Seconds 2
+& $bin split-window -t fmttest -h 2>&1 | Out-Null
+Start-Sleep -Seconds 1
 
 function Run-Test($num, $label, $format, $target, $validator) {
     $raw = & $bin display-message -t $target -p $format 2>&1

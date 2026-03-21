@@ -2,20 +2,21 @@
 <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
   <metadata>
     <id>psmux</id>
-    <version>0.4.1</version>
+    <version>0.4.9</version>
     <title>psmux - Terminal Multiplexer for Windows</title>
-    <authors>marlocarlo</authors>
-    <owners>marlocarlo</owners>
-    <licenseUrl>https://github.com/marlocarlo/psmux/blob/master/LICENSE</licenseUrl>
-    <projectUrl>https://github.com/marlocarlo/psmux</projectUrl>
+    <authors>Josh</authors>
+    <owners>Josh</owners>
+    <licenseUrl>https://github.com/psmux/psmux/blob/master/LICENSE</licenseUrl>
+    <projectUrl>https://github.com/psmux/psmux</projectUrl>
+    <iconUrl>https://raw.githubusercontent.com/psmux/psmux/master/icon.svg</iconUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
     <description>Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal. Includes psmux, pmux, and tmux commands.</description>
     <summary>Terminal multiplexer for Windows (tmux alternative)</summary>
-    <releaseNotes>https://github.com/marlocarlo/psmux/releases</releaseNotes>
+    <releaseNotes>https://github.com/psmux/psmux/releases</releaseNotes>
     <tags>terminal multiplexer tmux powershell cli windows psmux pmux</tags>
-    <packageSourceUrl>https://github.com/marlocarlo/psmux</packageSourceUrl>
-    <docsUrl>https://github.com/marlocarlo/psmux#readme</docsUrl>
-    <bugTrackerUrl>https://github.com/marlocarlo/psmux/issues</bugTrackerUrl>
+    <packageSourceUrl>https://github.com/psmux/psmux</packageSourceUrl>
+    <docsUrl>https://github.com/psmux/psmux#readme</docsUrl>
+    <bugTrackerUrl>https://github.com/psmux/psmux/issues</bugTrackerUrl>
   </metadata>
   <files>
     <file src="tools\**" target="tools" />

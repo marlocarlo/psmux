@@ -1,9 +1,8 @@
 use std::io;
-use std::env;
 
 use serde::{Serialize, Deserialize};
 
-use crate::types::*;
+use crate::types::{AppState, Node};
 
 pub fn infer_title_from_prompt(screen: &vt100::Screen, rows: u16, cols: u16) -> Option<String> {
     // Scan from cursor row (most likely prompt location) then fall back to last non-empty row
@@ -148,6 +147,101 @@ pub fn base64_decode(encoded: &str) -> Option<String> {
 
 /// Return color name as a string. Uses static strings for Default and
 /// the 256 indexed colors to avoid heap allocations on every cell.
+/// Quote and escape an argument for safe transmission over the control protocol.
+/// Wraps the value in double quotes and escapes any embedded double quotes or backslashes.
+pub fn quote_arg(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{}\"", escaped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::parse_command_line;
+
+    #[test]
+    fn test_quote_arg_simple() {
+        assert_eq!(quote_arg("hello"), "\"hello\"");
+    }
+
+    #[test]
+    fn test_quote_arg_with_spaces() {
+        assert_eq!(quote_arg("cc 123"), "\"cc 123\"");
+    }
+
+    #[test]
+    fn test_quote_arg_with_embedded_quotes() {
+        assert_eq!(quote_arg("say \"hi\""), "\"say \\\"hi\\\"\"");
+    }
+
+    #[test]
+    fn test_quote_arg_with_backslash() {
+        assert_eq!(quote_arg("C:\\Users\\foo"), "\"C:\\\\Users\\\\foo\"");
+    }
+
+    #[test]
+    fn test_quote_arg_empty() {
+        assert_eq!(quote_arg(""), "\"\"");
+    }
+
+    #[test]
+    fn test_rename_session_roundtrip_with_spaces() {
+        let name = "cc 123";
+        let cmd = format!("rename-session {}", quote_arg(name));
+        let args = parse_command_line(&cmd);
+        assert_eq!(args, vec!["rename-session", "cc 123"]);
+    }
+
+    #[test]
+    fn test_rename_window_roundtrip_with_spaces() {
+        let name = "my window";
+        let cmd = format!("rename-window {}", quote_arg(name));
+        let args = parse_command_line(&cmd);
+        assert_eq!(args, vec!["rename-window", "my window"]);
+    }
+
+    #[test]
+    fn test_set_pane_title_roundtrip_with_spaces() {
+        let title = "pane title here";
+        let cmd = format!("set-pane-title {}", quote_arg(title));
+        let args = parse_command_line(&cmd);
+        assert_eq!(args, vec!["set-pane-title", "pane title here"]);
+    }
+
+    #[test]
+    fn test_source_file_roundtrip_windows_path_with_spaces() {
+        let path = "C:\\Program Files\\psmux\\config.conf";
+        let cmd = format!("source-file {}", quote_arg(path));
+        let args = parse_command_line(&cmd);
+        assert_eq!(args, vec!["source-file", "C:\\Program Files\\psmux\\config.conf"]);
+    }
+
+    #[test]
+    fn test_claim_session_roundtrip_with_spaces() {
+        let name = "my session";
+        let cwd = "C:\\Users\\My Name\\Documents";
+        let cmd = format!("claim-session {} {}", quote_arg(name), quote_arg(cwd));
+        let args = parse_command_line(&cmd);
+        assert_eq!(args, vec!["claim-session", "my session", "C:\\Users\\My Name\\Documents"]);
+    }
+
+    #[test]
+    fn test_roundtrip_name_with_embedded_quotes() {
+        let name = "say \"hello\" world";
+        let cmd = format!("rename-session {}", quote_arg(name));
+        let args = parse_command_line(&cmd);
+        assert_eq!(args, vec!["rename-session", "say \"hello\" world"]);
+    }
+
+    #[test]
+    fn test_roundtrip_no_spaces_still_works() {
+        let name = "simple";
+        let cmd = format!("rename-session {}", quote_arg(name));
+        let args = parse_command_line(&cmd);
+        assert_eq!(args, vec!["rename-session", "simple"]);
+    }
+}
+
 pub fn color_to_name(c: vt100::Color) -> std::borrow::Cow<'static, str> {
     use std::borrow::Cow;
     match c {

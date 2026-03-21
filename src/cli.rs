@@ -102,6 +102,7 @@ KEY BINDING COMMANDS:
     list-keys, lsk          List all key bindings
     send-keys, send         Send keys to a pane
         -l                  Send literally (no key parsing)
+        -p                  Paste text (legacy compatibility)
         -t <target>         Target pane
 
 CONFIGURATION COMMANDS:
@@ -111,7 +112,7 @@ CONFIGURATION COMMANDS:
         -a                  Append to current value
         -q                  Quiet (no error on unknown option)
     show-options, show      Show all options and values
-    show-window-options, showw  (Alias for show-options)
+    show-window-options, showw  Show window-scoped options
     source-file, source     Execute commands from a config file
     set-environment, setenv Set an environment variable
     show-environment, showenv Show environment variables
@@ -143,6 +144,9 @@ MISC:
 OPTIONS:
     -h, --help              Show this help message
     -V, --version           Show version information
+    -f <file>               Use <file> as the configuration file
+    -L <name>               Name the server socket (namespace isolation)
+    -S <path>               Specify server socket path
     -t <target>             Target session, window, or pane
 
 TARGET SYNTAX (-t):
@@ -281,25 +285,36 @@ KEY BINDINGS (default prefix: Ctrl+B):
     prefix + c          Create new window
     prefix + n          Next window
     prefix + p          Previous window
+    prefix + l          Last window
     prefix + "          Split pane top/bottom
     prefix + %          Split pane left/right
     prefix + o          Switch to next pane
+    prefix + ;          Last pane
     prefix + x          Kill current pane
     prefix + &          Kill current window
     prefix + z          Toggle pane zoom
+    prefix + {{          Swap pane up
+    prefix + }}          Swap pane down
+    prefix + !          Break pane to new window
     prefix + d          Detach from session
     prefix + [          Enter copy/scroll mode
     prefix + ]          Paste from buffer
+    prefix + =          Buffer chooser
     prefix + :          Enter command mode
+    prefix + ?          List keybindings
     prefix + ,          Rename current window
     prefix + $          Rename session
     prefix + w          Window/pane chooser
     prefix + s          Session chooser
     prefix + q          Display pane numbers
+    prefix + i          Display pane info
     prefix + t          Clock mode
+    prefix + Space      Next layout
     prefix + Arrow      Navigate between panes
     prefix + 0-9        Select window by number
-    Ctrl+q              Quit
+    prefix + M-1..5     Preset layouts
+    prefix + C-Arrow    Resize pane by 1
+    prefix + M-Arrow    Resize pane by 5
 
 COPY MODE KEYS (prefix + [):
     ↑/k  Scroll up         ↓/j  Scroll down
@@ -308,10 +323,16 @@ COPY MODE KEYS (prefix + [):
     ←/h  Cursor left       →/l  Cursor right
     w/W  Next word          b/B  Previous word
     0  Start of line       $  End of line
+    ^  First non-blank     H/M/L  Top/Mid/Bot
+    f/F  Find char fwd/bwd t/T  Till char fwd/bwd
+    %  Matching bracket    {{/}}  Prev/next paragraph
     /  Search forward      ?  Search backward
     n  Next match          N  Previous match
-    v  Start selection     V  Line selection
-    y  Yank (copy)         q/Esc  Exit copy mode
+    v  Rectangle toggle    V  Line selection
+    Space  Begin selection y/Enter  Yank (copy)
+    D  Copy to end of line "a-z  Named registers
+    o  Swap cursor/anchor  1-9  Numeric prefix
+    q/Esc  Exit copy mode
 
 ENVIRONMENT VARIABLES:
     PSMUX_SESSION_NAME       Default session name
@@ -337,13 +358,21 @@ EXAMPLES:
 
 NOTE: psmux ships as 'psmux', 'pmux', and 'tmux' - use whichever you prefer!
 
-For more information: https://github.com/marlocarlo/psmux
+For more information: https://github.com/psmux/psmux
 "#, prog = prog, ver = VERSION);
 }
 
 pub fn print_version() {
     let prog = get_program_name();
-    println!("{} {}", prog, VERSION);
+    // When invoked as "tmux", output tmux-compatible format (e.g. "tmux 3.1")
+    // so tools like Claude Code that parse `tmux -V` accept the version.
+    if prog == "tmux" {
+        // Strip any patch version to match tmux convention: "tmux 3.1"
+        let short = VERSION.rsplitn(2, '.').last().unwrap_or(VERSION);
+        println!("tmux {}", short);
+    } else {
+        println!("{} {}", prog, VERSION);
+    }
 }
 
 pub fn print_commands() {
@@ -416,7 +445,7 @@ pub fn print_commands() {
   show-window-options (showw)- Show window options
   source-file (source)      - Execute commands from a file
   split-window (splitw)     - Split a window into panes
-  start-server              - Start the psmux server
+  start-server (warmup)     - Pre-spawn a warm server for instant session creation
   suspend-client (suspendc) - Suspend the client
   swap-pane (swapp)         - Swap two panes
   swap-window (swapw)       - Swap two windows

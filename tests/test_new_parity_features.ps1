@@ -101,13 +101,13 @@ if ($layout2 -ne $layout3) { Write-Pass "previous-layout changed layout" } else 
 
 # --- Test 1.8: main-pane-width/height ---
 Write-Test "1.8 main-pane-width option"
-Psmux set -t $SESSION -g main-pane-width 120 | Out-Null
+Psmux set-option -t $SESSION main-pane-width 120 | Out-Null
 Start-Sleep -Milliseconds 300
 $val = (Psmux show-options -t $SESSION -v main-pane-width 2>&1 | Out-String).Trim()
 if ($val -match "120") { Write-Pass "main-pane-width set to 120" } else { Write-Fail "main-pane-width not stored correctly: $val" }
 
 Write-Test "1.9 main-pane-height option"
-Psmux set -t $SESSION -g main-pane-height 30 | Out-Null
+Psmux set-option -t $SESSION main-pane-height 30 | Out-Null
 Start-Sleep -Milliseconds 300
 $val = (Psmux show-options -t $SESSION -v main-pane-height 2>&1 | Out-String).Trim()
 if ($val -match "30") { Write-Pass "main-pane-height set to 30" } else { Write-Fail "main-pane-height not stored correctly: $val" }
@@ -120,30 +120,30 @@ Write-Host ("=" * 60)
 
 # --- Test 2.1: status-left-length ---
 Write-Test "2.1 status-left-length option"
-Psmux set -t $SESSION -g status-left-length 20 | Out-Null
+Psmux set-option -t $SESSION status-left-length 20 | Out-Null
 Start-Sleep -Milliseconds 300
 Write-Pass "status-left-length set"
 
 # --- Test 2.2: status-right-length ---
 Write-Test "2.2 status-right-length option"
-Psmux set -t $SESSION -g status-right-length 50 | Out-Null
+Psmux set-option -t $SESSION status-right-length 50 | Out-Null
 Start-Sleep -Milliseconds 300
 Write-Pass "status-right-length set"
 
 # --- Test 2.3: status multi-line ---
 Write-Test "2.3 multi-line status bar (set status 2)"
-Psmux set -t $SESSION -g status 2 | Out-Null
+Psmux set-option -t $SESSION status 2 | Out-Null
 Start-Sleep -Milliseconds 300
 Write-Pass "status set to 2 lines"
 
 # --- Test 2.4: status-format ---
 Write-Test "2.4 status-format[1] custom format"
-Psmux set -t $SESSION -g 'status-format[1]' '#[fg=white,bg=blue] Custom Line 2: #S ' | Out-Null
+Psmux set-option -t $SESSION 'status-format[1]' '#[fg=white,bg=blue] Custom Line 2: #S ' | Out-Null
 Start-Sleep -Milliseconds 300
 Write-Pass "status-format[1] set"
 
 # Reset to single line
-Psmux set -t $SESSION -g status on | Out-Null
+Psmux set-option -t $SESSION status on | Out-Null
 
 # ============================================================
 Write-Host ""
@@ -153,40 +153,40 @@ Write-Host ("=" * 60)
 
 # --- Test 3.1: window-size ---
 Write-Test "3.1 window-size option"
-Psmux set -t $SESSION -g window-size latest | Out-Null
+Psmux set-option -t $SESSION window-size latest | Out-Null
 Start-Sleep -Milliseconds 300
 $val = (Psmux show-options -t $SESSION -v window-size 2>&1 | Out-String).Trim()
 if ($val -match "latest") { Write-Pass "window-size=latest" } else { Write-Fail "window-size not stored: $val" }
 
 # --- Test 3.2: allow-passthrough ---
 Write-Test "3.2 allow-passthrough option"
-Psmux set -t $SESSION -g allow-passthrough on | Out-Null
+Psmux set-option -t $SESSION allow-passthrough on | Out-Null
 Start-Sleep -Milliseconds 300
 $val = (Psmux show-options -t $SESSION -v allow-passthrough 2>&1 | Out-String).Trim()
 if ($val -match "on") { Write-Pass "allow-passthrough=on" } else { Write-Fail "allow-passthrough not stored: $val" }
 
 # --- Test 3.3: copy-command ---
 Write-Test "3.3 copy-command option"
-Psmux set -t $SESSION -g copy-command "Set-Clipboard" | Out-Null
+Psmux set-option -t $SESSION copy-command "Set-Clipboard" | Out-Null
 Start-Sleep -Milliseconds 300
 Write-Pass "copy-command set"
 
 # --- Test 3.4: set-clipboard ---
 Write-Test "3.4 set-clipboard option"
-Psmux set -t $SESSION -g set-clipboard on | Out-Null
+Psmux set-option -t $SESSION set-clipboard on | Out-Null
 Start-Sleep -Milliseconds 300
 $val = (Psmux show-options -t $SESSION -v set-clipboard 2>&1 | Out-String).Trim()
 if ($val -match "on") { Write-Pass "set-clipboard=on" } else { Write-Fail "set-clipboard not stored: $val" }
 
 # --- Test 3.5: command-alias ---
 Write-Test "3.5 command-alias"
-Psmux set -t $SESSION -g command-alias 'splitp=split-window' | Out-Null
+Psmux set-option -t $SESSION command-alias 'splitp=split-window' | Out-Null
 Start-Sleep -Milliseconds 300
 Write-Pass "command-alias set"
 
 # --- Test 3.6: prefix2 ---
 Write-Test "3.6 prefix2 option"
-Psmux set -t $SESSION -g prefix2 C-a | Out-Null
+Psmux set-option -t $SESSION prefix2 C-a | Out-Null
 Start-Sleep -Milliseconds 300
 $val = (Psmux show-options -t $SESSION -v prefix2 2>&1 | Out-String).Trim()
 if ($val -match "C-a") { Write-Pass "prefix2=C-a" } else { Write-Fail "prefix2 not stored: $val" }
@@ -309,7 +309,7 @@ if ($sesName -match $SESSION) { Write-Pass "display-message #S = $sesName" } els
 
 # --- Test 6.5: set/show options ---
 Write-Test "6.5 set-option and show-options"
-Psmux set -t $SESSION -g mouse on | Out-Null
+Psmux set-option -t $SESSION mouse on | Out-Null
 Start-Sleep -Milliseconds 200
 $mouseVal = (& $PSMUX show-options -t $SESSION -v mouse 2>&1 | Out-String).Trim()
 if ($mouseVal -match "on") { Write-Pass "set/show mouse=on" } else { Write-Fail "mouse option: $mouseVal" }
@@ -361,6 +361,9 @@ Write-Pass "swap-pane executed"
 
 # --- Test 6.12: kill-pane ---
 Write-Test "6.12 kill-pane reduces pane count"
+# Ensure the active window has ≥2 panes so kill-pane doesn't destroy the window
+Psmux split-window -t $SESSION -h | Out-Null
+Start-Sleep -Milliseconds 500
 $beforeKill = ((& $PSMUX list-panes -t $SESSION 2>&1) | Out-String).Split("`n").Count
 Psmux kill-pane -t $SESSION | Out-Null
 Start-Sleep -Milliseconds 500

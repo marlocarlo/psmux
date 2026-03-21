@@ -47,12 +47,12 @@ Write-Host "=" * 60
 Write-Host "BASE-INDEX TESTS"
 Write-Host "=" * 60
 
-Write-Test "Default base-index is 1"
+Write-Test "Default base-index is 0"
 $opts = & $PSMUX show-options -t $SESSION_NAME 2>&1
-if ($opts -match "base-index 1") {
-    Write-Pass "Default base-index is 1"
+if ($opts -match "base-index 0") {
+    Write-Pass "Default base-index is 0"
 } else {
-    Write-Fail "Expected base-index 1, got: $opts"
+    Write-Fail "Expected base-index 0, got: $opts"
 }
 
 Write-Test "Set base-index to 0"
@@ -109,12 +109,12 @@ Write-Host "=" * 60
 Write-Host "PREDICTION-DIMMING TESTS"
 Write-Host "=" * 60
 
-Write-Test "Default prediction-dimming is on"
+Write-Test "Default prediction-dimming is off"
 $opts = & $PSMUX show-options -t $SESSION_NAME 2>&1
-if ($opts -match "prediction-dimming on") {
-    Write-Pass "Default prediction-dimming is on"
+if ($opts -match "prediction-dimming off") {
+    Write-Pass "Default prediction-dimming is off"
 } else {
-    Write-Fail "Expected prediction-dimming on, got: $opts"
+    Write-Fail "Expected prediction-dimming off, got: $opts"
 }
 
 Write-Test "Set prediction-dimming off"
@@ -241,8 +241,8 @@ Start-Sleep -Seconds 2
 Write-Test "New window was created"
 $wins = (& $PSMUX list-windows -t $SESSION_NAME 2>&1) -join "`n"
 Write-Info "Windows: $wins"
-# Count "id" occurrences to check for 2 windows
-$idCount = ([regex]::Matches($wins, '"id"')).Count
+# Count non-empty lines to check for 2 windows
+$idCount = ($wins.Split("`n") | Where-Object { $_.Trim() -ne '' }).Count
 if ($idCount -ge 2) {
     Write-Pass "New window created ($idCount windows present)"
 } else {

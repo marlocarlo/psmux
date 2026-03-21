@@ -6,8 +6,6 @@
 /// `Start-Process -WindowStyle Hidden` in PowerShell.
 #[cfg(windows)]
 pub fn spawn_server_hidden(exe: &std::path::Path, args: &[String]) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
     #[repr(C)]
     #[allow(non_snake_case)]
     struct STARTUPINFOW {
@@ -116,15 +114,23 @@ pub fn spawn_server_hidden(exe: &std::path::Path, args: &[String]) -> std::io::R
 pub fn enable_virtual_terminal_processing() {
     const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
     const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+    const CP_UTF8: u32 = 65001;
 
     #[link(name = "kernel32")]
     extern "system" {
         fn GetStdHandle(nStdHandle: u32) -> *mut std::ffi::c_void;
         fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut u32) -> i32;
         fn SetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, dwMode: u32) -> i32;
+        fn SetConsoleOutputCP(wCodePageID: u32) -> i32;
+        fn SetConsoleCP(wCodePageID: u32) -> i32;
     }
 
     unsafe {
+        // Set console code page to UTF-8 so multi-byte Unicode characters
+        // (e.g. ▶ U+25B6, ◀ U+25C0) render correctly instead of as mojibake.
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+
         let handle = GetStdHandle(STD_OUTPUT_HANDLE);
         if !handle.is_null() {
             let mut mode: u32 = 0;
@@ -137,6 +143,59 @@ pub fn enable_virtual_terminal_processing() {
 
 #[cfg(not(windows))]
 pub fn enable_virtual_terminal_processing() {
+    // No-op on non-Windows platforms
+}
+
+/// Clear `ENABLE_VIRTUAL_TERMINAL_INPUT` (VTI, 0x0200) from the console stdin.
+///
+/// crossterm 0.28's `enable_raw_mode()` sets VTI.  When psmux runs inside a
+/// ConPTY-based terminal (e.g. WezTerm), VTI tells conhost to pass VT bytes
+/// through as raw KEY_EVENT records instead of properly translating them to
+/// INPUT_RECORDs with virtual-key codes.  This breaks crossterm's event parser
+/// because it expects translated INPUT_RECORDs for regular key events.
+///
+/// For local (non-SSH) sessions, we do not need VTI — crossterm reads native
+/// INPUT_RECORDs via `ReadConsoleInputW`.  The SSH input path has its OWN
+/// `SetConsoleMode(+VTI)` call, so this only runs for local mode.
+///
+/// Windows Terminal is unaffected because it IS the console host (no ConPTY
+/// pipe translation).  The fix specifically helps ConPTY-hosted terminals.
+#[cfg(windows)]
+pub fn disable_vti_on_stdin() {
+    const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(nStdHandle: u32) -> *mut std::ffi::c_void;
+        fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut u32) -> i32;
+        fn SetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, dwMode: u32) -> i32;
+    }
+
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        if handle.is_null() || handle == (-1isize) as *mut std::ffi::c_void {
+            return;
+        }
+        let mut mode: u32 = 0;
+        if GetConsoleMode(handle, &mut mode) != 0 {
+            let had_vti = mode & ENABLE_VIRTUAL_TERMINAL_INPUT != 0;
+            crate::debug_log::input_log("console", &format!(
+                "stdin mode before: 0x{:04X} VTI={}", mode, had_vti
+            ));
+            if had_vti {
+                let new_mode = mode & !ENABLE_VIRTUAL_TERMINAL_INPUT;
+                SetConsoleMode(handle, new_mode);
+                crate::debug_log::input_log("console", &format!(
+                    "stdin mode after: 0x{:04X} (VTI cleared)", new_mode
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn disable_vti_on_stdin() {
     // No-op on non-Windows platforms
 }
 
@@ -268,30 +327,97 @@ pub mod mouse_inject {
     const ENABLE_MOUSE_INPUT: u32         = 0x0010;
     const ENABLE_EXTENDED_FLAGS: u32      = 0x0080;
     const ENABLE_QUICK_EDIT_MODE: u32     = 0x0040;
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
 
     #[inline]
-    fn debug_log(_msg: &str) {
-        // Debug logging disabled for performance.
-        // To re-enable: write to $TEMP/psmux_mouse_debug.log
+    fn debug_log(msg: &str) {
+        // Write to mouse_debug.log when PSMUX_MOUSE_DEBUG=1 is set.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static CHECKED: AtomicBool = AtomicBool::new(false);
+        static ENABLED: AtomicBool = AtomicBool::new(false);
+
+        if !CHECKED.swap(true, Ordering::Relaxed) {
+            let on = std::env::var("PSMUX_MOUSE_DEBUG").map_or(false, |v| v == "1" || v == "true");
+            ENABLED.store(on, Ordering::Relaxed);
+        }
+        if !ENABLED.load(Ordering::Relaxed) { return; }
+
+        let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+        let path = format!("{}/.psmux/mouse_debug.log", home);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            use std::io::Write;
+            let _ = writeln!(f, "[platform] {}", msg);
+        }
     }
 
     /// Extract the process ID from a portable_pty::Child trait object.
     ///
-    /// SAFETY: On Windows with ConPTY (portable_pty 0.2), the concrete type behind
-    /// `dyn Child` is `WinChild { proc: OwnedHandle }` where OwnedHandle wraps a
-    /// single Windows HANDLE. We read the HANDLE and call GetProcessId.
-    pub unsafe fn get_child_pid(child: &dyn portable_pty::Child) -> Option<u32> {
-        let data_ptr = child as *const dyn portable_pty::Child as *const u8;
-        let handle = *(data_ptr as *const isize);
-        debug_log(&format!("get_child_pid: data_ptr={:p} handle=0x{:X}", data_ptr, handle));
-        if handle == 0 || handle == -1 {
-            debug_log("get_child_pid: INVALID handle");
-            return None;
+    /// Uses the `Child::process_id()` trait method provided by portable-pty 0.9+.
+    pub fn get_child_pid(child: &dyn portable_pty::Child) -> Option<u32> {
+        child.process_id()
+    }
+
+    /// Query whether the child process's console input has
+    /// ENABLE_VIRTUAL_TERMINAL_INPUT (0x0200) set.
+    ///
+    /// When this flag is ON, the process uses VT-based input processing
+    /// (crossterm, ratatui apps).  VT mouse sequences written to the ConPTY
+    /// input pipe are passed through as KEY_EVENT records, and the app's VT
+    /// parser handles them.  If the flag is OFF (e.g. Node.js libuv raw mode
+    /// which sets only ENABLE_WINDOW_INPUT), VT mouse sequences should NOT
+    /// be written because the app cannot parse them and they appear as garbage.
+    pub fn query_vti_enabled(child_pid: u32) -> Option<bool> {
+        unsafe {
+            let had_console = GetConsoleWindow() != 0;
+            FreeConsole();
+
+            if AttachConsole(child_pid) == 0 {
+                debug_log(&format!("query_vti_enabled: AttachConsole({}) FAILED", child_pid));
+                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                return None;
+            }
+
+            let conin: [u16; 7] = [
+                'C' as u16, 'O' as u16, 'N' as u16,
+                'I' as u16, 'N' as u16, '$' as u16, 0,
+            ];
+            let handle = CreateFileW(
+                conin.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null(),
+            );
+
+            if handle == INVALID_HANDLE || handle == 0 {
+                debug_log("query_vti_enabled: CreateFileW(CONIN$) FAILED");
+                FreeConsole();
+                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                return None;
+            }
+
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn GetConsoleMode(hConsoleHandle: *mut c_void, lpMode: *mut u32) -> i32;
+            }
+            let mut mode: u32 = 0;
+            let ok = GetConsoleMode(handle as *mut c_void, &mut mode);
+
+            CloseHandle(handle);
+            FreeConsole();
+            if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+
+            if ok == 0 {
+                debug_log("query_vti_enabled: GetConsoleMode FAILED");
+                return None;
+            }
+
+            let vti = (mode & ENABLE_VIRTUAL_TERMINAL_INPUT) != 0;
+            debug_log(&format!("query_vti_enabled: pid={} mode=0x{:04X} VTI={}", child_pid, mode, vti));
+            Some(vti)
         }
-        let pid = GetProcessId(handle);
-        let err = GetLastError();
-        debug_log(&format!("get_child_pid: GetProcessId(0x{:X}) => pid={} err={}", handle, pid, err));
-        if pid == 0 { None } else { Some(pid) }
     }
 
     /// Inject a mouse event into a child process's console input buffer.
@@ -363,9 +489,10 @@ pub mod mouse_inject {
                 return false;
             }
 
-            // Ensure ENABLE_MOUSE_INPUT is set on the console so mouse events
-            // are delivered to the foreground process (critical for WSL apps
-            // like htop that rely on wsl.exe relaying MOUSE_EVENT records).
+            // Temporarily ensure ENABLE_MOUSE_INPUT is set on the console so
+            // mouse events are delivered to the foreground process.  Save and
+            // restore original mode to prevent polluting the child's console
+            // state (which would confuse query_mouse_input_enabled).
             {
                 // Re-use the top-level GetConsoleMode/SetConsoleMode declarations
                 // (they use *mut c_void for the handle parameter).
@@ -377,9 +504,8 @@ pub mod mouse_inject {
                 let mut mode: u32 = 0;
                 let h = handle as *mut c_void;
                 if GetConsoleMode(h, &mut mode) != 0 {
-                    let desired = mode | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS;
-                    // Also disable Quick Edit mode which intercepts mouse events
-                    let desired = desired & !ENABLE_QUICK_EDIT_MODE;
+                    let desired = (mode | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS)
+                                  & !ENABLE_QUICK_EDIT_MODE;
                     if desired != mode {
                         SetConsoleMode(h, desired);
                     }
@@ -414,6 +540,67 @@ pub mod mouse_inject {
             }
 
             result != 0
+        }
+    }
+
+    /// Query whether the child process's console input has
+    /// ENABLE_MOUSE_INPUT (0x0010) set.
+    ///
+    /// When this flag is ON, the child uses ReadConsoleInputW to read
+    /// MOUSE_EVENT INPUT_RECORDs (crossterm/ratatui apps).  When OFF, the
+    /// child reads input as text (ReadConsole/ReadFile) and expects VT
+    /// mouse sequences delivered as KEY_EVENT records (nvim, vim).
+    pub fn query_mouse_input_enabled(child_pid: u32) -> Option<bool> {
+        unsafe {
+            let had_console = GetConsoleWindow() != 0;
+            FreeConsole();
+
+            if AttachConsole(child_pid) == 0 {
+                debug_log(&format!("query_mouse_input_enabled: AttachConsole({}) FAILED", child_pid));
+                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                return None;
+            }
+
+            let conin: [u16; 7] = [
+                'C' as u16, 'O' as u16, 'N' as u16,
+                'I' as u16, 'N' as u16, '$' as u16, 0,
+            ];
+            let handle = CreateFileW(
+                conin.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null(),
+            );
+
+            if handle == INVALID_HANDLE || handle == 0 {
+                debug_log("query_mouse_input_enabled: CreateFileW(CONIN$) FAILED");
+                FreeConsole();
+                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                return None;
+            }
+
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn GetConsoleMode(hConsoleHandle: *mut c_void, lpMode: *mut u32) -> i32;
+            }
+            let mut mode: u32 = 0;
+            let ok = GetConsoleMode(handle as *mut c_void, &mut mode);
+
+            CloseHandle(handle);
+            FreeConsole();
+            if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+
+            if ok == 0 {
+                debug_log("query_mouse_input_enabled: GetConsoleMode FAILED");
+                return None;
+            }
+
+            let mouse_input = (mode & ENABLE_MOUSE_INPUT) != 0;
+            debug_log(&format!("query_mouse_input_enabled: pid={} mode=0x{:04X} ENABLE_MOUSE_INPUT={}", child_pid, mode, mouse_input));
+            Some(mouse_input)
         }
     }
 
@@ -459,22 +646,23 @@ pub mod mouse_inject {
                 return false;
             }
 
-            // Ensure ENABLE_VIRTUAL_TERMINAL_INPUT is set so wsl.exe receives
-            // VT sequences as-is through KEY_EVENT records.
-            {
-                #[link(name = "kernel32")]
-                extern "system" {
-                    fn GetConsoleMode(hConsoleHandle: *mut c_void, lpMode: *mut u32) -> i32;
-                    fn SetConsoleMode(hConsoleHandle: *mut c_void, dwMode: u32) -> i32;
-                }
-                let mut mode: u32 = 0;
-                let h = handle as *mut c_void;
-                if GetConsoleMode(h, &mut mode) != 0 {
-                    let desired = (mode | ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS | 0x0200 /*ENABLE_VIRTUAL_TERMINAL_INPUT*/)
-                                  & !ENABLE_QUICK_EDIT_MODE;
-                    if desired != mode {
-                        SetConsoleMode(h, desired);
-                    }
+            // Save original console mode, temporarily set VTI for injection,
+            // then restore after writing.  This prevents mode pollution which
+            // would confuse the query_mouse_input_enabled() heuristic used to
+            // distinguish console-API apps (crossterm) from VT apps (nvim).
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn GetConsoleMode(hConsoleHandle: *mut c_void, lpMode: *mut u32) -> i32;
+                fn SetConsoleMode(hConsoleHandle: *mut c_void, dwMode: u32) -> i32;
+            }
+            let h = handle as *mut c_void;
+            let mut original_mode: u32 = 0;
+            let got_mode = GetConsoleMode(h, &mut original_mode) != 0;
+            if got_mode {
+                let desired = (original_mode | ENABLE_EXTENDED_FLAGS | 0x0200 /*ENABLE_VIRTUAL_TERMINAL_INPUT*/)
+                              & !ENABLE_QUICK_EDIT_MODE;
+                if desired != original_mode {
+                    SetConsoleMode(h, desired);
                 }
             }
 
@@ -525,6 +713,11 @@ pub mod mouse_inject {
                 &mut written,
             );
 
+            // Restore original console mode to prevent pollution
+            if got_mode {
+                SetConsoleMode(h, original_mode);
+            }
+
             CloseHandle(handle);
             FreeConsole();
             if had_console {
@@ -534,13 +727,597 @@ pub mod mouse_inject {
             result != 0
         }
     }
+
+    /// Inject bracketed paste text into a child process's console input buffer.
+    ///
+    /// Sends `\x1b[200~` + text + `\x1b[201~` as KEY_EVENT records via
+    /// WriteConsoleInputW, bypassing ConPTY's VT input parser entirely.
+    /// ConPTY strips bracketed paste sequences written to the PTY master pipe,
+    /// so this direct injection is the only way to deliver them to the child.
+    ///
+    /// The text is encoded as UTF-16 for proper Unicode support (file paths
+    /// may contain non-ASCII characters).
+    pub fn send_bracketed_paste(child_pid: u32, text: &str, bracket: bool) -> bool {
+        unsafe {
+            let had_console = GetConsoleWindow() != 0;
+            FreeConsole();
+
+            if AttachConsole(child_pid) == 0 {
+                let err = GetLastError();
+                debug_log(&format!("send_bracketed_paste: AttachConsole({}) FAILED err={}", child_pid, err));
+                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                return false;
+            }
+
+            let conin: [u16; 7] = [
+                'C' as u16, 'O' as u16, 'N' as u16,
+                'I' as u16, 'N' as u16, '$' as u16, 0,
+            ];
+            let handle = CreateFileW(
+                conin.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null(),
+            );
+
+            if handle == INVALID_HANDLE || handle == 0 {
+                let err = GetLastError();
+                debug_log(&format!("send_bracketed_paste: CreateFileW(CONIN$) FAILED err={}", err));
+                FreeConsole();
+                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                return false;
+            }
+
+            const KEY_EVENT: u16 = 0x0001;
+
+            #[repr(C)]
+            #[derive(Copy, Clone)]
+            struct KEY_EVENT_RECORD {
+                key_down: i32,
+                repeat_count: u16,
+                virtual_key_code: u16,
+                virtual_scan_code: u16,
+                u_char: u16,
+                control_key_state: u32,
+            }
+
+            #[repr(C)]
+            struct KEY_INPUT_RECORD {
+                event_type: u16,
+                _padding: u16,
+                event: KEY_EVENT_RECORD,
+            }
+
+            // Build bracket-open, text, bracket-close as UTF-16 chars
+            let bracket_open: &[u8] = b"\x1b[200~";
+            let bracket_close: &[u8] = b"\x1b[201~";
+
+            // Collect all UTF-16 code units to send
+            let mut chars: Vec<u16> = Vec::new();
+            if bracket {
+                for &b in bracket_open {
+                    chars.push(b as u16);
+                }
+            }
+            // Encode paste text as UTF-16, normalizing \n → \r for the
+            // console input buffer (Windows apps expect CR for line breaks;
+            // PSReadLine and other readline implementations treat \r as Enter).
+            let mut prev_cr = false;
+            for c in text.chars() {
+                if c == '\n' {
+                    if !prev_cr {
+                        // Bare \n → \r
+                        chars.push('\r' as u16);
+                    }
+                    // If preceded by \r, the \r was already pushed; skip this \n
+                    prev_cr = false;
+                    continue;
+                }
+                prev_cr = c == '\r';
+                let mut buf = [0u16; 2];
+                let encoded = c.encode_utf16(&mut buf);
+                for &unit in encoded.iter() {
+                    chars.push(unit);
+                }
+            }
+            if bracket {
+                for &b in bracket_close {
+                    chars.push(b as u16);
+                }
+            }
+
+            // Build KEY_EVENT records (key-down only; key-up not needed for
+            // console input injection — only key-down events carry characters).
+            let mut records: Vec<KEY_INPUT_RECORD> = Vec::with_capacity(chars.len());
+            for &wch in &chars {
+                records.push(KEY_INPUT_RECORD {
+                    event_type: KEY_EVENT,
+                    _padding: 0,
+                    event: KEY_EVENT_RECORD {
+                        key_down: 1,
+                        repeat_count: 1,
+                        virtual_key_code: 0,
+                        virtual_scan_code: 0,
+                        u_char: wch,
+                        control_key_state: 0,
+                    },
+                });
+            }
+
+            // WriteConsoleInputW can perform partial writes (returns fewer
+            // records than requested).  Retry in a loop so that large pastes
+            // are delivered in full; without this the closing bracket sequence
+            // can be silently dropped, breaking bracket paste mode in the
+            // child application.
+            //
+            // For very large pastes, the console input buffer may fill up.
+            // We limit each write to CHUNK_SIZE records and yield briefly
+            // between chunks to let the consumer (PSReadLine etc.) drain.
+            const CHUNK_SIZE: usize = 2048;
+            let mut offset: usize = 0;
+            let mut last_result: i32 = 1;
+            while offset < records.len() {
+                let mut written: u32 = 0;
+                let remaining = (records.len() - offset).min(CHUNK_SIZE);
+                last_result = WriteConsoleInputW(
+                    handle,
+                    records[offset..].as_ptr() as *const INPUT_RECORD,
+                    remaining as u32,
+                    &mut written,
+                );
+                if last_result == 0 || written == 0 {
+                    // Brief yield and retry once (buffer may temporarily be full)
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    last_result = WriteConsoleInputW(
+                        handle,
+                        records[offset..].as_ptr() as *const INPUT_RECORD,
+                        remaining as u32,
+                        &mut written,
+                    );
+                    if last_result == 0 || written == 0 {
+                        break;
+                    }
+                }
+                offset += written as usize;
+                // Yield between chunks to let the consumer drain the buffer
+                if offset < records.len() && remaining >= CHUNK_SIZE {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+
+            debug_log(&format!("send_bracketed_paste: pid={} bracket={} text_len={} records={} written={} ok={}",
+                child_pid, bracket, text.len(), records.len(), offset, last_result != 0));
+
+            CloseHandle(handle);
+            FreeConsole();
+            if had_console {
+                AttachConsole(ATTACH_PARENT_PROCESS);
+            }
+
+            last_result != 0 && offset == records.len()
+        }
+    }
+
+    /// Send a CTRL_C_EVENT to all processes on the child's console.
+    ///
+    /// TUI applications (pstop, btop, etc.) often disable ENABLE_PROCESSED_INPUT
+    /// on the ConPTY console and fail to restore it on exit.  When this flag is
+    /// off, writing 0x03 to the ConPTY input pipe no longer generates a
+    /// CTRL_C_EVENT signal — the byte is delivered as a regular key event that
+    /// most programs ignore.
+    ///
+    /// This function works around the issue by:
+    ///   1. Attaching to the child's hidden ConPTY console
+    ///   2. Re-enabling ENABLE_PROCESSED_INPUT if it was cleared
+    ///   3. Calling GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)
+    ///
+    /// The combination ensures Ctrl+C always delivers a signal regardless of
+    /// what a previous TUI application did to the console mode.
+    pub fn send_ctrl_c_event(child_pid: u32, reattach: bool) -> bool {
+        const CTRL_C_EVENT: u32 = 0;
+        const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
+
+        type HandlerRoutine = unsafe extern "system" fn(u32) -> i32;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetConsoleCtrlHandler(
+                handler: Option<HandlerRoutine>,
+                add: i32,
+            ) -> i32;
+            fn GenerateConsoleCtrlEvent(
+                ctrl_event: u32,
+                process_group_id: u32,
+            ) -> i32;
+            fn GetConsoleMode(h: *mut c_void, mode: *mut u32) -> i32;
+            fn SetConsoleMode(h: *mut c_void, mode: u32) -> i32;
+        }
+
+        // Always log to file for Ctrl+C events (critical signal path).
+        fn log(msg: &str) {
+            debug_log(&format!("ctrl_c: {}", msg));
+        }
+
+        unsafe {
+            let had_console = reattach && GetConsoleWindow() != 0;
+
+            FreeConsole();
+
+            log(&format!("called: pid={} reattach={} had_console={}", child_pid, reattach, had_console));
+
+            if AttachConsole(child_pid) == 0 {
+                let err = GetLastError();
+                log(&format!("AttachConsole({}) FAILED err={}", child_pid, err));
+                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                return false;
+            }
+
+            // Open the console input buffer to check / fix ENABLE_PROCESSED_INPUT
+            let conin: [u16; 7] = [
+                'C' as u16, 'O' as u16, 'N' as u16,
+                'I' as u16, 'N' as u16, '$' as u16, 0,
+            ];
+            let handle = CreateFileW(
+                conin.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null(),
+            );
+
+            if handle != INVALID_HANDLE && handle != 0 {
+                let mut mode: u32 = 0;
+                if GetConsoleMode(handle as *mut c_void, &mut mode) != 0 {
+                    log(&format!("console mode=0x{:04X} PROCESSED_INPUT={}", mode, mode & ENABLE_PROCESSED_INPUT != 0));
+                    if mode & ENABLE_PROCESSED_INPUT == 0 {
+                        log(&format!("re-enabling ENABLE_PROCESSED_INPUT for pid={}", child_pid));
+                        SetConsoleMode(handle as *mut c_void, mode | ENABLE_PROCESSED_INPUT);
+                    }
+                }
+                CloseHandle(handle);
+            }
+
+            // Ignore CTRL_C in our own process so GenerateConsoleCtrlEvent
+            // doesn't kill psmux (we're temporarily on the child's console).
+            // Passing None as handler with add=1 tells the system to ignore
+            // Ctrl+C signals in this process.
+            SetConsoleCtrlHandler(None, 1);
+
+            let ok = GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
+            let err = GetLastError();
+
+            log(&format!("GenerateConsoleCtrlEvent => ok={} err={}", ok, err));
+
+            // Detach from the child's console BEFORE restoring Ctrl+C handling.
+            // GenerateConsoleCtrlEvent dispatches asynchronously via a new thread;
+            // if we restore the default handler while still attached, the async
+            // handler thread might terminate psmux.  Detaching first ensures the
+            // event only targets processes that remain on the console.
+            FreeConsole();
+
+            // Brief sleep to let the async CTRL_C_EVENT handler thread finish
+            // before we re-enable default handling.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+
+            // Restore default Ctrl+C handling now that we're detached
+            SetConsoleCtrlHandler(None, 0);
+
+            if had_console {
+                AttachConsole(ATTACH_PARENT_PROCESS);
+            }
+
+            ok != 0
+        }
+    }
+
+    /// Inject a modified key event into a child process's console input buffer.
+    ///
+    /// Uses WriteConsoleInputW with the appropriate control_key_state flags
+    /// (LEFT_CTRL_PRESSED, LEFT_ALT_PRESSED, SHIFT_PRESSED) matching how
+    /// Windows Terminal synthesises input events.
+    ///
+    /// This is necessary because ConPTY does NOT reassemble ESC+char into
+    /// native Alt+key events — PSReadLine and other console apps receive
+    /// them as separate key events.  Similarly, Ctrl+Alt+key written as
+    /// ESC + control-char is not reassembled.
+    ///
+    /// For Ctrl+key: `u_char` = control character (ch & 0x1F), matching the
+    /// Windows console convention.  For Alt+key: `u_char` = the plain char.
+    /// For Ctrl+Alt: `u_char` = control character.
+    ///
+    /// Sends both key-down and key-up events for proper event pairing.
+    ///
+    /// Convenience wrapper: `send_alt_key_event` calls this with ctrl=false, alt=true, shift=false.
+    pub fn send_modified_key_event(child_pid: u32, ch: char, ctrl: bool, alt: bool, shift: bool) -> bool {
+        unsafe {
+            let had_console = GetConsoleWindow() != 0;
+            FreeConsole();
+
+            if AttachConsole(child_pid) == 0 {
+                debug_log(&format!("send_modified_key_event: AttachConsole({}) FAILED", child_pid));
+                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                return false;
+            }
+
+            let conin: [u16; 7] = [
+                'C' as u16, 'O' as u16, 'N' as u16,
+                'I' as u16, 'N' as u16, '$' as u16, 0,
+            ];
+            let handle = CreateFileW(
+                conin.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null(),
+            );
+
+            if handle == INVALID_HANDLE || handle == 0 {
+                debug_log(&format!("send_modified_key_event: CreateFileW(CONIN$) FAILED"));
+                FreeConsole();
+                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                return false;
+            }
+
+            const KEY_EVENT: u16 = 0x0001;
+            const LEFT_ALT_PRESSED: u32 = 0x0002;
+            const LEFT_CTRL_PRESSED: u32 = 0x0008;
+            const SHIFT_PRESSED: u32 = 0x0010;
+
+            #[repr(C)]
+            #[derive(Copy, Clone)]
+            struct KEY_EVENT_RECORD {
+                key_down: i32,
+                repeat_count: u16,
+                virtual_key_code: u16,
+                virtual_scan_code: u16,
+                u_char: u16,
+                control_key_state: u32,
+            }
+
+            #[repr(C)]
+            struct KEY_INPUT_RECORD {
+                event_type: u16,
+                _padding: u16,
+                event: KEY_EVENT_RECORD,
+            }
+
+            #[link(name = "user32")]
+            extern "system" {
+                fn VkKeyScanW(ch: u16) -> i16;
+                fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
+            }
+
+            // Build control_key_state flags (matching Windows Terminal convention)
+            let mut flags: u32 = 0;
+            if ctrl { flags |= LEFT_CTRL_PRESSED; }
+            if alt  { flags |= LEFT_ALT_PRESSED; }
+            if shift { flags |= SHIFT_PRESSED; }
+
+            // Determine the character to send:
+            // - Ctrl+key: u_char = control character (ch & 0x1F)
+            // - Alt+key: u_char = plain character
+            // - Ctrl+Alt+key: u_char = control character
+            // - Shift+key: u_char = uppercase/shifted character
+            let base_char = if shift && !ctrl {
+                ch.to_ascii_uppercase()
+            } else {
+                ch
+            };
+
+            let u_char_value: u16 = if ctrl {
+                // Control character: letter & 0x1F
+                (base_char.to_ascii_lowercase() as u16) & 0x1F
+            } else {
+                let mut buf = [0u16; 2];
+                let encoded = base_char.encode_utf16(&mut buf);
+                encoded[0]
+            };
+
+            // VK code is always the unmodified letter key
+            let mut buf = [0u16; 2];
+            let plain_wch = ch.to_ascii_lowercase().encode_utf16(&mut buf)[0];
+            let vk_result = VkKeyScanW(plain_wch);
+            let vk = if vk_result == -1 { 0u16 } else { (vk_result & 0xFF) as u16 };
+
+            // MAPVK_VK_TO_VSC = 0
+            let scan = MapVirtualKeyW(vk as u32, 0) as u16;
+
+            let records = [
+                KEY_INPUT_RECORD {
+                    event_type: KEY_EVENT,
+                    _padding: 0,
+                    event: KEY_EVENT_RECORD {
+                        key_down: 1,
+                        repeat_count: 1,
+                        virtual_key_code: vk,
+                        virtual_scan_code: scan,
+                        u_char: u_char_value,
+                        control_key_state: flags,
+                    },
+                },
+                KEY_INPUT_RECORD {
+                    event_type: KEY_EVENT,
+                    _padding: 0,
+                    event: KEY_EVENT_RECORD {
+                        key_down: 0,
+                        repeat_count: 1,
+                        virtual_key_code: vk,
+                        virtual_scan_code: scan,
+                        u_char: u_char_value,
+                        control_key_state: flags,
+                    },
+                },
+            ];
+
+            let mut written: u32 = 0;
+            let result = WriteConsoleInputW(
+                handle,
+                records.as_ptr() as *const INPUT_RECORD,
+                2,
+                &mut written,
+            );
+
+            debug_log(&format!("send_modified_key_event: pid={} char='{}' ctrl={} alt={} shift={} vk=0x{:02X} scan=0x{:02X} u_char=0x{:04X} flags=0x{:04X} => ok={} written={}",
+                child_pid, ch, ctrl, alt, shift, vk, scan, u_char_value, flags, result != 0, written));
+
+            CloseHandle(handle);
+            FreeConsole();
+            if had_console {
+                AttachConsole(ATTACH_PARENT_PROCESS);
+            }
+
+            result != 0 && written >= 1
+        }
+    }
+
+    /// Convenience: inject Alt+key event.
+    pub fn send_alt_key_event(child_pid: u32, ch: char) -> bool {
+        send_modified_key_event(child_pid, ch, false, true, false)
+    }
+
+    /// Inject a modified Enter (VK_RETURN) event via WriteConsoleInputW.
+    ///
+    /// ConPTY cannot reconstruct Shift+Enter from VT sequences (\x1b\r is
+    /// misinterpreted as Alt+Enter).  Native injection delivers the exact
+    /// KEY_EVENT_RECORD with the correct modifier flags, so PSReadLine and
+    /// other console-API-based readers see the true Shift/Ctrl/Alt+Enter.
+    pub fn send_modified_enter_event(child_pid: u32, ctrl: bool, alt: bool, shift: bool) -> bool {
+        unsafe {
+            let had_console = GetConsoleWindow() != 0;
+            FreeConsole();
+
+            if AttachConsole(child_pid) == 0 {
+                debug_log(&format!("send_modified_enter_event: AttachConsole({}) FAILED", child_pid));
+                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                return false;
+            }
+
+            let conin: [u16; 7] = [
+                'C' as u16, 'O' as u16, 'N' as u16,
+                'I' as u16, 'N' as u16, '$' as u16, 0,
+            ];
+            let handle = CreateFileW(
+                conin.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null(),
+            );
+
+            if handle == INVALID_HANDLE || handle == 0 {
+                debug_log(&format!("send_modified_enter_event: CreateFileW(CONIN$) FAILED"));
+                FreeConsole();
+                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
+                return false;
+            }
+
+            const KEY_EVENT: u16 = 0x0001;
+            const LEFT_ALT_PRESSED: u32 = 0x0002;
+            const LEFT_CTRL_PRESSED: u32 = 0x0008;
+            const SHIFT_PRESSED: u32 = 0x0010;
+            const VK_RETURN: u16 = 0x0D;
+
+            #[repr(C)]
+            #[derive(Copy, Clone)]
+            struct KEY_EVENT_RECORD {
+                key_down: i32,
+                repeat_count: u16,
+                virtual_key_code: u16,
+                virtual_scan_code: u16,
+                u_char: u16,
+                control_key_state: u32,
+            }
+
+            #[repr(C)]
+            struct KEY_INPUT_RECORD {
+                event_type: u16,
+                _padding: u16,
+                event: KEY_EVENT_RECORD,
+            }
+
+            #[link(name = "user32")]
+            extern "system" {
+                fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
+            }
+
+            let mut flags: u32 = 0;
+            if ctrl  { flags |= LEFT_CTRL_PRESSED; }
+            if alt   { flags |= LEFT_ALT_PRESSED; }
+            if shift { flags |= SHIFT_PRESSED; }
+
+            // MAPVK_VK_TO_VSC = 0
+            let scan = MapVirtualKeyW(VK_RETURN as u32, 0) as u16;
+
+            let records = [
+                KEY_INPUT_RECORD {
+                    event_type: KEY_EVENT,
+                    _padding: 0,
+                    event: KEY_EVENT_RECORD {
+                        key_down: 1,
+                        repeat_count: 1,
+                        virtual_key_code: VK_RETURN,
+                        virtual_scan_code: scan,
+                        u_char: '\r' as u16,
+                        control_key_state: flags,
+                    },
+                },
+                KEY_INPUT_RECORD {
+                    event_type: KEY_EVENT,
+                    _padding: 0,
+                    event: KEY_EVENT_RECORD {
+                        key_down: 0,
+                        repeat_count: 1,
+                        virtual_key_code: VK_RETURN,
+                        virtual_scan_code: scan,
+                        u_char: '\r' as u16,
+                        control_key_state: flags,
+                    },
+                },
+            ];
+
+            let mut written: u32 = 0;
+            let result = WriteConsoleInputW(
+                handle,
+                records.as_ptr() as *const INPUT_RECORD,
+                2,
+                &mut written,
+            );
+
+            debug_log(&format!("send_modified_enter_event: pid={} ctrl={} alt={} shift={} scan=0x{:02X} flags=0x{:04X} => ok={} written={}",
+                child_pid, ctrl, alt, shift, scan, flags, result != 0, written));
+
+            CloseHandle(handle);
+            FreeConsole();
+            if had_console {
+                AttachConsole(ATTACH_PARENT_PROCESS);
+            }
+
+            result != 0 && written >= 1
+        }
+    }
 }
 
 #[cfg(not(windows))]
 pub mod mouse_inject {
-    pub unsafe fn get_child_pid(_child: &dyn portable_pty::Child) -> Option<u32> { None }
+    pub fn get_child_pid(_child: &dyn portable_pty::Child) -> Option<u32> { None }
     pub fn send_mouse_event(_pid: u32, _col: i16, _row: i16, _btn: u32, _flags: u32, _reattach: bool) -> bool { false }
     pub fn send_vt_sequence(_pid: u32, _sequence: &[u8]) -> bool { false }
+    pub fn query_vti_enabled(_pid: u32) -> Option<bool> { None }
+    pub fn send_ctrl_c_event(_pid: u32, _reattach: bool) -> bool { false }
+    pub fn query_mouse_input_enabled(_pid: u32) -> Option<bool> { None }
+    pub fn send_bracketed_paste(_pid: u32, _text: &str, _bracket: bool) -> bool { false }
+    pub fn send_modified_key_event(_pid: u32, _ch: char, _ctrl: bool, _alt: bool, _shift: bool) -> bool { false }
+    pub fn send_alt_key_event(_pid: u32, _ch: char) -> bool { false }
+    pub fn send_modified_enter_event(_pid: u32, _ctrl: bool, _alt: bool, _shift: bool) -> bool { false }
 }
 
 // ---------------------------------------------------------------------------
@@ -636,7 +1413,7 @@ pub mod process_kill {
     /// This mirrors how tmux on Linux sends SIGKILL to the pane's process group.
     pub fn kill_process_tree(child: &mut Box<dyn portable_pty::Child>) {
         // Try to get the PID
-        let pid = unsafe { super::mouse_inject::get_child_pid(child.as_ref()) };
+        let pid = super::mouse_inject::get_child_pid(child.as_ref());
 
         if let Some(root_pid) = pid {
             // Collect all descendants, kill them leaf-first (reverse order)
@@ -654,6 +1431,71 @@ pub mod process_kill {
         // try_wait() to detect the dead process and remove the tree node.
         let _ = child.kill();
     }
+
+    /// Kill multiple process trees using a SINGLE process snapshot.
+    /// Much faster than calling `kill_process_tree` N times when
+    /// killing an entire session (avoids N separate system snapshots).
+    pub fn kill_process_trees_batch(children: &mut [&mut Box<dyn portable_pty::Child>]) {
+        // Collect all root PIDs
+        let root_pids: Vec<Option<u32>> = children.iter()
+            .map(|c| super::mouse_inject::get_child_pid(c.as_ref()))
+            .collect();
+
+        // Take ONE process snapshot for all trees
+        let entries = snapshot_process_table();
+
+        // For each root PID, find descendants using the shared snapshot
+        for (i, root_pid_opt) in root_pids.iter().enumerate() {
+            if let Some(root_pid) = root_pid_opt {
+                let mut descs = collect_descendants_from_table(&entries, *root_pid);
+                descs.reverse();
+                for &dpid in &descs {
+                    terminate_pid(dpid);
+                }
+                terminate_pid(*root_pid);
+            }
+            let _ = children[i].kill();
+        }
+    }
+
+    /// Take a system-wide process snapshot and return the process table.
+    fn snapshot_process_table() -> Vec<(u32, u32)> {
+        let mut entries: Vec<(u32, u32)> = Vec::with_capacity(256);
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == INVALID_HANDLE || snap == 0 { return entries; }
+
+            let mut pe: PROCESSENTRY32W = std::mem::zeroed();
+            pe.dw_size = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+            if Process32FirstW(snap, &mut pe) != 0 {
+                entries.push((pe.th32_process_id, pe.th32_parent_process_id));
+                while Process32NextW(snap, &mut pe) != 0 {
+                    entries.push((pe.th32_process_id, pe.th32_parent_process_id));
+                }
+            }
+            CloseHandle(snap);
+        }
+        entries
+    }
+
+    /// BFS from root_pid using a pre-built process table.
+    fn collect_descendants_from_table(entries: &[(u32, u32)], root_pid: u32) -> Vec<u32> {
+        let mut descendants = Vec::new();
+        let mut queue: Vec<u32> = vec![root_pid];
+        let mut head = 0;
+        while head < queue.len() {
+            let parent = queue[head];
+            head += 1;
+            for &(pid, ppid) in entries {
+                if ppid == parent && pid != root_pid && !queue.contains(&pid) {
+                    queue.push(pid);
+                    descendants.push(pid);
+                }
+            }
+        }
+        descendants
+    }
 }
 
 #[cfg(not(windows))]
@@ -661,6 +1503,13 @@ pub mod process_kill {
     /// On non-Windows, fall back to simple kill (no wait — let the reaper handle it).
     pub fn kill_process_tree(child: &mut Box<dyn portable_pty::Child>) {
         let _ = child.kill();
+    }
+
+    /// Batch kill — on non-Windows, just kill each child individually.
+    pub fn kill_process_trees_batch(children: &mut [&mut Box<dyn portable_pty::Child>]) {
+        for child in children.iter_mut() {
+            let _ = child.kill();
+        }
     }
 }
 
@@ -1068,4 +1917,321 @@ pub mod process_info {
     pub fn get_foreground_process_name(_pid: u32) -> Option<String> { None }
     pub fn get_foreground_cwd(_pid: u32) -> Option<String> { None }
     pub fn has_vt_bridge_descendant(_root_pid: u32) -> bool { false }
+}
+
+// ─── UTF-16 Console Writer (Windows) ────────────────────────────────────
+//
+// On Windows, Rust's `Stdout::write()` uses `WriteFile` which sends raw
+// bytes to the console.  The console interprets those bytes according to
+// the *output code page* (typically 437 or 1252, **not** UTF-8).  Even
+// after calling `SetConsoleOutputCP(65001)`, ConPTY has incomplete support
+// for multi-byte UTF-8 sequences delivered through `WriteFile`, causing
+// characters like ▶ (U+25B6, 3 bytes: E2 96 B6) to render as mojibake
+// (e.g. `â¶`).
+//
+// The fix is to bypass `WriteFile` entirely and use `WriteConsoleW`, which
+// accepts UTF-16 wide strings and renders them correctly regardless of
+// the console codepage.  This wrapper converts incoming UTF-8 bytes to
+// UTF-16 on the fly and writes them with `WriteConsoleW`.
+
+/// A [`std::io::Write`] implementation that renders Unicode correctly on
+/// Windows by converting UTF-8 → UTF-16 and calling `WriteConsoleW`.
+///
+/// Crucially, this buffers incomplete trailing UTF-8 sequences between
+/// `write()` calls.  `write_all()` may split a buffer at any byte
+/// boundary — including in the middle of a multi-byte character like
+/// `▶` (U+25B6, bytes E2 96 B6).  Without buffering, each orphaned byte
+/// would be emitted as a Latin-1 code point (`â`, `¶`), producing the
+/// exact garbling the user sees.
+#[cfg(windows)]
+pub struct Utf16ConsoleWriter {
+    handle: *mut std::ffi::c_void,
+    /// Frame buffer: accumulates all `write()` output so that `flush()`
+    /// can emit the complete frame as a single `WriteConsoleW` call.
+    /// This eliminates the visible top-to-bottom "curtain" repaint that
+    /// occurs when ratatui's many small per-cell writes are each sent to
+    /// the console individually.
+    frame_buf: Vec<u8>,
+}
+
+#[cfg(windows)]
+unsafe impl Send for Utf16ConsoleWriter {}
+
+#[cfg(windows)]
+impl Utf16ConsoleWriter {
+    pub fn new() -> Self {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetStdHandle(nStdHandle: u32) -> *mut std::ffi::c_void;
+        }
+        const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+        let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        // Pre-allocate ~128KB for the frame buffer — large enough for a
+        // typical full-screen frame's escape sequences without reallocation.
+        Self { handle, frame_buf: Vec::with_capacity(131072) }
+    }
+
+    /// Write a valid UTF-8 string via `WriteConsoleW`.
+    fn write_wide(&self, s: &str) -> std::io::Result<()> {
+        if s.is_empty() {
+            return Ok(());
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn WriteConsoleW(
+                hConsoleOutput: *mut std::ffi::c_void,
+                lpBuffer: *const u16,
+                nNumberOfCharsToWrite: u32,
+                lpNumberOfCharsWritten: *mut u32,
+                lpReserved: *mut std::ffi::c_void,
+            ) -> i32;
+        }
+
+        let wide: Vec<u16> = s.encode_utf16().collect();
+        let mut total: u32 = 0;
+        let len = wide.len() as u32;
+        while total < len {
+            let mut written: u32 = 0;
+            let ok = unsafe {
+                WriteConsoleW(
+                    self.handle,
+                    wide.as_ptr().add(total as usize),
+                    len - total,
+                    &mut written,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if written == 0 {
+                break;
+            }
+            total += written;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl std::io::Write for Utf16ConsoleWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Append to the frame buffer — actual console output is deferred
+        // until flush(), so all of ratatui's per-cell writes within a
+        // single draw() call are batched into one atomic WriteConsoleW.
+        self.frame_buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.frame_buf.is_empty() {
+            return Ok(());
+        }
+
+        // Convert the buffered UTF-8 to a valid string, handling any
+        // incomplete trailing multi-byte sequence.
+        let (valid, remainder) = match std::str::from_utf8(&self.frame_buf) {
+            Ok(s) => (s.len(), 0),
+            Err(e) => {
+                let valid_end = e.valid_up_to();
+                // If error_len is None, trailing bytes are an incomplete
+                // sequence — they'll be completed by the next write.
+                // If it's Some, those bytes are genuinely invalid — skip.
+                let skip = e.error_len().unwrap_or(0);
+                (valid_end, self.frame_buf.len() - valid_end - skip)
+            }
+        };
+
+        if valid > 0 {
+            // Safety: we just validated this range is valid UTF-8.
+            let s = unsafe { std::str::from_utf8_unchecked(&self.frame_buf[..valid]) };
+            self.write_wide(s)?;
+        }
+
+        // Keep any incomplete trailing bytes for the next flush.
+        if remainder > 0 {
+            let start = self.frame_buf.len() - remainder;
+            // Rotate trailing bytes to front.
+            let mut i = 0;
+            while i < remainder {
+                self.frame_buf[i] = self.frame_buf[start + i];
+                i += 1;
+            }
+            self.frame_buf.truncate(remainder);
+        } else {
+            self.frame_buf.clear();
+        }
+
+        Ok(())
+    }
+}
+
+/// Platform-independent writer type for the TUI backend.
+///
+/// On Windows this uses [`Utf16ConsoleWriter`] (WriteConsoleW) so that
+/// multi-byte UTF-8 characters render correctly.  On other platforms it
+/// is simply [`std::io::Stdout`].
+#[cfg(windows)]
+pub type PsmuxWriter = Utf16ConsoleWriter;
+#[cfg(not(windows))]
+pub type PsmuxWriter = std::io::Stdout;
+
+/// Create a new [`PsmuxWriter`].
+pub fn create_writer() -> PsmuxWriter {
+    #[cfg(windows)]
+    { Utf16ConsoleWriter::new() }
+    #[cfg(not(windows))]
+    { std::io::stdout() }
+}
+
+// ---------------------------------------------------------------------------
+// Win32 System Caret — Accessibility / Speech-to-Text support
+// ---------------------------------------------------------------------------
+// Speech-to-text tools like Wispr Flow use GetGUIThreadInfo() to locate the
+// system caret.  When psmux enters raw mode + alternate screen, the default
+// console caret is hidden and accessibility tools lose track of the text
+// insertion point.
+//
+// By creating a Win32 caret on the console window and updating its position
+// every frame, accessibility tools can detect the active text input context
+// and inject transcribed text.
+//
+// These functions are safe to call on all platforms; non-Windows builds are
+// no-ops.  SSH sessions should skip calling these (no local console window).
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+pub mod caret {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static CARET_CREATED: AtomicBool = AtomicBool::new(false);
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleWindow() -> isize;
+        fn GetCurrentConsoleFontEx(
+            hConsoleOutput: *mut std::ffi::c_void,
+            bMaximumWindow: i32,
+            lpConsoleCurrentFontEx: *mut CONSOLE_FONT_INFOEX,
+        ) -> i32;
+        fn GetStdHandle(nStdHandle: u32) -> *mut std::ffi::c_void;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn CreateCaret(hWnd: isize, hBitmap: isize, nWidth: i32, nHeight: i32) -> i32;
+        fn SetCaretPos(x: i32, y: i32) -> i32;
+        fn ShowCaret(hWnd: isize) -> i32;
+        fn DestroyCaret() -> i32;
+    }
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct CONSOLE_FONT_INFOEX {
+        cbSize: u32,
+        nFont: u32,
+        dwFontSize_X: i16,
+        dwFontSize_Y: i16,
+        FontFamily: u32,
+        FontWeight: u32,
+        FaceName: [u16; 32],
+    }
+
+    /// Query the current console font cell size in pixels.
+    /// Returns (cell_width, cell_height).  Falls back to (8, 16) on failure.
+    fn console_cell_size() -> (i32, i32) {
+        const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+        unsafe {
+            let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            if handle.is_null() || handle == (-1isize) as *mut std::ffi::c_void {
+                return (8, 16);
+            }
+            let mut info: CONSOLE_FONT_INFOEX = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<CONSOLE_FONT_INFOEX>() as u32;
+            if GetCurrentConsoleFontEx(handle, 0, &mut info) != 0 {
+                let w = if info.dwFontSize_X > 0 { info.dwFontSize_X as i32 } else { 8 };
+                let h = if info.dwFontSize_Y > 0 { info.dwFontSize_Y as i32 } else { 16 };
+                (w, h)
+            } else {
+                (8, 16)
+            }
+        }
+    }
+
+    /// Create the system caret on the console window (if not already created)
+    /// and update its position to the given terminal cell coordinates.
+    ///
+    /// `col` and `row` are 0-based terminal cell coordinates (the same values
+    /// used for VT CUP positioning).
+    pub fn update(col: u16, row: u16) {
+        unsafe {
+            let hwnd = GetConsoleWindow();
+            if hwnd == 0 {
+                return;
+            }
+            if !CARET_CREATED.load(Ordering::Relaxed) {
+                let (cw, ch) = console_cell_size();
+                if CreateCaret(hwnd, 0, cw.max(1), ch.max(1)) != 0 {
+                    CARET_CREATED.store(true, Ordering::Relaxed);
+                    ShowCaret(hwnd);
+                }
+            }
+            let (cw, ch) = console_cell_size();
+            SetCaretPos(col as i32 * cw, row as i32 * ch);
+        }
+    }
+
+    /// Hide and destroy the system caret.  Call on exit.
+    pub fn destroy() {
+        if CARET_CREATED.swap(false, Ordering::Relaxed) {
+            unsafe { DestroyCaret(); }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub mod caret {
+    pub fn update(_col: u16, _row: u16) {}
+    pub fn destroy() {}
+}
+
+/// On Windows ConPTY, Shift+Enter is misreported by crossterm:
+///
+/// VS Code's xterm.js sends `\x1b\r` (ESC + CR) for Shift+Enter.
+/// ConPTY interprets the ESC prefix as Alt, so crossterm reports
+/// `KeyModifiers::ALT` instead of `KeyModifiers::SHIFT`.
+///
+/// This function polls the physical keyboard state to detect the real
+/// modifiers and remaps accordingly.
+#[cfg(windows)]
+pub fn augment_enter_shift(key: &mut crossterm::event::KeyEvent) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    if !matches!(key.code, KeyCode::Enter) {
+        return;
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        return;
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetAsyncKeyState(vKey: i32) -> i16;
+    }
+
+    const VK_SHIFT: i32 = 0x10;
+    const VK_MENU: i32 = 0x12; // Alt
+
+    unsafe {
+        let shift_down = GetAsyncKeyState(VK_SHIFT) < 0;
+        let alt_down = GetAsyncKeyState(VK_MENU) < 0;
+
+        if shift_down && !alt_down {
+            key.modifiers.remove(KeyModifiers::ALT);
+            key.modifiers.insert(KeyModifiers::SHIFT);
+        } else if shift_down {
+            key.modifiers.insert(KeyModifiers::SHIFT);
+        }
+    }
 }

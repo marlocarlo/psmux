@@ -4,6 +4,19 @@
 # Only dump-state returns a response (the JSON or "NC").
 
 $ErrorActionPreference = "Continue"
+
+# WSL availability check
+$wslExe = "$env:SystemRoot\System32\wsl.exe"
+if (-not (Test-Path $wslExe)) {
+    Write-Host "[SKIP] WSL not available (wsl.exe not found)" -ForegroundColor Yellow
+    exit 0
+}
+$distroCheck = & $wslExe --list --quiet 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0 -or $distroCheck.Trim().Length -eq 0) {
+    Write-Host "[SKIP] WSL not available (no distro installed)" -ForegroundColor Yellow
+    exit 0
+}
+
 $psmux = "$PSScriptRoot\..\target\release\psmux.exe"
 $sessionName = "lattest5"
 $dotPsmux = "$env:USERPROFILE\.psmux"

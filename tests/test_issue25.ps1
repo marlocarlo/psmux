@@ -1,6 +1,6 @@
 # Issue #25 Tests - prefix+[0-9] with custom prefix, window tab color,
 #                   copy-mode cursor, Ctrl+C behavior
-# https://github.com/marlocarlo/psmux/issues/25
+# https://github.com/psmux/psmux/issues/25
 $ErrorActionPreference = "Continue"
 $script:TestsPassed = 0
 $script:TestsFailed = 0

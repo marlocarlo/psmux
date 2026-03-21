@@ -200,7 +200,7 @@ Write-Host ("=" * 60)
 Write-Host "4. NAMED REGISTERS"
 Write-Host ("=" * 60)
 
-Write-Test "4.1 named register selection (\"a)"
+Write-Test '4.1 named register selection ("a)'
 Psmux copy-mode -t $SESSION | Out-Null
 Start-Sleep -Milliseconds 500
 # Select text, yank to register a
@@ -338,7 +338,7 @@ Start-Sleep -Milliseconds 100
 $x2 = (& $PSMUX display-message -t $SESSION -p "#{copy_cursor_x}" 2>&1 | Out-String).Trim()
 Psmux send-keys -t $SESSION '^' | Out-Null
 Start-Sleep -Milliseconds 100
-Write-Info "  $: x=$x1, 0: x=$x2"
+Write-Info "  `$: x=$x1, 0: x=$x2"
 Write-Pass "0, $, ^ motions work"
 Psmux send-keys -t $SESSION q | Out-Null
 

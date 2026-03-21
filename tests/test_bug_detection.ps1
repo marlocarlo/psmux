@@ -83,8 +83,8 @@ if ($dashBindFound) {
     Write-Info "This confirms the bug: parse_bind_key() in config.rs treats '-' as a flag"
 }
 
-& $PSMUX kill-session -t $S1 2>&1 | Out-Null
-Start-Sleep -Seconds 2
+& $PSMUX kill-server 2>&1 | Out-Null
+Start-Sleep -Seconds 3
 
 # ═══════════════════════════════════════════════════════════════════════
 # BUG 1b: Same dash key via RUNTIME bind-key (should work since TCP 
@@ -125,8 +125,8 @@ if ($dashRuntimeFound) {
     Write-Fail "BUG1b-runtime: dash binding missing even via TCP handler"
 }
 
-& $PSMUX kill-session -t $S1b 2>&1 | Out-Null
-Start-Sleep -Seconds 2
+& $PSMUX kill-server 2>&1 | Out-Null
+Start-Sleep -Seconds 3
 
 # ═══════════════════════════════════════════════════════════════════════
 # BUG 2: list-keys shows duplicates for overridden default keys
@@ -166,8 +166,8 @@ if ($lCount -eq 1) {
     Write-Fail "BUG2: No 'l' binding found at all"
 }
 
-& $PSMUX kill-session -t $S2 2>&1 | Out-Null
-Start-Sleep -Seconds 2
+& $PSMUX kill-server 2>&1 | Out-Null
+Start-Sleep -Seconds 3
 
 # ═══════════════════════════════════════════════════════════════════════
 # BUG 3: Client hardcoded bindings shadow user bindings

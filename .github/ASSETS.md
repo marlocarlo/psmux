@@ -10,7 +10,7 @@ To enable the social card on GitHub:
    - Then run: `magick .github/social-card.svg .github/social-card.png`
 
 2. **Upload to GitHub**:
-   - Go to: https://github.com/marlocarlo/psmux/settings
+   - Go to: https://github.com/psmux/psmux/settings
    - Scroll to "Social preview"
    - Click "Edit" and upload `.github/social-card.png`
    - Dimensions: 1280x640px (optimal for social sharing)

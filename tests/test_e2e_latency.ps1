@@ -10,7 +10,23 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$psmuxExe = "c:\Users\gj\Documents\workspace\psmux\target\release\psmux.exe"
+$psmuxExe = "$PSScriptRoot\..\target\release\psmux.exe"
+if (-not (Test-Path $psmuxExe)) { $psmuxExe = "$PSScriptRoot\..\target\debug\psmux.exe" }
+
+# Auto-detect WSL availability and skip WSL tests if not present
+if (-not $SkipWSL -and -not $PwshOnly) {
+    $wslExe = "$env:SystemRoot\System32\wsl.exe"
+    if (-not (Test-Path $wslExe)) {
+        Write-Host "[INFO] WSL not found — running pwsh-only tests" -ForegroundColor Yellow
+        $PwshOnly = $true
+    } else {
+        $distroCheck = & $wslExe --list --quiet 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0 -or $distroCheck.Trim().Length -eq 0) {
+            Write-Host "[INFO] No WSL distro installed — running pwsh-only tests" -ForegroundColor Yellow
+            $PwshOnly = $true
+        }
+    }
+}
 
 function Get-LayoutHash {
     param([string]$json)

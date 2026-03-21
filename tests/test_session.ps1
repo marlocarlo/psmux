@@ -15,7 +15,7 @@ if (-not (Test-Path $PSMUX)) {
     $PSMUX = "$PSScriptRoot\..\target\release\psmux.exe"
 }
 
-$SESSION_NAME = "test_session_$$"
+$SESSION_NAME = "test_session_$(Get-Random -Maximum 99999)"
 
 Write-Info "Starting test session: $SESSION_NAME"
 Write-Host ""
@@ -242,8 +242,8 @@ Write-Info "Cleaning up test session..."
 Start-Sleep -Seconds 1
 
 # Verify session is gone
-$sessions = & $PSMUX ls 2>&1
-if ($sessions -notmatch $SESSION_NAME) {
+& $PSMUX has-session -t $SESSION_NAME 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) {
     Write-Pass "Session cleaned up successfully"
 } else {
     Write-Fail "Session may still exist"

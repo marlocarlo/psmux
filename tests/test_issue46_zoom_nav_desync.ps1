@@ -212,17 +212,17 @@ if ($desyncCount -eq 0) {
 }
 
 # ============================================================
-# TEST 4: ZOOM PRESERVED WHEN NO PANE IN DIRECTION (tmux parity)
+# TEST 4: ZOOM WRAP NAVIGATION (issue #134 parity)
 # ============================================================
 Write-Host ""
 Write-Host ("=" * 60)
-Write-Host "  TEST 4: ZOOM PRESERVED ON NO-OP NAVIGATION"
+Write-Host "  TEST 4: ZOOM WRAP NAVIGATION (LEFT FROM LEFTMOST)"
 Write-Host ("=" * 60)
 
-Write-Test "4. Zoom stays active when navigating with no pane in that direction"
+Write-Test "4. Zoomed select-pane -L from leftmost wraps to rightmost and unzooms"
 
 # With horizontal split (pane 0 left, pane 1 right):
-# Select pane 0, zoom it, then try select-pane -L (no pane further left)
+# Select pane 0, zoom it, then select-pane -L should wrap to pane 1 and unzoom
 Psmux select-pane -t "${SESSION}:.0" | Out-Null
 Start-Sleep -Milliseconds 500
 
@@ -241,7 +241,7 @@ $z4 = Query -Target $SESSION -Fmt '#{window_zoomed_flag}'
 $a4 = Query -Target $SESSION -Fmt '#{pane_index}'
 Write-Info "  Before nav: zoomed=$z4, active_pane=$a4"
 
-# Try to move left — no pane there, zoom should stay
+# Move left from leftmost — wraps to rightmost, unzooms (issue #134)
 Psmux select-pane -L -t $SESSION | Out-Null
 Start-Sleep -Milliseconds 500
 
@@ -249,10 +249,10 @@ $z4after = Query -Target $SESSION -Fmt '#{window_zoomed_flag}'
 $a4after = Query -Target $SESSION -Fmt '#{pane_index}'
 Write-Info "  After select-pane -L: zoomed=$z4after, active_pane=$a4after"
 
-if ($z4after -match "1" -and $a4after -eq $a4) {
-    Write-Pass "Zoom preserved when no pane in that direction (tmux parity)"
+if ($z4after -match "0" -and $a4after -eq "1") {
+    Write-Pass "Zoomed wrap -L: pane $a4->$a4after, zoom $z4->$z4after (issue #134 parity)"
 } else {
-    Write-Fail "Zoom was cancelled on no-op navigation (tmux: should stay zoomed)"
+    Write-Fail "Expected pane 0->1 zoom 1->0, got pane $a4->$a4after zoom $z4->$z4after"
 }
 
 # Clean up: unzoom

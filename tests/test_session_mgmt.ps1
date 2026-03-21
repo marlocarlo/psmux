@@ -1,5 +1,6 @@
 $ErrorActionPreference = "Continue"
-$PSMUX = "C:\Users\gj\Documents\workspace\psmux\target\release\psmux.exe"
+$PSMUX = "$PSScriptRoot\..\target\release\psmux.exe"
+if (-not (Test-Path $PSMUX)) { $PSMUX = "$PSScriptRoot\..\target\debug\psmux.exe" }
 $results = @()
 
 function Add-Result {

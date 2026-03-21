@@ -113,8 +113,8 @@ if ($keysText -match "_.*split-window.*-v") {
     Write-Fail "bind-key _ split-window -v NOT found in list-keys"
 }
 
-& $PSMUX kill-session -t $S1 2>&1 | Out-Null
-Start-Sleep -Seconds 2
+& $PSMUX kill-server 2>&1 | Out-Null
+Start-Sleep -Seconds 3
 
 # ═══════════════════════════════════════════════════════════════════════
 # TEST 2: Runtime bind-key | via CLI
@@ -201,8 +201,8 @@ foreach ($st in $symbolTests) {
     }
 }
 
-& $PSMUX kill-session -t $S2 2>&1 | Out-Null
-Start-Sleep -Seconds 2
+& $PSMUX kill-server 2>&1 | Out-Null
+Start-Sleep -Seconds 3
 
 # ═══════════════════════════════════════════════════════════════════════
 # TEST 4: unbind-key | works
@@ -242,8 +242,8 @@ if ($keys4bText -notmatch "\|.*split-window") {
     Write-Fail "unbind-key | did NOT remove the binding"
 }
 
-& $PSMUX kill-session -t $S4 2>&1 | Out-Null
-Start-Sleep -Seconds 1
+& $PSMUX kill-server 2>&1 | Out-Null
+Start-Sleep -Seconds 3
 
 # ═══════════════════════════════════════════════════════════════════════
 # TEST 5: Verify split-window -h via pipe binding actually creates pane

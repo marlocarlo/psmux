@@ -1,10 +1,42 @@
 use std::env;
+use std::cell::RefCell;
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use crate::types::*;
+use crate::types::{AppState, Action, Bind};
 use crate::commands::parse_command_to_action;
 
+// Track the current config file being parsed (for #{current_file}, #{d:current_file})
+thread_local! {
+    static CURRENT_CONFIG_FILE: RefCell<String> = RefCell::new(String::new());
+}
+
+/// Get the current config file path being parsed.
+pub fn current_config_file() -> String {
+    CURRENT_CONFIG_FILE.with(|f| f.borrow().clone())
+}
+
+/// Set the current config file path.
+fn set_current_config_file(path: &str) {
+    CURRENT_CONFIG_FILE.with(|f| *f.borrow_mut() = path.to_string());
+}
+
 pub fn load_config(app: &mut AppState) {
+    // If -f flag was used, load that specific config file instead of default search
+    if let Ok(config_file) = env::var("PSMUX_CONFIG_FILE") {
+        let expanded = if config_file.starts_with('~') {
+            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+            config_file.replacen('~', &home, 1)
+        } else {
+            config_file
+        };
+        set_current_config_file(&expanded);
+        if let Ok(content) = std::fs::read_to_string(&expanded) {
+            parse_config_content(app, &content);
+        }
+        set_current_config_file("");
+        return;
+    }
+
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let paths = vec![
         format!("{}\\.psmux.conf", home),
@@ -14,16 +46,209 @@ pub fn load_config(app: &mut AppState) {
     ];
     for path in paths {
         if let Ok(content) = std::fs::read_to_string(&path) {
+            set_current_config_file(&path);
             parse_config_content(app, &content);
+            set_current_config_file("");
             break;
         }
     }
 }
 
 pub fn parse_config_content(app: &mut AppState, content: &str) {
-    for line in content.lines() {
-        parse_config_line(app, line);
+    // Process %if / %elif / %else / %endif conditional blocks.
+    // These are tmux config-level directives that control which lines are parsed.
+    //
+    // %if "#{==:#{@option},value}"   — evaluate format condition
+    // %elif "#{condition}"           — else-if branch
+    // %else                          — else branch
+    // %endif                         — end conditional block
+    // %hidden NAME=value             — define a hidden variable (stored but not shown)
+    //
+    // Blocks can nest. We track a stack of (active, satisfied) states.
+    // - active: whether the current block should execute lines
+    // - satisfied: whether any branch of the current if/elif/else has matched
+    struct IfState {
+        active: bool,    // are we executing lines in this block?
+        satisfied: bool, // has any branch of this if/elif/else already matched?
+        parent_active: bool, // was the parent context active?
     }
+
+    let mut if_stack: Vec<IfState> = Vec::new();
+
+    // Join continuation lines (ending with \)
+    let mut lines: Vec<String> = Vec::new();
+    let mut continuation = String::new();
+    for line in content.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.ends_with('\\') {
+            continuation.push_str(trimmed.trim_end_matches('\\'));
+            continuation.push(' ');
+        } else {
+            if !continuation.is_empty() {
+                continuation.push_str(trimmed);
+                lines.push(continuation.clone());
+                continuation.clear();
+            } else {
+                lines.push(trimmed.to_string());
+            }
+        }
+    }
+    if !continuation.is_empty() {
+        lines.push(continuation);
+    }
+
+    for line in &lines {
+        let l = line.trim();
+
+        // Skip empty lines and comments (but comments start with # not %)
+        if l.is_empty() { continue; }
+
+        // Handle %-directives before checking for # comments
+        if l.starts_with('%') {
+            if l.starts_with("%if ") || l.starts_with("%if\t") {
+                let condition = l[3..].trim().trim_matches('"').trim_matches('\'');
+
+                // Evaluate the condition using format expansion
+                let parent_active = if_stack.last().map(|s| s.active).unwrap_or(true);
+                let result = if parent_active {
+                    let expanded = crate::format::expand_format(condition, app);
+                    is_truthy_config(&expanded)
+                } else {
+                    false
+                };
+
+                if_stack.push(IfState {
+                    active: parent_active && result,
+                    satisfied: result,
+                    parent_active,
+                });
+                continue;
+            }
+
+            if l.starts_with("%elif ") || l.starts_with("%elif\t") {
+                if let Some(state) = if_stack.last_mut() {
+                    let condition = l[5..].trim().trim_matches('"').trim_matches('\'');
+                    if state.parent_active && !state.satisfied {
+                        let expanded = crate::format::expand_format(condition, app);
+                        let result = is_truthy_config(&expanded);
+                        state.active = result;
+                        if result { state.satisfied = true; }
+                    } else {
+                        state.active = false;
+                    }
+                }
+                continue;
+            }
+
+            if l == "%else" {
+                if let Some(state) = if_stack.last_mut() {
+                    state.active = state.parent_active && !state.satisfied;
+                    state.satisfied = true; // prevent further elif from matching
+                }
+                continue;
+            }
+
+            if l == "%endif" {
+                if_stack.pop();
+                continue;
+            }
+
+            if l.starts_with("%hidden ") {
+                // %hidden NAME=VALUE — define a hidden config variable
+                let rest = l[8..].trim();
+                if let Some(eq_pos) = rest.find('=') {
+                    let name = rest[..eq_pos].trim();
+                    let value = rest[eq_pos + 1..].trim().trim_matches('"').trim_matches('\'');
+                    // Only process if active
+                    let active = if_stack.last().map(|s| s.active).unwrap_or(true);
+                    if active {
+                        app.environment.insert(name.to_string(), value.to_string());
+                    }
+                }
+                continue;
+            }
+
+            // Unknown %-directive — skip
+            continue;
+        }
+
+        // Regular line — only process if all enclosing %if blocks are active
+        let active = if_stack.last().map(|s| s.active).unwrap_or(true);
+        if !active { continue; }
+
+        // Expand $NAME / ${NAME} references from %hidden variables.
+        // tmux's %hidden directive defines server-level variables that are
+        // expanded with $ syntax in subsequent config lines.
+        let l = if l.contains('$') {
+            expand_hidden_vars(l, &app.environment)
+        } else {
+            l.to_string()
+        };
+
+        parse_config_line(app, &l);
+    }
+}
+
+/// Expand `$NAME` and `${NAME}` references to %hidden variable values.
+/// Only expand if the variable exists in the environment map (which stores
+/// both %hidden variables and @user-options without the @ prefix).
+fn expand_hidden_vars(line: &str, env: &std::collections::HashMap<String, String>) -> String {
+    let mut result = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] == b'$' {
+            // Check for ${NAME} syntax
+            if i + 1 < len && bytes[i + 1] == b'{' {
+                if let Some(close) = line[i + 2..].find('}') {
+                    let name = &line[i + 2..i + 2 + close];
+                    if let Some(val) = env.get(name) {
+                        result.push_str(val);
+                    } else {
+                        // Not found — keep as literal
+                        result.push_str(&line[i..i + 2 + close + 1]);
+                    }
+                    i = i + 2 + close + 1;
+                    continue;
+                }
+            }
+            // Check for $NAME syntax (NAME = [A-Z_][A-Z0-9_]*)
+            let start = i + 1;
+            let mut end = start;
+            while end < len && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            if end > start {
+                let name = &line[start..end];
+                if let Some(val) = env.get(name) {
+                    result.push_str(val);
+                    i = end;
+                    continue;
+                }
+            }
+            // Not a recognized variable — keep literal $
+            result.push('$');
+            i += 1;
+        } else {
+            // Advance by full UTF-8 character (not single byte) to preserve
+            // multi-byte chars like ▶ (U+25B6, 3 bytes) and ◀ (U+25C0).
+            if let Some(ch) = line[i..].chars().next() {
+                result.push(ch);
+                i += ch.len_utf8();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    result
+}
+
+/// Check if a config-level condition result is truthy
+fn is_truthy_config(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty() && s != "0"
 }
 
 pub fn parse_config_line(app: &mut AppState, line: &str) {
@@ -38,10 +263,6 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
     
     if l.starts_with("set-option ") || l.starts_with("set ") {
         parse_set_option(app, l);
-    }
-    else if l.starts_with("set -g ") {
-        let rest = &l[7..];
-        parse_option_value(app, rest, true);
     }
     else if l.starts_with("setw ") || l.starts_with("set-window-option ") {
         // setw maps to the same option parser (tmux window options overlap)
@@ -66,14 +287,41 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
         parse_if_shell(app, l);
     }
     else if l.starts_with("set-hook ") {
-        // Parse set-hook: set-hook [-g] hook-name command
+        // Parse set-hook: set-hook [-g] [-u] hook-name [command]
         let parts: Vec<&str> = l.split_whitespace().collect();
         let mut i = 1;
-        while i < parts.len() && parts[i].starts_with('-') { i += 1; }
-        if i + 1 < parts.len() {
+        let mut unset = false;
+        while i < parts.len() && parts[i].starts_with('-') {
+            if parts[i].contains('u') { unset = true; }
+            i += 1;
+        }
+        if unset {
+            // set-hook -gu <hook-name>  →  remove the hook
+            if i < parts.len() {
+                app.hooks.remove(parts[i]);
+            }
+        } else if i + 1 < parts.len() {
             let hook = parts[i].to_string();
             let cmd = parts[i+1..].join(" ");
-            app.hooks.entry(hook).or_insert_with(Vec::new).push(cmd);
+            // Strip matching outer quotes (single or double) that wrap the command
+            let cmd = {
+                let trimmed = cmd.trim();
+                let bytes = trimmed.as_bytes();
+                if bytes.len() >= 2 {
+                    let first = bytes[0];
+                    let last = bytes[bytes.len() - 1];
+                    if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
+                        trimmed[1..trimmed.len()-1].to_string()
+                    } else {
+                        cmd
+                    }
+                } else {
+                    cmd
+                }
+            };
+            // Replace (not append) to match tmux – prevents duplicates on
+            // config reload (issue #133).
+            app.hooks.insert(hook, vec![cmd]);
         }
     }
     else if l.starts_with("set-environment ") || l.starts_with("setenv ") {
@@ -81,7 +329,10 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
         let mut i = 1;
         while i < parts.len() && parts[i].starts_with('-') { i += 1; }
         if i + 1 < parts.len() {
-            app.environment.insert(parts[i].to_string(), parts[i+1..].join(" "));
+            let val = parts[i+1..].join(" ");
+            app.environment.insert(parts[i].to_string(), val.clone());
+            // Also set on the server process so child panes inherit via env block
+            std::env::set_var(parts[i], &val);
         }
     }
 }
@@ -92,11 +343,21 @@ fn parse_set_option(app: &mut AppState, line: &str) {
     
     let mut i = 1;
     let mut is_global = false;
+    let mut format_expand = false;  // -F: expand format strings in value
+    let mut only_if_unset = false;  // -o: only set if not already set
+    let mut append_mode = false;    // -a: append to current value
+    let mut unset_mode = false;     // -u: unset (reset to default)
     
     while i < parts.len() {
         let p = parts[i];
         if p.starts_with('-') {
             if p.contains('g') { is_global = true; }
+            if p.contains('F') { format_expand = true; }
+            if p.contains('o') { only_if_unset = true; }
+            if p.contains('a') { append_mode = true; }
+            if p.contains('u') { unset_mode = true; }
+            // -q (quiet): no-op — we don't produce errors for unknown options
+            // -w: window option — treat same as global for our single-server model
             i += 1;
             if p.contains('t') && i < parts.len() { i += 1; }
         } else {
@@ -104,10 +365,49 @@ fn parse_set_option(app: &mut AppState, line: &str) {
         }
     }
     
-    if i < parts.len() {
-        let rest = parts[i..].join(" ");
-        parse_option_value(app, &rest, is_global);
+    if i >= parts.len() { return; }
+
+    // Extract key and value
+    let key = parts[i];
+    let raw_value = if i + 1 < parts.len() {
+        parts[i + 1..].join(" ")
+    } else {
+        String::new()
+    };
+
+    // Handle -u (unset): reset option to empty
+    if unset_mode {
+        parse_option_value(app, &format!("{} ", key), is_global);
+        return;
     }
+
+    // Handle -o (only set if not currently set)
+    if only_if_unset {
+        let current = crate::format::lookup_option_pub(key, app);
+        if let Some(ref v) = current {
+            if !v.is_empty() { return; }
+        }
+    }
+
+    // Expand format strings in the value if -F flag is set
+    let value = if format_expand && !raw_value.is_empty() {
+        let stripped = raw_value.trim_matches('"').trim_matches('\'');
+        let expanded = crate::format::expand_format(stripped, app);
+        expanded
+    } else {
+        raw_value
+    };
+
+    // Handle -a (append to current value)
+    let final_value = if append_mode {
+        let current = crate::format::lookup_option_pub(key, app).unwrap_or_default();
+        format!("{}{}", current, value.trim_matches('"').trim_matches('\''))
+    } else {
+        value
+    };
+
+    let rest = format!("{} {}", key, final_value);
+    parse_option_value(app, &rest, is_global);
 }
 
 pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
@@ -115,10 +415,19 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
     if parts.is_empty() { return; }
     
     let key = parts[0].trim();
-    let value = if parts.len() > 1 { 
-        parts[1].trim().trim_matches('"').trim_matches('\'')
-    } else { 
-        "" 
+    let value = if parts.len() > 1 {
+        let v = parts[1].trim();
+        // Only strip quotes when the entire value is wrapped in matching
+        // quotes.  Preserves values like `"path with spaces" --login`.
+        if (v.starts_with('"') && v.ends_with('"'))
+            || (v.starts_with('\'') && v.ends_with('\''))
+        {
+            &v[1..v.len() - 1]
+        } else {
+            v
+        }
+    } else {
+        ""
     };
     
     match key {
@@ -222,6 +531,12 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         "remain-on-exit" => {
             app.remain_on_exit = matches!(value, "on" | "true" | "1");
         }
+        "destroy-unattached" => {
+            app.destroy_unattached = matches!(value, "on" | "true" | "1");
+        }
+        "exit-empty" => {
+            app.exit_empty = matches!(value, "on" | "true" | "1");
+        }
         "aggressive-resize" => {
             app.aggressive_resize = matches!(value, "on" | "true" | "1");
         }
@@ -231,7 +546,7 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         "set-titles-string" => {
             app.set_titles_string = value.to_string();
         }
-        "status-keys" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "status-keys" => { app.user_options.insert(key.to_string(), value.to_string()); }
         "pane-border-style" => { app.pane_border_style = value.to_string(); }
         "pane-active-border-style" => { app.pane_active_border_style = value.to_string(); }
         "window-status-format" => { app.window_status_format = value.to_string(); }
@@ -243,14 +558,26 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         "synchronize-panes" => {
             app.sync_input = matches!(value, "on" | "true" | "1");
         }
-        "allow-rename" => { app.environment.insert(key.to_string(), value.to_string()); }
-        "terminal-overrides" => { app.environment.insert(key.to_string(), value.to_string()); }
-        "default-terminal" => { app.environment.insert(key.to_string(), value.to_string()); }
-        "update-environment" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "allow-rename" => {
+            app.allow_rename = matches!(value, "on" | "true" | "1");
+        }
+        "terminal-overrides" => { /* tmux terminfo override — accepted for compatibility, no-op on Windows */ }
+        "default-terminal" => {
+            // tmux sets the TERM env var from this option (#137)
+            app.environment.insert("TERM".to_string(), value.to_string());
+        }
+        "update-environment" => {
+            // tmux: space-separated list of env var names to update from client on attach
+            app.update_environment = value.split_whitespace().map(|s| s.to_string()).collect();
+        }
         "bell-action" => { app.bell_action = value.to_string(); }
         "visual-bell" => { app.visual_bell = matches!(value, "on" | "true" | "1"); }
-        "activity-action" => { app.environment.insert(key.to_string(), value.to_string()); }
-        "silence-action" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "activity-action" => {
+            app.activity_action = value.to_string();
+        }
+        "silence-action" => {
+            app.silence_action = value.to_string();
+        }
         "monitor-silence" => {
             if let Ok(n) = value.parse::<u64>() { app.monitor_silence = n; }
         }
@@ -264,12 +591,12 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         "window-status-last-style" => { app.window_status_last_style = value.to_string(); }
         "status-left-style" => { app.status_left_style = value.to_string(); }
         "status-right-style" => { app.status_right_style = value.to_string(); }
-        "clock-mode-colour" | "clock-mode-style" => { app.environment.insert(key.to_string(), value.to_string()); }
-        "pane-border-format" | "pane-border-status" => { app.environment.insert(key.to_string(), value.to_string()); }
-        "popup-style" | "popup-border-style" | "popup-border-lines" => { app.environment.insert(key.to_string(), value.to_string()); }
-        "window-style" | "window-active-style" => { app.environment.insert(key.to_string(), value.to_string()); }
-        "wrap-search" => { app.environment.insert(key.to_string(), value.to_string()); }
-        "lock-after-time" | "lock-command" => { app.environment.insert(key.to_string(), value.to_string()); }
+        "clock-mode-colour" | "clock-mode-style" => { app.user_options.insert(key.to_string(), value.to_string()); }
+        "pane-border-format" | "pane-border-status" => { app.user_options.insert(key.to_string(), value.to_string()); }
+        "popup-style" | "popup-border-style" | "popup-border-lines" => { app.user_options.insert(key.to_string(), value.to_string()); }
+        "window-style" | "window-active-style" => { app.user_options.insert(key.to_string(), value.to_string()); }
+        "wrap-search" => { app.user_options.insert(key.to_string(), value.to_string()); }
+        "lock-after-time" | "lock-command" => { app.user_options.insert(key.to_string(), value.to_string()); }
         "main-pane-width" => {
             if let Ok(n) = value.parse::<u16>() { app.main_pane_width = n; }
         }
@@ -286,6 +613,15 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         "allow-passthrough" => { app.allow_passthrough = value.to_string(); }
         "copy-command" => { app.copy_command = value.to_string(); }
         "set-clipboard" => { app.set_clipboard = value.to_string(); }
+        "env-shim" => {
+            app.env_shim = matches!(value, "on" | "true" | "1");
+        }
+        "claude-code-fix-tty" => {
+            app.claude_code_fix_tty = matches!(value, "on" | "true" | "1");
+        }
+        "claude-code-force-interactive" => {
+            app.claude_code_force_interactive = matches!(value, "on" | "true" | "1");
+        }
         "command-alias" => {
             if let Some(pos) = value.find('=') {
                 let alias = value[..pos].trim().to_string();
@@ -304,8 +640,90 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
                     return;
                 }
             }
-            // Store any unknown option in the environment map for plugin compat
-            app.environment.insert(key.to_string(), value.to_string());
+            // Store @-prefixed user/plugin options separately from environment
+            // so they don't leak into child shells (#105).
+            if key.starts_with('@') {
+                app.user_options.insert(key.to_string(), value.to_string());
+            } else if key.contains('-') {
+                // Options with hyphens are tmux config options, NOT environment
+                // variables.  Storing them in environment causes PowerShell
+                // ParserErrors when injected via $env:NAME syntax (#137).
+                app.user_options.insert(key.to_string(), value.to_string());
+            } else {
+                app.environment.insert(key.to_string(), value.to_string());
+            }
+
+            // Auto-source plugin conf files when @plugin is declared.
+            // This makes theme/settings load synchronously during config
+            // parsing instead of waiting for PPM's async run-shell to
+            // source them later (which causes a visible flash).
+            //
+            // Format: set -g @plugin 'org/plugin-name' or 'plugin-name'
+            // Tries:  ~/.psmux/plugins/<full-value>/plugin.conf
+            //   then: ~/.psmux/plugins/<last-component>/plugin.conf
+            if key == "@plugin" && !value.is_empty() {
+                let plugin_name = value.rsplit('/').next().unwrap_or(value);
+                if plugin_name != "ppm" {
+                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                    let xdg_config = env::var("XDG_CONFIG_HOME")
+                        .unwrap_or_else(|_| format!("{}\\.config", home));
+                    let candidates = [
+                        // Classic paths: ~/.psmux/plugins/
+                        format!("{}\\.psmux\\plugins\\{}\\plugin.conf", home, value.replace('/', "\\")),
+                        format!("{}\\.psmux\\plugins\\{}\\plugin.conf", home, plugin_name),
+                        format!("{}\\.psmux\\plugins\\psmux-plugins\\{}\\plugin.conf", home, plugin_name),
+                        // XDG paths: ~/.config/psmux/plugins/
+                        format!("{}\\psmux\\plugins\\{}\\plugin.conf", xdg_config, value.replace('/', "\\")),
+                        format!("{}\\psmux\\plugins\\{}\\plugin.conf", xdg_config, plugin_name),
+                        format!("{}\\psmux\\plugins\\psmux-plugins\\{}\\plugin.conf", xdg_config, plugin_name),
+                    ];
+                    let mut found = false;
+                    for conf in &candidates {
+                        if std::path::Path::new(conf).exists() {
+                            let prev_file = current_config_file();
+                            set_current_config_file(conf);
+                            if let Ok(content) = std::fs::read_to_string(conf) {
+                                parse_config_content(app, &content);
+                            }
+                            set_current_config_file(&prev_file);
+                            found = true;
+                            break;
+                        }
+                    }
+                    // If no plugin.conf, try .ps1 entry scripts
+                    if !found {
+                        let ps1_candidates = [
+                            // Classic paths
+                            format!("{}\\.psmux\\plugins\\{}\\{}.ps1", home, value.replace('/', "\\"), plugin_name),
+                            format!("{}\\.psmux\\plugins\\{}\\{}.ps1", home, plugin_name, plugin_name),
+                            format!("{}\\.psmux\\plugins\\psmux-plugins\\{}\\{}.ps1", home, plugin_name, plugin_name),
+                            // XDG paths
+                            format!("{}\\psmux\\plugins\\{}\\{}.ps1", xdg_config, value.replace('/', "\\"), plugin_name),
+                            format!("{}\\psmux\\plugins\\{}\\{}.ps1", xdg_config, plugin_name, plugin_name),
+                            format!("{}\\psmux\\plugins\\psmux-plugins\\{}\\{}.ps1", xdg_config, plugin_name, plugin_name),
+                        ];
+                        for ps1 in &ps1_candidates {
+                            if std::path::Path::new(ps1).exists() {
+                                // First try static extraction of set/bind commands
+                                if let Ok(content) = std::fs::read_to_string(ps1) {
+                                    let prev_file = current_config_file();
+                                    set_current_config_file(ps1);
+                                    let applied = parse_ps1_plugin_script(app, &content);
+                                    set_current_config_file(&prev_file);
+                                    // If the script uses PS variables (theme plugins),
+                                    // static extraction yields unresolved $vars.
+                                    // Queue for post-startup execution when the
+                                    // server is listening.
+                                    if !applied {
+                                        app.pending_plugin_scripts.push(ps1.clone());
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -434,36 +852,82 @@ pub fn normalize_key_for_binding(key: (KeyCode, KeyModifiers)) -> (KeyCode, KeyM
     }
 }
 
+/// Map a multi-character key name (case-insensitive) to a KeyCode.
+/// Returns None if the name is not recognized.
+fn named_key(name: &str) -> Option<KeyCode> {
+    match name.to_lowercase().as_str() {
+        "space" => Some(KeyCode::Char(' ')),
+        "enter" | "return" => Some(KeyCode::Enter),
+        "tab" => Some(KeyCode::Tab),
+        "btab" | "backtab" => Some(KeyCode::BackTab),
+        "escape" | "esc" => Some(KeyCode::Esc),
+        "bspace" | "backspace" => Some(KeyCode::Backspace),
+        "up" => Some(KeyCode::Up),
+        "down" => Some(KeyCode::Down),
+        "left" => Some(KeyCode::Left),
+        "right" => Some(KeyCode::Right),
+        "home" => Some(KeyCode::Home),
+        "end" => Some(KeyCode::End),
+        "pageup" | "ppage" | "pgup" => Some(KeyCode::PageUp),
+        "pagedown" | "npage" | "pgdn" => Some(KeyCode::PageDown),
+        "insert" | "ic" => Some(KeyCode::Insert),
+        "delete" | "dc" => Some(KeyCode::Delete),
+        "f1" => Some(KeyCode::F(1)),
+        "f2" => Some(KeyCode::F(2)),
+        "f3" => Some(KeyCode::F(3)),
+        "f4" => Some(KeyCode::F(4)),
+        "f5" => Some(KeyCode::F(5)),
+        "f6" => Some(KeyCode::F(6)),
+        "f7" => Some(KeyCode::F(7)),
+        "f8" => Some(KeyCode::F(8)),
+        "f9" => Some(KeyCode::F(9)),
+        "f10" => Some(KeyCode::F(10)),
+        "f11" => Some(KeyCode::F(11)),
+        "f12" => Some(KeyCode::F(12)),
+        _ => None,
+    }
+}
+
 pub fn parse_key_name(name: &str) -> Option<(KeyCode, KeyModifiers)> {
     let name = name.trim();
-    
-    if name.starts_with("C-") || name.starts_with("^") {
-        let ch = if name.starts_with("C-") {
-            name.chars().nth(2)
-        } else {
-            name.chars().nth(1)
-        };
-        if let Some(c) = ch {
-            return Some((KeyCode::Char(c.to_ascii_lowercase()), KeyModifiers::CONTROL));
-        }
+    // Strip surrounding quotes (single or double) — plugins often quote special chars
+    // e.g., bind-key '|' split-window -h
+    let name = if (name.starts_with('\'') && name.ends_with('\'') && name.len() >= 2)
+        || (name.starts_with('"') && name.ends_with('"') && name.len() >= 2) {
+        &name[1..name.len()-1]
+    } else {
+        name
+    };
+
+    // ── Extract all modifier prefixes (C-, M-, S-) then resolve the base key ──
+    // This supports arbitrary combinations: C-Tab, C-S-Tab, C-M-S-Up, etc.
+    let mut rest = name;
+    let mut mods = KeyModifiers::NONE;
+    loop {
+        if rest.starts_with("C-") { mods |= KeyModifiers::CONTROL; rest = &rest[2..]; }
+        else if rest.starts_with("M-") { mods |= KeyModifiers::ALT; rest = &rest[2..]; }
+        else if rest.starts_with("S-") { mods |= KeyModifiers::SHIFT; rest = &rest[2..]; }
+        else if rest.starts_with("^") && rest.len() > 1 { mods |= KeyModifiers::CONTROL; rest = &rest[1..]; }
+        else { break; }
     }
-    
-    if name.starts_with("M-") {
-        if let Some(c) = name.chars().nth(2) {
-            return Some((KeyCode::Char(c.to_ascii_lowercase()), KeyModifiers::ALT));
+
+    if mods != KeyModifiers::NONE {
+        // S-Tab (with or without other modifiers) → BackTab + remaining mods
+        if rest.eq_ignore_ascii_case("Tab") && mods.contains(KeyModifiers::SHIFT) {
+            return Some((KeyCode::BackTab, mods.difference(KeyModifiers::SHIFT)));
         }
-    }
-    
-    if name.starts_with("S-") {
-        let rest = &name[2..];
-        if rest.eq_ignore_ascii_case("Tab") {
-            return Some((KeyCode::BackTab, KeyModifiers::NONE));
+        if let Some(kc) = named_key(rest) {
+            return Some((kc, mods));
         }
-        if let Some(c) = rest.chars().next() {
-            if rest.chars().count() == 1 {
-                return Some((KeyCode::Char(c.to_ascii_uppercase()), KeyModifiers::SHIFT));
+        if rest.chars().count() == 1  {
+            if let Some(c) = rest.chars().next() {
+                if mods.contains(KeyModifiers::SHIFT) {
+                    return Some((KeyCode::Char(c.to_ascii_uppercase()), mods.difference(KeyModifiers::SHIFT)));
+                }
+                return Some((KeyCode::Char(c.to_ascii_lowercase()), mods));
             }
         }
+        // Unrecognized key after modifiers — fall through
     }
     
     match name.to_uppercase().as_str() {
@@ -509,16 +973,56 @@ pub fn parse_key_name(name: &str) -> Option<(KeyCode, KeyModifiers)> {
 
 pub fn source_file(app: &mut AppState, path: &str) {
     let path = path.trim().trim_matches('"').trim_matches('\'');
-    let expanded = if path.starts_with('~') {
-        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-        path.replacen('~', &home, 1)
+
+    // Handle -F flag: expand format strings in the path
+    let (path, format_expand) = if path.starts_with("-F ") || path.starts_with("-F\t") {
+        (path[3..].trim().trim_matches('"').trim_matches('\''), true)
+    } else {
+        (path, false)
+    };
+
+    let expanded_path = if format_expand {
+        crate::format::expand_format(path, app)
     } else {
         path.to_string()
     };
-    
-    if let Ok(content) = std::fs::read_to_string(&expanded) {
+
+    let expanded_path = if expanded_path.starts_with('~') {
+        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+        expanded_path.replacen('~', &home, 1)
+    } else {
+        expanded_path
+    };
+
+    // Normalize path separators for Windows
+    let expanded_path = expanded_path.replace('/', &std::path::MAIN_SEPARATOR.to_string());
+
+    // Fallback: if path references ~/.psmux/ but doesn't exist and the
+    // XDG equivalent (~/.config/psmux/) does, use that instead (issue #135).
+    let expanded_path = if !std::path::Path::new(&expanded_path).exists() {
+        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+        let classic = format!("{}\\.psmux\\", home);
+        if expanded_path.starts_with(&classic) {
+            let xdg_base = env::var("XDG_CONFIG_HOME")
+                .unwrap_or_else(|_| format!("{}\\.config", home));
+            let xdg_alt = expanded_path.replacen(&classic, &format!("{}\\psmux\\", xdg_base), 1);
+            if std::path::Path::new(&xdg_alt).exists() { xdg_alt } else { expanded_path }
+        } else {
+            expanded_path
+        }
+    } else {
+        expanded_path
+    };
+
+    // Save and restore current_config_file around the nested parse
+    let prev_file = current_config_file();
+    set_current_config_file(&expanded_path);
+
+    if let Ok(content) = std::fs::read_to_string(&expanded_path) {
         parse_config_content(app, &content);
     }
+
+    set_current_config_file(&prev_file);
 }
 
 /// Parse a key string like "C-a", "M-x", "F1", "Space" into (KeyCode, KeyModifiers)
@@ -645,6 +1149,7 @@ pub fn format_key_binding(key: &(KeyCode, KeyModifiers)) -> String {
     }
     
     let key_str = match keycode {
+        KeyCode::Char(' ') => "Space".to_string(),
         KeyCode::Char(c) => c.to_string(),
         KeyCode::Enter => "Enter".to_string(),
         KeyCode::Tab => "Tab".to_string(),
@@ -669,34 +1174,280 @@ pub fn format_key_binding(key: &(KeyCode, KeyModifiers)) -> String {
     result
 }
 
-/// Execute a run-shell / run command from config.
+/// Execute a run-shell / run command from config or hooks.
 /// Syntax: run-shell [-b] <command>
-/// Without -b, output is silently discarded (we're in config parsing).
-/// With -b, the command runs in the background.
-fn parse_run_shell(_app: &mut AppState, line: &str) {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 2 { return; }
-    let mut background = false;
+/// Always spawns non-blocking to avoid deadlocks when hooks fire on the
+/// server thread (scripts may call back to psmux via CLI).
+fn parse_run_shell(app: &mut AppState, line: &str) {
+    // Use quote-aware parser to properly handle nested quotes and escapes
+    let args = crate::commands::parse_command_line(line);
+    if args.len() < 2 { return; }
     let mut cmd_parts: Vec<&str> = Vec::new();
-    for p in &parts[1..] {
-        if *p == "-b" { background = true; }
-        else { cmd_parts.push(p); }
+    for arg in &args[1..] {
+        if arg == "-b" { /* background flag — always spawn anyway */ }
+        else { cmd_parts.push(arg); }
     }
     let shell_cmd = cmd_parts.join(" ");
-    // Strip surrounding quotes if present
-    let shell_cmd = shell_cmd.trim_matches(|c| c == '\'' || c == '"');
     if shell_cmd.is_empty() { return; }
 
-    if background {
-        #[cfg(windows)]
-        { let _ = std::process::Command::new("pwsh").args(["-NoProfile", "-Command", shell_cmd]).spawn(); }
-        #[cfg(not(windows))]
-        { let _ = std::process::Command::new("sh").args(["-c", shell_cmd]).spawn(); }
+    // Expand ~ to home directory in the command
+    let shell_cmd = if shell_cmd.contains('~') {
+        let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+        shell_cmd.replace("~/", &format!("{}/", home)).replace("~\\", &format!("{}\\", home))
     } else {
-        #[cfg(windows)]
-        { let _ = std::process::Command::new("pwsh").args(["-NoProfile", "-Command", shell_cmd]).output(); }
-        #[cfg(not(windows))]
-        { let _ = std::process::Command::new("sh").args(["-c", shell_cmd]).output(); }
+        shell_cmd
+    };
+
+    // Fallback: if the command references ~/.psmux/plugins/ but that directory
+    // doesn't exist and ~/.config/psmux/plugins/ does, rewrite the path.
+    // Plugin repos may hardcode ~/.psmux/plugins/ but the TUI installs to
+    // the XDG location (issue #135).
+    let shell_cmd = {
+        let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+        let classic_fwd = format!("{}/.psmux/plugins/", home);
+        let classic_win = format!("{}\\.psmux\\plugins\\", home);
+        if shell_cmd.contains(&classic_fwd) || shell_cmd.contains(&classic_win) {
+            let classic_dir = std::path::Path::new(&home).join(".psmux").join("plugins");
+            let xdg_base = std::env::var("XDG_CONFIG_HOME")
+                .unwrap_or_else(|_| format!("{}\\.config", home));
+            let xdg_dir = std::path::Path::new(&xdg_base).join("psmux").join("plugins");
+            if !classic_dir.is_dir() && xdg_dir.is_dir() {
+                let xdg_fwd = format!("{}/psmux/plugins/", xdg_base.replace('\\', "/"));
+                let xdg_win = format!("{}\\psmux\\plugins\\", xdg_base);
+                shell_cmd.replace(&classic_fwd, &xdg_fwd).replace(&classic_win, &xdg_win)
+            } else {
+                shell_cmd
+            }
+        } else {
+            shell_cmd
+        }
+    };
+
+    // ── Handle .tmux files natively ──────────────────────────────────
+    // .tmux files are bash scripts used by tmux plugins. On Windows they
+    // can't be executed by pwsh. Parse them for `tmux source`, `tmux set`,
+    // etc. and apply the extracted commands as config lines.
+    let trimmed_cmd = shell_cmd.trim().trim_matches('\'').trim_matches('"');
+    if trimmed_cmd.ends_with(".tmux") {
+        let tmux_path = std::path::Path::new(trimmed_cmd);
+        if tmux_path.is_file() {
+            parse_tmux_entry_script(app, tmux_path);
+            return;
+        }
+    }
+    // Also handle .ps1 files natively when possible: if the command is a
+    // bare .ps1 path (no arguments), we can run it directly with pwsh -File
+    // which is more reliable than -Command for script paths with spaces.
+
+    // Always spawn non-blocking: run-shell commands from hooks may call back
+    // to the psmux server (e.g., `psmux set -g @option value`), which would
+    // deadlock if we blocked the server thread with .output().
+    // Set PSMUX_TARGET_SESSION so child scripts connect to the correct server
+    // (especially important when using -L socket namespaces like in tppanel preview).
+    let target_session = app.port_file_base();
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("pwsh");
+        cmd.args(["-NoProfile", "-Command", &shell_cmd]);
+        if !target_session.is_empty() {
+            cmd.env("PSMUX_TARGET_SESSION", &target_session);
+        }
+        let _ = cmd.spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", &shell_cmd]);
+        if !target_session.is_empty() {
+            cmd.env("PSMUX_TARGET_SESSION", &target_session);
+        }
+        let _ = cmd.spawn();
+    }
+}
+
+/// Parse a `.tmux` entry script (bash) and extract tmux commands from it.
+///
+/// .tmux files are the standard entry point for tmux plugins. They are bash
+/// scripts that typically call `tmux source <file>`, `tmux set -g ...`, etc.
+/// On Windows we can't run bash, so we parse the script and translate the
+/// tmux CLI calls into psmux config lines.
+///
+/// Supported patterns:
+/// Parse a .ps1 plugin entry script and extract psmux set/bind commands.
+///
+/// Plugin .ps1 scripts use patterns like:
+///   & $PSMUX set -g key value 2>&1 | Out-Null
+///   & $PSMUX bind-key ...
+///
+/// We extract the psmux command portion and apply it as config.
+/// Returns true if all extracted values are literal (no unresolved PS variables).
+/// Returns false if the script uses PowerShell variables that need runtime eval.
+fn parse_ps1_plugin_script(app: &mut AppState, content: &str) -> bool {
+    let mut has_ps_vars = false;
+    let mut applied_any = false;
+
+    for line in content.lines() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') { continue; }
+
+        // Match patterns like: & $PSMUX set -g ... 2>&1 | Out-Null
+        // Also: & $PSMUX bind-key ... 2>&1 | Out-Null
+        let cmd_start = if let Some(pos) = l.find("$PSMUX ") {
+            // Ensure it's preceded by "& " (PowerShell call operator)
+            let prefix = &l[..pos];
+            if prefix.trim_end().ends_with('&') {
+                Some(pos + 7) // skip "$PSMUX "
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let cmd = match cmd_start {
+            Some(start) => &l[start..],
+            None => continue,
+        };
+
+        // Strip trailing PowerShell noise: 2>&1 | Out-Null, 2>$null
+        let cmd = cmd.split(" 2>&1").next().unwrap_or(cmd);
+        let cmd = cmd.split(" 2>$null").next().unwrap_or(cmd);
+        let cmd = cmd.trim();
+
+        // Check for unresolved PowerShell variables (e.g., $bg1, $fg)
+        // but not $PSMUX or $TMUX which are expected patterns
+        if cmd.contains('$') {
+            // Check if it's a PS variable reference (not env var pattern)
+            let has_var = cmd.split('$').skip(1).any(|part| {
+                let first_word: String = part.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                !first_word.is_empty() && first_word != "PSMUX" && first_word != "TMUX"
+                    && first_word != "env" && first_word != "null"
+            });
+            if has_var { has_ps_vars = true; }
+        }
+
+        if cmd.starts_with("set ") || cmd.starts_with("set-option ")
+            || cmd.starts_with("bind-key ") || cmd.starts_with("bind ")
+            || cmd.starts_with("setw ") || cmd.starts_with("set-window-option ") {
+            if !has_ps_vars {
+                parse_config_line(app, cmd);
+                applied_any = true;
+            }
+        }
+    }
+
+    // Return true if we applied commands and they were all literal
+    applied_any && !has_ps_vars
+}
+
+///   tmux source[-file] "path"       → source-file "path"
+///   tmux set[-option] [-g] key val  → set [-g] key val
+///   tmux setw key val               → setw key val
+///   PLUGIN_DIR=...                  → track for variable expansion
+fn parse_tmux_entry_script(app: &mut AppState, path: &std::path::Path) {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // Determine the directory of the .tmux file for $PLUGIN_DIR / ${PLUGIN_DIR}
+    let plugin_dir = path.parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // Also look for PLUGIN_DIR assignment in the script (may differ)
+    let mut script_plugin_dir = plugin_dir.clone();
+    // Common pattern:  PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    // We can't evaluate bash, so we just use the file's parent directory.
+
+    for line in content.lines() {
+        let l = line.trim();
+        // Skip empty lines, comments, shebang
+        if l.is_empty() || l.starts_with('#') { continue; }
+
+        // Track explicit PLUGIN_DIR assignment (best-effort)
+        if l.starts_with("PLUGIN_DIR=") || l.starts_with("export PLUGIN_DIR=") {
+            // If it's a simple literal path, use it
+            let val = l.splitn(2, '=').nth(1).unwrap_or("").trim_matches('"').trim_matches('\'');
+            if !val.contains('$') && !val.contains('`') && !val.is_empty() {
+                script_plugin_dir = val.to_string();
+            }
+            // Otherwise keep using the .tmux file's parent dir
+            continue;
+        }
+
+        // Skip other bash-isms (variable assignments, if/fi, for, etc.)
+        if l.contains("BASH_SOURCE") || l.starts_with("cd ") || l.starts_with("export ")
+            || l.starts_with("if ") || l == "fi" || l.starts_with("for ")
+            || l.starts_with("done") || l.starts_with("then") || l.starts_with("else")
+            || l.starts_with("local ") || l.starts_with("readonly ") {
+            continue;
+        }
+
+        // Extract tmux commands: look for lines starting with `tmux `
+        let tmux_cmd = if l.starts_with("tmux ") {
+            &l[5..]
+        } else if l.starts_with("\"$TMUX_PROGRAM\" ") || l.starts_with("$TMUX_PROGRAM ") {
+            // Some plugins use $TMUX_PROGRAM variable
+            let start = l.find(' ').unwrap_or(l.len());
+            l[start..].trim()
+        } else {
+            continue;
+        };
+
+        // Expand $PLUGIN_DIR, ${PLUGIN_DIR}, $CURRENT_DIR, ${CURRENT_DIR}
+        let expanded = tmux_cmd
+            .replace("${PLUGIN_DIR}", &script_plugin_dir)
+            .replace("$PLUGIN_DIR", &script_plugin_dir)
+            .replace("${CURRENT_DIR}", &script_plugin_dir)
+            .replace("$CURRENT_DIR", &script_plugin_dir);
+
+        // Now parse the tmux subcommand as a psmux config line
+        let expanded = expanded.trim();
+        if expanded.starts_with("source-file ") || expanded.starts_with("source ") {
+            parse_config_line(app, expanded);
+        } else if expanded.starts_with("set-option ") || expanded.starts_with("set ")
+            || expanded.starts_with("set -g ") {
+            parse_config_line(app, expanded);
+        } else if expanded.starts_with("setw ") || expanded.starts_with("set-window-option ") {
+            parse_config_line(app, expanded);
+        } else if expanded.starts_with("run-shell ") || expanded.starts_with("run ") {
+            parse_config_line(app, expanded);
+        } else if expanded.starts_with("bind-key ") || expanded.starts_with("bind ") {
+            parse_config_line(app, expanded);
+        } else if expanded.starts_with("if-shell ") || expanded.starts_with("if ") {
+            parse_config_line(app, expanded);
+        } else if expanded.starts_with("set-hook ") {
+            parse_config_line(app, expanded);
+        } else {
+            // Try to parse it anyway — it might be a valid config directive
+            parse_config_line(app, expanded);
+        }
+    }
+
+    // Fallback: if we didn't find any tmux commands in the script, try to
+    // source .conf files from the same directory (many themes ship both
+    // .tmux entry script and .conf files).
+    // Check if we actually parsed anything by looking at common indicators
+    // (status-left, status-right being changed from defaults).
+    // For now, also auto-source any *_tmux.conf or *.conf files in the dir.
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                    if ext == "conf" {
+                        let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        // Source companion .conf files (but not the .tmux script itself)
+                        // Prioritize files like plugin_name_options.conf, plugin_name.conf
+                        if fname.ends_with("_tmux.conf") || fname.ends_with("_options_tmux.conf") {
+                            source_file(app, &p.to_string_lossy());
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -753,9 +1504,22 @@ fn parse_if_shell(app: &mut AppState, line: &str) {
 
     let success = if format_mode {
         !condition.is_empty() && condition != "0"
+    } else if condition == "true" || condition == "1" {
+        true
+    } else if condition == "false" || condition == "0" {
+        false
     } else {
         #[cfg(windows)]
-        { std::process::Command::new("pwsh").args(["-NoProfile", "-Command", condition]).status().map(|s| s.success()).unwrap_or(false) }
+        {
+            std::process::Command::new("pwsh")
+                .args(["-NoProfile", "-Command", condition])
+                .status().map(|s| s.success())
+                .unwrap_or_else(|_| {
+                    std::process::Command::new("cmd")
+                        .args(["/c", condition])
+                        .status().map(|s| s.success()).unwrap_or(false)
+                })
+        }
         #[cfg(not(windows))]
         { std::process::Command::new("sh").args(["-c", condition]).status().map(|s| s.success()).unwrap_or(false) }
     };
@@ -766,3 +1530,11 @@ fn parse_if_shell(app: &mut AppState, line: &str) {
         parse_config_line(app, cmd);
     }
 }
+
+#[cfg(test)]
+#[path = "../tests-rs/test_config_plugin_paths.rs"]
+mod tests_plugin_paths;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue137_env_leak.rs"]
+mod tests_issue137_env_leak;

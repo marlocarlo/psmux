@@ -15,7 +15,10 @@
 # 12. choose-client, respawn-window, link-window, unlink-window
 
 $ErrorActionPreference = "Continue"
-$exe = "psmux"
+$exe = "$PSScriptRoot\..\target\release\psmux.exe"
+if (-not (Test-Path $exe)) { $exe = "$PSScriptRoot\..\target\debug\psmux.exe" }
+if (-not (Test-Path $exe)) { $exe = (Get-Command psmux -ErrorAction SilentlyContinue).Source }
+if (-not $exe -or -not (Test-Path $exe)) { Write-Error "psmux binary not found"; exit 1 }
 
 # Helper: cleanup sessions
 function Cleanup-All {
@@ -338,14 +341,26 @@ Test-Assert "unlinkw alias accepted" (-not ($ulwAliasErr -match 'unknown command
 Write-Host "`n[Test Group 15] Binary alias consistency" -ForegroundColor Magenta
 
 # Test 15.1: pmux server-info works
-$pmuxInfo = & pmux -t test-cli server-info 2>&1
-$pmuxInfoStr = ($pmuxInfo | Out-String).Trim()
-Test-Assert "pmux server-info works" ($pmuxInfoStr -match 'psmux') "Got: '$pmuxInfoStr'"
+$pmuxExe = "$PSScriptRoot\..\target\release\pmux.exe"
+if (-not (Test-Path $pmuxExe)) { $pmuxExe = (Get-Command pmux -ErrorAction SilentlyContinue).Source }
+if ($pmuxExe -and (Test-Path $pmuxExe)) {
+    $pmuxInfo = & $pmuxExe -t test-cli server-info 2>&1
+    $pmuxInfoStr = ($pmuxInfo | Out-String).Trim()
+    Test-Assert "pmux server-info works" ($pmuxInfoStr -match 'psmux') "Got: '$pmuxInfoStr'"
+} else {
+    Write-Host "  SKIP: pmux binary not found" -ForegroundColor Yellow
+}
 
-# Test 15.2: tmux server-info works
-$tmuxInfo = & tmux -t test-cli server-info 2>&1
-$tmuxInfoStr = ($tmuxInfo | Out-String).Trim()
-Test-Assert "tmux server-info works" ($tmuxInfoStr -match 'psmux') "Got: '$tmuxInfoStr'"
+# Test 15.2: tmux server-info works (psmux's tmux shim)
+$tmuxExe = "$PSScriptRoot\..\target\release\tmux.exe"
+if (-not (Test-Path $tmuxExe)) { $tmuxExe = (Get-Command tmux -ErrorAction SilentlyContinue).Source }
+if ($tmuxExe -and (Test-Path $tmuxExe)) {
+    $tmuxInfo = & $tmuxExe -t test-cli server-info 2>&1
+    $tmuxInfoStr = ($tmuxInfo | Out-String).Trim()
+    Test-Assert "tmux server-info works" ($tmuxInfoStr -match 'psmux') "Got: '$tmuxInfoStr'"
+} else {
+    Write-Host "  SKIP: tmux binary not found" -ForegroundColor Yellow
+}
 
 # ============================================================
 # Cleanup

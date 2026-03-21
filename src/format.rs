@@ -10,8 +10,8 @@
 use std::env;
 use std::cell::Cell;
 
-use crate::types::*;
-use crate::tree::*;
+use crate::types::{AppState, Node, LayoutKind, Pane, Mode, VERSION};
+use crate::tree::{split_with_gaps, get_active_pane_id, active_pane, count_panes};
 use crate::config::format_key_binding;
 
 // Thread-local override for per-pane format expansion in list-panes.
@@ -95,14 +95,39 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
     let bytes = fmt.as_bytes();
     let len = bytes.len();
     let mut i = 0;
+
+    // Whether the original format contains strftime %-sequences.
+    // If so, we need to escape '%' in expanded variable content so chrono
+    // only interprets the real strftime codes from the original format.
+    let has_strftime = fmt.contains('%');
+
     while i < len {
         if bytes[i] == b'#' && i + 1 < len {
             if bytes[i + 1] == b'{' {
                 // #{...} expression
                 if let Some(close) = find_matching_brace(fmt, i + 2) {
                     let inner = &fmt[i + 2..close];
-                    result.push_str(&expand_expression(inner, app, win_idx));
+                    let expanded = expand_expression(inner, app, win_idx);
+                    if has_strftime {
+                        result.push_str(&escape_strftime_percent(&expanded));
+                    } else {
+                        result.push_str(&expanded);
+                    }
                     i = close + 1;
+                    continue;
+                }
+            }
+            if bytes[i + 1] == b'(' {
+                // #(command) — shell command execution (tmux compat)
+                if let Some(end) = fmt[i + 2..].find(')') {
+                    let cmd = &fmt[i + 2..i + 2 + end];
+                    let output = run_shell_command(cmd);
+                    if has_strftime {
+                        result.push_str(&escape_strftime_percent(&output));
+                    } else {
+                        result.push_str(&output);
+                    }
+                    i = i + 2 + end + 1;
                     continue;
                 }
             }
@@ -114,7 +139,14 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
             }
             // Shorthand #X
             match bytes[i + 1] {
-                b'S' => { result.push_str(&app.session_name); i += 2; continue; }
+                b'S' => {
+                    if has_strftime {
+                        result.push_str(&escape_strftime_percent(&app.session_name));
+                    } else {
+                        result.push_str(&app.session_name);
+                    }
+                    i += 2; continue;
+                }
                 b'I' => {
                     let n = if win_idx < app.windows.len() { win_idx + app.window_base_index } else { 0 };
                     result.push_str(&n.to_string());
@@ -122,7 +154,11 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
                 }
                 b'W' | b'T' => {
                     if let Some(w) = app.windows.get(win_idx) {
-                        result.push_str(&w.name);
+                        if has_strftime {
+                            result.push_str(&escape_strftime_percent(&w.name));
+                        } else {
+                            result.push_str(&w.name);
+                        }
                     }
                     i += 2; continue;
                 }
@@ -140,14 +176,23 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
                     i += 2; continue;
                 }
                 b'H' | b'h' => {
-                    result.push_str(&hostname_cached());
+                    if has_strftime {
+                        result.push_str(&escape_strftime_percent(&hostname_cached()));
+                    } else {
+                        result.push_str(&hostname_cached());
+                    }
                     i += 2; continue;
                 }
                 b'D' => {
                     // tmux: #D = unique pane id (like %0, %1)
                     if let Some(w) = app.windows.get(win_idx) {
                         let active_id = get_active_pane_id(&w.root, &w.active_path).unwrap_or(0);
-                        result.push_str(&format!("%{}", active_id));
+                        if has_strftime {
+                            // Escape the '%' so chrono doesn't misinterpret %0, %1, etc.
+                            result.push_str(&format!("%%{}", active_id));
+                        } else {
+                            result.push_str(&format!("%{}", active_id));
+                        }
                     }
                     i += 2; continue;
                 }
@@ -155,14 +200,20 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
                 _ => {}
             }
         }
-        result.push(bytes[i] as char);
-        i += 1;
+        // Advance by full UTF-8 character (not single byte) to preserve
+        // multi-byte chars like ▶ (U+25B6, 3 bytes) and ◀ (U+25C0).
+        if let Some(ch) = fmt[i..].chars().next() {
+            result.push(ch);
+            i += ch.len_utf8();
+        } else {
+            i += 1;
+        }
     }
     // Expand strftime %-sequences only if the ORIGINAL format contained '%'
-    if fmt.contains('%') && result.contains('%') {
+    if has_strftime && result.contains('%') {
         // Use write! to catch chrono format errors instead of panicking.
-        // The result string may contain user content (e.g. pane titles) with stray
-        // '%' characters that chrono can't parse as strftime specifiers.
+        // Expanded variable content has '%' escaped to '%%' above, so chrono
+        // will only interpret the real strftime codes from the original format.
         use std::fmt::Write;
         let formatted = chrono::Local::now().format(&result);
         let mut buf = String::with_capacity(result.len() + 32);
@@ -172,6 +223,37 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
         // On error, keep the pre-strftime result as-is
     }
     result
+}
+
+/// Execute a shell command and return its stdout (trimmed).
+/// Used for `#(command)` expansion (tmux compatibility).
+/// Caches results for the lifetime of a single format expansion cycle to
+/// avoid repeated subprocess spawning on every refresh.
+fn run_shell_command(cmd: &str) -> String {
+    use std::process::Command;
+    let output = if cfg!(windows) {
+        Command::new("cmd").args(["/C", cmd]).output()
+    } else {
+        Command::new("sh").args(["-c", cmd]).output()
+    };
+    match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Escape '%' to '%%' in expanded variable content so chrono's strftime
+/// doesn't misinterpret user content (pane titles, pane IDs, etc.) as
+/// format specifiers.
+#[inline]
+fn escape_strftime_percent(s: &str) -> String {
+    if s.contains('%') {
+        s.replace('%', "%%")
+    } else {
+        s.to_string()
+    }
 }
 
 /// Expand format for a specific pane (used by list-panes -F, loops, etc).
@@ -674,9 +756,14 @@ fn expand_var_or_format(target: &str, app: &AppState, win_idx: usize) -> String 
 }
 
 /// Look up a tmux option by name.
+/// Public wrapper for lookup_option so config.rs can use it for -o flag check.
+pub fn lookup_option_pub(name: &str, app: &AppState) -> Option<String> {
+    lookup_option(name, app)
+}
+
 fn lookup_option(name: &str, app: &AppState) -> Option<String> {
     if name.starts_with('@') {
-        return app.environment.get(name).cloned();
+        return app.user_options.get(name).cloned();
     }
     match name {
         "status-left" => Some(app.status_left.clone()),
@@ -698,6 +785,8 @@ fn lookup_option(name: &str, app: &AppState) -> Option<String> {
         "automatic-rename" => Some(if app.automatic_rename { "on".into() } else { "off".into() }),
         "monitor-activity" => Some(if app.monitor_activity { "on".into() } else { "off".into() }),
         "remain-on-exit" => Some(if app.remain_on_exit { "on".into() } else { "off".into() }),
+        "destroy-unattached" => Some(if app.destroy_unattached { "on".into() } else { "off".into() }),
+        "exit-empty" => Some(if app.exit_empty { "on".into() } else { "off".into() }),
         "set-titles" => Some(if app.set_titles { "on".into() } else { "off".into() }),
         "set-titles-string" => Some(app.set_titles_string.clone()),
         "pane-border-style" => Some(app.pane_border_style.clone()),
@@ -721,10 +810,26 @@ fn lookup_option(name: &str, app: &AppState) -> Option<String> {
         "display-panes-time" => Some(app.display_panes_time_ms.to_string()),
         "focus-events" => Some(if app.focus_events { "on".into() } else { "off".into() }),
         "aggressive-resize" => Some(if app.aggressive_resize { "on".into() } else { "off".into() }),
+        "synchronize-panes" => Some(if app.sync_input { "on".into() } else { "off".into() }),
         "monitor-silence" => Some(app.monitor_silence.to_string()),
         "bell-action" => Some(app.bell_action.clone()),
         "visual-bell" => Some(if app.visual_bell { "on".into() } else { "off".into() }),
-        _ => app.environment.get(name).cloned(),
+        "claude-code-fix-tty" => Some(if app.claude_code_fix_tty { "on".into() } else { "off".into() }),
+        "claude-code-force-interactive" => Some(if app.claude_code_force_interactive { "on".into() } else { "off".into() }),
+        _ => {
+            // Try user_options first (plugins store @cpu_percentage etc.),
+            // then environment, then @name fallback for plugin compat
+            // (format strings use #{cpu_percentage} without the @ prefix).
+            app.user_options.get(name).cloned()
+                .or_else(|| app.environment.get(name).cloned())
+                .or_else(|| {
+                    if !name.starts_with('@') {
+                        app.user_options.get(&format!("@{}", name)).cloned()
+                    } else {
+                        None
+                    }
+                })
+        }
     }
 }
 
@@ -773,7 +878,7 @@ fn expand_boolean_and(body: &str, app: &AppState, win_idx: usize) -> String {
 
 #[inline]
 fn is_truthy(s: &str) -> bool {
-    !s.is_empty() && s != "0"
+    !s.is_empty() && s != "0" && s != "off" && s != "no"
 }
 
 // ─────────────────── conditional ─────────────────────────────────
@@ -910,12 +1015,15 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
             let mut f = String::new();
             if win_idx == app.active_idx { f.push('*'); }
             else if win_idx == app.last_window_idx { f.push('-'); }
+            if win.zoom_saved.is_some() { f.push('Z'); }
             if win.activity_flag { f.push('#'); }
+            if win.bell_flag { f.push('!'); }
+            if win.silence_flag { f.push('~'); }
             f
         }
         "window_id" => format!("@{}", win.id),
         "window_activity_flag" => if win.activity_flag { "1".into() } else { "0".into() },
-        "window_zoomed_flag" => if app.zoom_saved.is_some() && win_idx == app.active_idx { "1".into() } else { "0".into() },
+        "window_zoomed_flag" => if win.zoom_saved.is_some() { "1".into() } else { "0".into() },
         "window_layout" | "window_visible_layout" => generate_window_layout(&win.root, app.last_window_area),
         "window_width" => app.last_window_area.width.to_string(),
         "window_height" => app.last_window_area.height.to_string(),
@@ -965,16 +1073,32 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
                 }
             } else { String::new() }
         }
-        "pane_current_path" | "pane_path" => {
+        "pane_current_path" => {
             if let Some(p) = target_pane() {
+                // Layer 1: PEB walk (authoritative for local processes)
                 if let Some(pid) = p.child_pid {
-                    crate::platform::process_info::get_foreground_cwd(pid)
-                        .unwrap_or_default()
-                } else {
-                    std::env::current_dir()
-                        .map(|d| d.to_string_lossy().into_owned())
-                        .unwrap_or_default()
+                    if let Some(cwd) = crate::platform::process_info::get_foreground_cwd(pid) {
+                        return cwd;
+                    }
                 }
+                // Layer 2: OSC 7 path (works over SSH/WSL where PEB fails)
+                if let Ok(parser) = p.term.lock() {
+                    if let Some(osc_path) = parser.screen().path() {
+                        return osc_path.to_string();
+                    }
+                }
+                // Layer 3: fallback to server CWD
+                std::env::current_dir()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            } else { String::new() }
+        }
+        "pane_path" => {
+            // Pure OSC 7 value (tmux-compatible: only what the shell announced)
+            if let Some(p) = target_pane() {
+                if let Ok(parser) = p.term.lock() {
+                    parser.screen().path().unwrap_or_default().to_string()
+                } else { String::new() }
             } else { String::new() }
         }
         "pane_pid" => {
@@ -1246,15 +1370,18 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "client_session" | "client_last_session" => app.session_name.clone(),
         "client_name" | "client_tty" => "client0".into(),
         "client_pid" => std::process::id().to_string(),
-        "client_prefix" => match app.mode { Mode::Prefix { .. } => "1".into(), _ => "0".into() },
+        "client_prefix" => if app.client_prefix_active || matches!(app.mode, Mode::Prefix { .. }) { "1".into() } else { "0".into() },
         "client_activity" | "client_created" => app.created_at.timestamp().to_string(),
         "client_activity_string" | "client_created_string" => app.created_at.format("%a %b %e %H:%M:%S %Y").to_string(),
         "client_control_mode" => "0".into(),
         "client_flags" => "focused".into(),
-        "client_key_table" => match app.mode {
-            Mode::Prefix { .. } => "prefix".into(),
-            Mode::CopyMode => "copy-mode-vi".into(),
-            _ => "root".into(),
+        "client_key_table" => if app.client_prefix_active || matches!(app.mode, Mode::Prefix { .. }) {
+            "prefix".into()
+        } else {
+            match app.mode {
+                Mode::CopyMode => "copy-mode-vi".into(),
+                _ => "root".into(),
+            }
         },
         "client_termname" | "client_termtype" => env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
         "client_termfeatures" => "256,RGB,title".into(),
@@ -1266,6 +1393,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         // ── Server ──
         "host" | "hostname" => hostname_cached(),
         "host_short" => { let h = hostname_cached(); h.split('.').next().unwrap_or(&h).to_string() }
+        "user" | "username" => env::var("USERNAME").or_else(|_| env::var("USER")).unwrap_or_else(|_| "unknown".into()),
         "pid" | "server_pid" => std::process::id().to_string(),
         "version" => VERSION.to_string(),
         "start_time" => app.created_at.timestamp().to_string(),
@@ -1296,6 +1424,7 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
         "origin_flag" | "insert_flag" | "keypad_cursor_flag" | "keypad_flag" => "0".into(),
         "wrap_flag" => "1".into(),
         "line" | "command" | "command_list_name" | "command_list_alias" | "command_list_usage" | "config_files" => String::new(),
+        "current_file" => crate::config::current_config_file(),
 
         // Anything else: try as option, then env
         _ => {
@@ -1338,7 +1467,8 @@ fn split_at_depth0(s: &str, delim: u8) -> Vec<String> {
     let bytes = s.as_bytes();
     let mut parts = Vec::new();
     let mut start = 0;
-    let mut depth = 0usize;
+    let mut depth = 0usize;       // #{...} nesting depth
+    let mut in_style = false;      // inside #[...] style directive
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'#' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
@@ -1351,7 +1481,23 @@ fn split_at_depth0(s: &str, delim: u8) -> Vec<String> {
             i += 1;
             continue;
         }
-        if bytes[i] == delim && depth == 0 {
+        // Track #[...] style directives — commas inside are NOT delimiters
+        if bytes[i] == b'#' && i + 1 < bytes.len() && bytes[i + 1] == b'[' && !in_style {
+            in_style = true;
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b']' && in_style {
+            in_style = false;
+            i += 1;
+            continue;
+        }
+        // Handle #, (escaped delimiter) – skip over without splitting
+        if bytes[i] == b'#' && i + 1 < bytes.len() && bytes[i + 1] == delim && depth == 0 {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == delim && depth == 0 && !in_style {
             parts.push(s[start..i].to_string());
             start = i + 1;
         }
@@ -1454,119 +1600,5 @@ fn collect_pane_ids(node: &Node, ids: &mut Vec<usize>) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn mock_app() -> AppState {
-        let mut app = AppState::new("test_session".to_string());
-        app.window_base_index = 0;
-        app
-    }
-
-    #[test]
-    fn test_literal_modifier() {
-        let app = mock_app();
-        assert_eq!(expand_expression("l:hello", &app, 0), "hello");
-    }
-
-    #[test]
-    fn test_trim_modifier() {
-        let app = mock_app();
-        let result = expand_expression("=3:session_name", &app, 0);
-        assert_eq!(result, "tes");
-    }
-
-    #[test]
-    fn test_trim_negative() {
-        let app = mock_app();
-        let result = expand_expression("=-3:session_name", &app, 0);
-        assert_eq!(result, "ion");
-    }
-
-    #[test]
-    fn test_basename() {
-        let app = mock_app();
-        let val = apply_modifier(&Modifier::Basename, "/usr/src/tmux", &app, 0);
-        assert_eq!(val, "tmux");
-    }
-
-    #[test]
-    fn test_dirname() {
-        let app = mock_app();
-        let val = apply_modifier(&Modifier::Dirname, "/usr/src/tmux", &app, 0);
-        assert_eq!(val, "/usr/src");
-    }
-
-    #[test]
-    fn test_pad() {
-        let app = mock_app();
-        let val = apply_modifier(&Modifier::Pad(10), "foo", &app, 0);
-        assert_eq!(val, "foo       ");
-        let val = apply_modifier(&Modifier::Pad(-10), "foo", &app, 0);
-        assert_eq!(val, "       foo");
-    }
-
-    #[test]
-    fn test_substitute() {
-        let app = mock_app();
-        let val = apply_modifier(
-            &Modifier::Substitute { pattern: "foo".into(), replacement: "bar".into(), case_insensitive: false },
-            "foobar", &app, 0
-        );
-        assert_eq!(val, "barbar");
-    }
-
-    #[test]
-    fn test_math_add() {
-        let app = mock_app();
-        let val = apply_modifier(
-            &Modifier::MathExpr { op: '+', floating: false, decimals: 0 },
-            "3,5", &app, 0
-        );
-        assert_eq!(val, "8");
-    }
-
-    #[test]
-    fn test_math_float_div() {
-        let app = mock_app();
-        let val = apply_modifier(
-            &Modifier::MathExpr { op: '/', floating: true, decimals: 4 },
-            "10,3", &app, 0
-        );
-        assert_eq!(val, "3.3333");
-    }
-
-    #[test]
-    fn test_boolean_or() {
-        let app = mock_app();
-        assert_eq!(expand_expression("||:1,0", &app, 0), "1");
-        assert_eq!(expand_expression("||:0,0", &app, 0), "0");
-    }
-
-    #[test]
-    fn test_boolean_and() {
-        let app = mock_app();
-        assert_eq!(expand_expression("&&:1,1", &app, 0), "1");
-        assert_eq!(expand_expression("&&:1,0", &app, 0), "0");
-    }
-
-    #[test]
-    fn test_comparison_eq() {
-        let app = mock_app();
-        assert_eq!(expand_expression("==:version,version", &app, 0), "1");
-    }
-
-    #[test]
-    fn test_glob_match_fn() {
-        assert!(glob_match("*foo*", "barfoobar", false));
-        assert!(!glob_match("*foo*", "barbaz", false));
-        assert!(glob_match("*FOO*", "barfoobar", true));
-    }
-
-    #[test]
-    fn test_quote() {
-        let app = mock_app();
-        let val = apply_modifier(&Modifier::Quote, "(hello)", &app, 0);
-        assert_eq!(val, "\\(hello\\)");
-    }
-}
+#[path = "../tests-rs/test_format.rs"]
+mod tests;

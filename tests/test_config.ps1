@@ -15,7 +15,7 @@ if (-not (Test-Path $PSMUX)) {
     $PSMUX = "$PSScriptRoot\..\target\release\psmux.exe"
 }
 
-$SESSION_NAME = "config_test_$$"
+$SESSION_NAME = "config_test_$(Get-Random -Maximum 99999)"
 $CONFIG_FILE = "$PSScriptRoot\test_config.conf"
 
 Write-Host "=" * 60

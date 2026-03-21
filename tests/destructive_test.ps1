@@ -181,6 +181,7 @@ $successCycles = 0
 foreach ($i in 1..20) {
     Start-DetachedSession -Name "rapid_$i" | Out-Null
     & $PSMUX kill-session -t "rapid_$i" 2>&1 | Out-Null
+    Start-Sleep -Milliseconds 500
     
     # Verify it's gone
     & $PSMUX has-session -t "rapid_$i" 2>&1 | Out-Null

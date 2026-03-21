@@ -1,7 +1,7 @@
-use std::io::{self, Write};
+use std::io;
 use ratatui::prelude::*;
 
-use crate::types::*;
+use crate::types::{AppState, Pane, Node, LayoutKind, DragState};
 use crate::platform::process_kill;
 
 /// Split an area into sub-rects with 1px gaps between them for separator lines.
@@ -226,8 +226,10 @@ pub fn resize_all_panes(app: &mut AppState) {
                     if rect.width == 0 || rect.height == 0 {
                         return;
                     }
-                    let inner_height = rect.height;
-                    let inner_width = rect.width;
+                    // Clamp to MIN_PANE_DIM so ConPTY never receives a
+                    // dimension small enough to crash the child process.
+                    let inner_height = rect.height.max(crate::pane::MIN_PANE_DIM);
+                    let inner_width = rect.width.max(crate::pane::MIN_PANE_DIM);
                     
                     if pane.last_rows != inner_height || pane.last_cols != inner_width {
                         let _ = pane.master.resize(portable_pty::PtySize { 
@@ -270,6 +272,26 @@ pub fn kill_all_children(node: &mut Node) {
     match node {
         Node::Leaf(p) => { process_kill::kill_process_tree(&mut p.child); }
         Node::Split { children, .. } => { for child in children.iter_mut() { kill_all_children(child); } }
+    }
+}
+
+/// Collect mutable references to all child processes in a tree node.
+fn collect_child_refs<'a>(node: &'a mut Node, out: &mut Vec<&'a mut Box<dyn portable_pty::Child>>) {
+    match node {
+        Node::Leaf(p) => { out.push(&mut p.child); }
+        Node::Split { children, .. } => { for child in children.iter_mut() { collect_child_refs(child, out); } }
+    }
+}
+
+/// Kill all children across multiple windows using a single process snapshot.
+/// Much faster than per-window `kill_all_children` when killing an entire session.
+pub fn kill_all_children_batch(windows: &mut [crate::types::Window]) {
+    let mut all_children: Vec<&mut Box<dyn portable_pty::Child>> = Vec::new();
+    for win in windows.iter_mut() {
+        collect_child_refs(&mut win.root, &mut all_children);
+    }
+    if !all_children.is_empty() {
+        process_kill::kill_process_trees_batch(&mut all_children);
     }
 }
 
@@ -421,6 +443,83 @@ pub fn first_leaf_path(node: &Node) -> Vec<usize> {
     rec(node, &mut Vec::new()).unwrap_or_default()
 }
 
+/// Find the tree path to a pane by its ID.  Returns None if not found.
+pub fn find_path_by_id(node: &Node, id: usize) -> Option<Vec<usize>> {
+    fn rec(n: &Node, id: usize, path: &mut Vec<usize>) -> Option<Vec<usize>> {
+        match n {
+            Node::Leaf(p) => if p.id == id { Some(path.clone()) } else { None },
+            Node::Split { children, .. } => {
+                for (i, c) in children.iter().enumerate() {
+                    path.push(i);
+                    if let Some(p) = rec(c, id, path) { return Some(p); }
+                    path.pop();
+                }
+                None
+            }
+        }
+    }
+    rec(node, id, &mut Vec::new())
+}
+
+/// Collect all leaf pane paths in DFS order.
+fn collect_leaf_paths(node: &Node, path: &mut Vec<usize>, out: &mut Vec<(usize, Vec<usize>)>) {
+    match node {
+        Node::Leaf(p) => out.push((p.id, path.clone())),
+        Node::Split { children, .. } => {
+            for (i, c) in children.iter().enumerate() {
+                path.push(i);
+                collect_leaf_paths(c, path, out);
+                path.pop();
+            }
+        }
+    }
+}
+
+/// Move `pane_id` to the front of the MRU list.
+/// If not present, inserts at front.
+pub fn touch_mru(mru: &mut Vec<usize>, pane_id: usize) {
+    if let Some(pos) = mru.iter().position(|&id| id == pane_id) {
+        mru.remove(pos);
+    }
+    mru.insert(0, pane_id);
+}
+
+/// Remove a pane ID from the MRU list.
+pub fn remove_from_mru(mru: &mut Vec<usize>, pane_id: usize) {
+    mru.retain(|&id| id != pane_id);
+}
+
+/// Get the MRU rank of a pane ID (0 = most recent). Returns usize::MAX if not found.
+pub fn mru_rank(mru: &[usize], pane_id: usize) -> usize {
+    mru.iter().position(|&id| id == pane_id).unwrap_or(usize::MAX)
+}
+
+/// Collect all pane IDs from a tree node (DFS order).
+pub fn collect_pane_ids(node: &Node) -> Vec<usize> {
+    let mut ids = Vec::new();
+    fn rec(node: &Node, ids: &mut Vec<usize>) {
+        match node {
+            Node::Leaf(p) => ids.push(p.id),
+            Node::Split { children, .. } => {
+                for c in children { rec(c, ids); }
+            }
+        }
+    }
+    rec(node, &mut ids);
+    ids
+}
+
+/// Find the next pane path after `active_path` in DFS order (wraps around).
+/// Returns the path of the next pane, or None if there's only one pane.
+pub fn next_leaf_path(node: &Node, active_path: &[usize]) -> Option<Vec<usize>> {
+    let mut leaves = Vec::new();
+    collect_leaf_paths(node, &mut Vec::new(), &mut leaves);
+    if leaves.len() <= 1 { return None; }
+    let pos = leaves.iter().position(|(_, p)| p.as_slice() == active_path).unwrap_or(0);
+    let next = if pos + 1 < leaves.len() { pos + 1 } else { pos.saturating_sub(1) };
+    Some(leaves[next].1.clone())
+}
+
 /// Get the pane ID of the active pane
 pub fn get_active_pane_id(node: &Node, path: &[usize]) -> Option<usize> {
     match node {
@@ -489,7 +588,7 @@ pub fn focus_pane_by_id(app: &mut AppState, pid: usize) {
         let mut path = Vec::new();
         let mut found = None;
         rec(&w.root, &mut path, &mut found, pid);
-        if let Some(p) = found { app.active_idx = wi; let win = &mut app.windows[wi]; win.active_path = p; return; }
+        if let Some(p) = found { app.active_idx = wi; let win = &mut app.windows[wi]; win.active_path = p; touch_mru(&mut win.pane_mru, pid); return; }
     }
 }
 
@@ -560,33 +659,71 @@ pub fn pane_index_in_window(node: &Node, path: &[usize]) -> Option<usize> {
 }
 
 /// Reap exited children from the app. Returns (all_empty, any_pruned).
+/// Fast check: does any pane in this node tree have an exited child?
+/// Uses try_wait() but avoids the full tree rebuild if nothing has exited.
+fn has_any_exited(node: &mut Node) -> bool {
+    match node {
+        Node::Leaf(p) => {
+            if p.dead { return false; } // Already dead, handled
+            matches!(p.child.try_wait(), Ok(Some(_)))
+        }
+        Node::Split { children, .. } => {
+            children.iter_mut().any(|c| has_any_exited(c))
+        }
+    }
+}
+
 pub fn reap_children(app: &mut AppState) -> io::Result<(bool, bool)> {
     let remain = app.remain_on_exit;
     let mut any_pruned = false;
     for i in (0..app.windows.len()).rev() {
+        // Fast path: skip full tree rebuild if no panes have exited
+        if !has_any_exited(&mut app.windows[i].root) {
+            continue;
+        }
         let leaves_before = count_panes(&app.windows[i].root);
+        let active_pane_id = get_active_pane_id(&app.windows[i].root, &app.windows[i].active_path);
         let root = std::mem::replace(&mut app.windows[i].root, Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
         match prune_exited(root, remain) {
             Some(new_root) => {
                 let leaves_after = count_panes(&new_root);
                 if leaves_after < leaves_before {
                     any_pruned = true;
+                    // Clean up MRU: remove IDs of panes that no longer exist
+                    let surviving_ids = collect_pane_ids(&new_root);
+                    app.windows[i].pane_mru.retain(|id| surviving_ids.contains(id));
                 }
                 app.windows[i].root = new_root;
-                if !path_exists(&app.windows[i].root, &app.windows[i].active_path) {
-                    app.windows[i].active_path = first_leaf_path(&app.windows[i].root);
+                // After tree restructuring, the old active_path indices may
+                // still be in-range but point to a different pane (issue #140).
+                // Always verify by pane ID, not just path validity.
+                let current_id = get_active_pane_id(&app.windows[i].root, &app.windows[i].active_path);
+                if current_id != active_pane_id || !path_exists(&app.windows[i].root, &app.windows[i].active_path) {
+                    // The active pane's path shifted due to tree restructuring.
+                    // Try to find it by ID first, then by MRU order (issue #71).
+                    let found = active_pane_id.and_then(|id| find_path_by_id(&app.windows[i].root, id))
+                        .or_else(|| {
+                            app.windows[i].pane_mru.iter()
+                                .find_map(|&id| find_path_by_id(&app.windows[i].root, id))
+                        });
+                    app.windows[i].active_path = found.unwrap_or_else(|| first_leaf_path(&app.windows[i].root));
                 }
             }
             None => {
                 app.windows.remove(i);
                 any_pruned = true;
                 // Adjust active_idx after removing a window
+                let _old = app.active_idx;
                 if !app.windows.is_empty() {
                     if i < app.active_idx {
                         app.active_idx -= 1;
                     } else if app.active_idx >= app.windows.len() {
                         app.active_idx = app.windows.len() - 1;
                     }
+                }
+                if app.active_idx != _old {
+                    crate::debug_log::server_log("switch", &format!(
+                        "REAP: active_idx {} -> {} after removing window at index {}", _old, app.active_idx, i));
                 }
             }
         }

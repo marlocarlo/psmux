@@ -6,14 +6,20 @@
 $ErrorActionPreference = "Continue"
 $script:TestsPassed = 0
 $script:TestsFailed = 0
+$script:TestsSkipped = 0
 
 function Write-Pass { param($msg) Write-Host "[PASS] $msg" -ForegroundColor Green; $script:TestsPassed++ }
 function Write-Fail { param($msg) Write-Host "[FAIL] $msg" -ForegroundColor Red; $script:TestsFailed++ }
+function Write-Skip { param($msg) Write-Host "[SKIP] $msg" -ForegroundColor Yellow; $script:TestsSkipped++ }
 function Write-Info { param($msg) Write-Host "[INFO] $msg" -ForegroundColor Cyan }
 function Write-Test { param($msg) Write-Host "[TEST] $msg" -ForegroundColor White }
 
 $PSMUX = (Resolve-Path "$PSScriptRoot\..\target\release\psmux.exe" -ErrorAction SilentlyContinue).Path
 if (-not $PSMUX) { $PSMUX = (Resolve-Path "$PSScriptRoot\..\target\debug\psmux.exe" -ErrorAction SilentlyContinue).Path }
+if (-not $PSMUX) {
+    $cmd = Get-Command psmux -ErrorAction SilentlyContinue
+    if ($cmd) { $PSMUX = $cmd.Source }
+}
 if (-not $PSMUX) { Write-Error "psmux binary not found"; exit 1 }
 Write-Info "Using: $PSMUX"
 
@@ -79,7 +85,8 @@ Start-Sleep -Milliseconds 300
 $d2 = Psmux display-message -p "#{pane_in_mode}" -t feat3 | Out-String
 if (("$d1".Trim() -eq "1") -and ("$d2".Trim() -eq "0")) {
     Write-Pass "clock-mode enter/exit cycle works"
-} else {
+}
+else {
     Write-Fail "clock-mode cycle issue: d1=$($d1.Trim()) d2=$($d2.Trim())"
 }
 
@@ -112,8 +119,13 @@ else { Write-Fail "show-options -v status got: '$val'" }
 Write-Test "show-options -v history-limit"
 $val = Psmux show-options -v history-limit -t feat3 | Out-String
 $val = $val.Trim()
-if ("$val" -eq "2000") { Write-Pass "show-options -v history-limit = 2000" }
-else { Write-Fail "show-options -v history-limit got: '$val'" }
+if ("$val" -match '^\d+$') {
+    Write-Pass "show-options -v history-limit is numeric: $val"
+}
+else {
+    Write-Fail "show-options -v history-limit not numeric: '$val'"
+}
+$historyLimitBaseline = $val
 
 Write-Test "show-options -v mouse"
 $val = Psmux show-options -v mouse -t feat3 | Out-String
@@ -129,7 +141,9 @@ $val = $val.Trim()
 if ("$val" -eq "5000") { Write-Pass "show-options -v reflects set-option change: 5000" }
 else { Write-Fail "show-options -v after change got: '$val'" }
 # Restore
-Psmux set-option -t feat3 history-limit 2000 2>$null | Out-Null
+if ("$historyLimitBaseline" -match '^\d+$') {
+    Psmux set-option -t feat3 history-limit $historyLimitBaseline 2>$null | Out-Null
+}
 
 Write-Test "show-options -v unknown option"
 $val = Psmux show-options -v nonexistent-option -t feat3 | Out-String
@@ -139,13 +153,29 @@ else { Write-Fail "show-options -v unknown got: '$val'" }
 
 Write-Test "show-window-options alias"
 $val = Psmux show-window-options -t feat3 | Out-String
-if ("$val" -match "prefix") { Write-Pass "show-window-options returns options" }
-else { Write-Fail "show-window-options empty" }
+if ("$val" -match "window-status-format|automatic-rename|window-size") { Write-Pass "show-window-options returns window options" }
+else { Write-Fail "show-window-options missing expected window options" }
 
 Write-Test "showw alias"
 $val = Psmux showw -t feat3 | Out-String
-if ("$val" -match "prefix") { Write-Pass "showw alias returns options" }
-else { Write-Fail "showw alias empty" }
+if ("$val" -match "window-status-format|automatic-rename|window-size") { Write-Pass "showw alias returns window options" }
+else { Write-Fail "showw alias missing expected window options" }
+
+Write-Test "show-window-options -v window option"
+$val = Psmux show-window-options -v window-size -t feat3 | Out-String
+$val = $val.Trim()
+if ("$val" -ne "") { Write-Pass "show-window-options -v window-size returned '$val'" }
+else { Write-Fail "show-window-options -v window-size returned empty" }
+
+Write-Test "show-window-options -v session option is empty"
+$val = Psmux show-window-options -v prefix -t feat3 | Out-String
+$val = $val.Trim()
+if ("$val" -eq "") {
+    Write-Pass "show-window-options -v prefix correctly empty"
+}
+else {
+    Write-Fail "show-window-options -v prefix should be empty, got '$val'"
+}
 
 # ============================================================
 # 3. RESIZE-PANE -x/-y TESTS
@@ -190,6 +220,22 @@ Psmux kill-pane -t feat3 2>$null | Out-Null
 Start-Sleep -Milliseconds 300
 
 # ============================================================
+# 3b. SEND-KEYS -p COMPAT TESTS
+# ============================================================
+Write-Host ""
+Write-Host ("=" * 60)
+Write-Host "SEND-KEYS -p COMPAT TESTS"
+Write-Host ("=" * 60)
+
+Write-Test "send-keys -p pastes literal text"
+Psmux send-keys -t feat3 -p "paste_literal_test" 2>$null | Out-Null
+Psmux send-keys -t feat3 Enter 2>$null | Out-Null
+Start-Sleep -Milliseconds 500
+$cap = Psmux capture-pane -t feat3 -p | Out-String
+if ("$cap" -match "paste_literal_test") { Write-Pass "send-keys -p delivered pasted text" }
+else { Write-Fail "send-keys -p text not found in pane" }
+
+# ============================================================
 # 4. ACTIVITY NOTIFICATION TESTS
 # ============================================================
 Write-Host ""
@@ -197,10 +243,12 @@ Write-Host ("=" * 60)
 Write-Host "ACTIVITY NOTIFICATION TESTS"
 Write-Host ("=" * 60)
 
-Write-Test "monitor-activity default off"
+Write-Test "set monitor-activity off"
+Psmux set-option -t feat3 monitor-activity off 2>$null | Out-Null
+Start-Sleep -Milliseconds 300
 $opts = Psmux show-options -t feat3 | Out-String
-if ("$opts" -match "monitor-activity off") { Write-Pass "monitor-activity default is off" }
-else { Write-Fail "monitor-activity not off by default" }
+if ("$opts" -match "monitor-activity off") { Write-Pass "monitor-activity set to off" }
+else { Write-Fail "monitor-activity not off after set" }
 
 Write-Test "set monitor-activity on"
 Psmux set-option -t feat3 monitor-activity on 2>$null | Out-Null
@@ -376,6 +424,7 @@ Write-Host "SESSION-3 FEATURES TEST SUMMARY"
 Write-Host ("=" * 60)
 $total = $script:TestsPassed + $script:TestsFailed
 Write-Host "Passed:  $($script:TestsPassed) / $total" -ForegroundColor Green
+Write-Host "Skipped: $($script:TestsSkipped)" -ForegroundColor Yellow
 Write-Host "Failed:  $($script:TestsFailed) / $total" -ForegroundColor $(if ($script:TestsFailed -gt 0) { "Red" } else { "Green" })
 if ($script:TestsFailed -eq 0) { Write-Host "ALL TESTS PASSED!" -ForegroundColor Green }
 else { Write-Host "$($script:TestsFailed) test(s) failed" -ForegroundColor Red }

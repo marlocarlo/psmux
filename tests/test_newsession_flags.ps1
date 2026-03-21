@@ -78,16 +78,18 @@ if ($out -match "already exists") {
     $fail++
 }
 
-# Test 6: tmux new -d (no session name, should use 'default')
-Write-Host "`n=== Test 6: tmux new -d (default name) ===" -ForegroundColor Cyan
+# Test 6: tmux new -d (no session name, should auto-number like tmux)
+Write-Host "`n=== Test 6: tmux new -d (auto-numbered name) ===" -ForegroundColor Cyan
 $out = & $exe new -d 2>&1 | Out-String
 $code = $LASTEXITCODE
 Start-Sleep 1
-if ($code -eq 0 -and (Test-Path "$env:USERPROFILE\.psmux\default.port")) {
-    Write-Host "PASS: Default session created (exit=$code)" -ForegroundColor Green
+# Should create a numeric session (0, 1, 2, ...) — check ls output
+$lsOut = & $exe ls 2>&1 | Out-String
+if ($code -eq 0 -and $lsOut -match "^\d+:") {
+    Write-Host "PASS: Auto-numbered session created (exit=$code)" -ForegroundColor Green
     $pass++
 } else {
-    Write-Host "FAIL: exit=$code, output=$out" -ForegroundColor Red
+    Write-Host "FAIL: exit=$code, output=$lsOut" -ForegroundColor Red
     $fail++
 }
 
@@ -172,15 +174,15 @@ if ($out -match "my-session:" -and $out -match "work:") {
     $fail++
 }
 
-# Test 12: tmux new -d (with existing sessions, creates "default")
-Write-Host "`n=== Test 12: tmux new -d (creates default alongside others) ===" -ForegroundColor Cyan
+# Test 12: tmux new -d (with existing sessions, creates auto-numbered session)
+Write-Host "`n=== Test 12: tmux new -d (creates auto-numbered session alongside others) ===" -ForegroundColor Cyan
 $out = & $exe new -d 2>&1 | Out-String
 $code = $LASTEXITCODE
 Start-Sleep 1
 $out2 = & $exe ls 2>&1 | Out-String
 $lines = @($out2.Trim() -split "`n" | Where-Object { $_.Trim() }).Count
-if ($code -eq 0 -and $lines -eq 3 -and $out2 -match "default:") {
-    Write-Host "PASS: 'default' added, total $lines sessions" -ForegroundColor Green
+if ($code -eq 0 -and $lines -eq 3 -and $out2 -match "^\d+:") {
+    Write-Host "PASS: auto-numbered session added, total $lines sessions" -ForegroundColor Green
     Write-Host $out2
     $pass++
 } else {

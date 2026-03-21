@@ -6,6 +6,18 @@
 #   B) Rapid typing (50ms gap) with full JSON parse - stress
 #   C) Burst typing (10ms gap) - pathological fast typing
 
+# WSL availability check
+$wslExe = "$env:SystemRoot\System32\wsl.exe"
+if (-not (Test-Path $wslExe)) {
+    Write-Host "[SKIP] WSL not available (wsl.exe not found)" -ForegroundColor Yellow
+    exit 0
+}
+$distroCheck = & $wslExe --list --quiet 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0 -or $distroCheck.Trim().Length -eq 0) {
+    Write-Host "[SKIP] WSL not available (no distro installed)" -ForegroundColor Yellow
+    exit 0
+}
+
 $exe = ".\target\release\psmux.exe"
 $home_ = $env:USERPROFILE
 $session = "default"

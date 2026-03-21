@@ -1,17 +1,21 @@
 [package]
 name = "psmux"
-version = "0.4.1"
+version = "3.3.0"
 edition = "2021"
 description = "Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal"
 license = "MIT"
-repository = "https://github.com/marlocarlo/psmux"
+repository = "https://github.com/psmux/psmux"
 readme = "README.md"
 keywords = ["terminal", "multiplexer", "tmux", "windows", "powershell"]
 categories = ["command-line-utilities"]
+
+[workspace]
+members = [".", "crates/portable-pty-psmux", "crates/vt100-psmux"]
 exclude = [
     "target/",
     "release/",
     "tests/",
+    "tests-rs/",
     "packages/",
     "psmux-windows-x86_64/",
     ".github/",
@@ -21,10 +25,15 @@ exclude = [
     "*.txt",
 ]
 
+# Disable auto-discovery of integration tests from tests/ directory
+[[test]]
+name = "test_vt100_mouse"
+path = "tests-rs/test_vt100_mouse.rs"
+
 # Windows only
 [target.'cfg(not(windows))'.dependencies]
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Memory",
     "Win32_System_DataExchange",
@@ -43,13 +52,13 @@ name = "tmux"
 path = "src/main.rs"
 
 [dependencies]
-ratatui = "0.26"
-crossterm = "0.28"
-portable-pty = "0.2"
-which = "6"
+ratatui = "0.30"
+crossterm = "0.29"
+portable-pty = { version = "0.9.2", path = "crates/portable-pty-psmux", package = "portable-pty-psmux" }
+which = "8"
 chrono = "0.4"
-vt100 = "0.16"
-unicode-width = "0.1"
+vt100 = { version = "0.16.4", path = "crates/vt100-psmux", package = "vt100-psmux" }
+unicode-width = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 regex = "1"
@@ -59,3 +68,4 @@ glob = "0.3"
 opt-level = 3
 lto = true
 codegen-units = 1
+strip = "symbols"

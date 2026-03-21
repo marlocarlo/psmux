@@ -10,6 +10,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct Pane {
     pub master: Box<dyn MasterPty>,
+    pub writer: Box<dyn std::io::Write + Send>,
     pub child: Box<dyn portable_pty::Child>,
     pub term: Arc<Mutex<vt100::Parser>>,
     pub last_rows: u16,
@@ -32,9 +33,48 @@ pub struct Pane {
     /// Cached VT bridge detection result (for mouse injection).
     /// Updated on first mouse event and refreshed every 2 seconds.
     pub vt_bridge_cache: Option<(Instant, bool)>,
+    /// Cached ENABLE_VIRTUAL_TERMINAL_INPUT query result (for mouse injection).
+    /// When true, the child's console input has VTI set, meaning VT mouse
+    /// sequences can be delivered.  Refreshed every 2 seconds.
+    pub vti_mode_cache: Option<(Instant, bool)>,
+    /// Cached ENABLE_MOUSE_INPUT query result (for mouse injection heuristic).
+    /// When true, the child's console has ENABLE_MOUSE_INPUT set, meaning it
+    /// reads MOUSE_EVENT records via ReadConsoleInputW (crossterm/ratatui apps).
+    /// When false, the child expects VT SGR mouse sequences (nvim, vim).
+    /// Refreshed every 2 seconds.
+    pub mouse_input_cache: Option<(Instant, bool)>,
+    /// Last cursor shape requested by the child process via DECSCUSR (`\x1b[N q`).
+    /// 0 = no override (use PSMUX_CURSOR_STYLE default), 1-6 = DECSCUSR values.
+    pub cursor_shape: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Set by the PTY reader thread when a BEL character (\x07) is detected.
+    /// Consumed by the server loop to set the window's bell_flag.
+    pub bell_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Per-pane copy mode state (tmux-style pane-local copy mode).
     /// Some(_) when this pane is in copy mode, None otherwise.
     pub copy_state: Option<CopyModeState>,
+    /// Per-pane style string (set via `select-pane -P "bg=...,fg=..."`).
+    /// Matches tmux's `window-style` / `window-active-style` pane option.
+    /// Stored for API compatibility; ConPTY rendering doesn't support
+    /// per-pane fg/bg tinting so this is not rendered yet.
+    pub pane_style: Option<String>,
+}
+
+/// Pre-spawned shell ready to be transplanted into a new window instantly.
+/// The shell has already loaded its profile (~470ms for pwsh), so the prompt
+/// appears immediately when the user creates a new window — matching wezterm's
+/// perceived "instant tab" experience.
+pub struct WarmPane {
+    pub master: Box<dyn MasterPty>,
+    pub writer: Box<dyn std::io::Write + Send>,
+    pub child: Box<dyn portable_pty::Child>,
+    pub term: Arc<Mutex<vt100::Parser>>,
+    pub data_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub cursor_shape: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    pub bell_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub child_pid: Option<u32>,
+    pub pane_id: usize,
+    pub rows: u16,
+    pub cols: u16,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -65,6 +105,15 @@ pub struct Window {
     pub manual_rename: bool,
     /// Current position in the named layout cycle (0..4)
     pub layout_index: usize,
+    /// Per-pane MRU (most-recently-used) order: pane IDs ordered by recency.
+    /// Front = most recently focused.  Used for:
+    ///  - Directional navigation tie-breaking (issue #70)
+    ///  - Focus selection after kill-pane (issue #71)
+    pub pane_mru: Vec<usize>,
+    /// Per-window zoom state (tmux parity: each window tracks its own zoom independently).
+    /// When `Some(...)`, one pane in this window is zoomed; the vec stores saved split sizes
+    /// for restoration on unzoom.
+    pub zoom_saved: Option<Vec<(Vec<usize>, Vec<u16>)>>,
 }
 
 /// A menu item for display-menu
@@ -96,6 +145,7 @@ pub struct Hook {
 /// Interactive PTY for popup window (supports fzf, etc.)
 pub struct PopupPty {
     pub master: Box<dyn portable_pty::MasterPty>,
+    pub writer: Box<dyn std::io::Write + Send>,
     pub child: Box<dyn portable_pty::Child>,
     pub term: std::sync::Arc<std::sync::Mutex<vt100::Parser>>,
 }
@@ -182,7 +232,7 @@ pub struct CopyModeState {
     pub search_input_forward: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FocusDir { Left, Right, Up, Down }
 
 pub struct AppState {
@@ -191,6 +241,8 @@ pub struct AppState {
     pub mode: Mode,
     pub escape_time_ms: u64,
     pub repeat_time_ms: u64,
+    /// True when prefix mode was re-armed by a repeatable binding (not initial prefix press).
+    pub prefix_repeating: bool,
     pub prefix_key: (KeyCode, KeyModifiers),
     pub prefix2_key: Option<(KeyCode, KeyModifiers)>,
     pub prediction_dimming: bool,
@@ -233,6 +285,7 @@ pub struct AppState {
     pub current_key_table: Option<String>,
     pub control_rx: Option<mpsc::Receiver<CtrlReq>>,
     pub control_port: Option<u16>,
+    pub session_key: String,
     pub session_name: String,
     /// Numeric session ID (tmux-compatible: $0, $1, $2...).
     pub session_id: usize,
@@ -240,10 +293,15 @@ pub struct AppState {
     /// When set, port/key files are stored as `{socket_name}__{session_name}.port`.
     pub socket_name: Option<String>,
     pub attached_clients: usize,
+    /// Per-client terminal sizes for multi-client resize tracking.
+    pub client_sizes: std::collections::HashMap<u64, (u16, u16)>,
+    /// The most recently active client ID (for window_size="latest").
+    pub latest_client_id: Option<u64>,
     pub created_at: chrono::DateTime<Local>,
     pub next_win_id: usize,
     pub next_pane_id: usize,
-    pub zoom_saved: Option<Vec<(Vec<usize>, Vec<u16>)>>,
+    /// Whether the attached client is currently in prefix mode (for `client_prefix` format var).
+    pub client_prefix_active: bool,
     pub sync_input: bool,
     /// Hooks: map of hook name to list of commands
     pub hooks: std::collections::HashMap<String, Vec<String>>,
@@ -283,19 +341,35 @@ pub struct AppState {
     pub renumber_windows: bool,
     /// automatic-rename: update window name from active pane's running command
     pub automatic_rename: bool,
+    /// allow-rename: allow programs to set window title via escape sequences
+    pub allow_rename: bool,
     /// monitor-activity / visual-activity: stored for compat
     pub monitor_activity: bool,
     pub visual_activity: bool,
+    /// activity-action: what to do on activity ("any", "none", "current", "other")
+    pub activity_action: String,
+    /// silence-action: what to do on silence ("any", "none", "current", "other")
+    pub silence_action: String,
     /// remain-on-exit: keep panes open after process exits
     pub remain_on_exit: bool,
+    /// destroy-unattached: exit server when no clients remain attached
+    pub destroy_unattached: bool,
+    /// exit-empty: exit server when all panes/windows are empty
+    pub exit_empty: bool,
     /// aggressive-resize: resize window to smallest attached client
     pub aggressive_resize: bool,
     /// set-titles: update terminal title
     pub set_titles: bool,
     /// set-titles-string: format for terminal title
     pub set_titles_string: String,
+    /// update-environment: list of env var names to update from client on attach
+    pub update_environment: Vec<String>,
     /// Environment variables set via set-environment
     pub environment: std::collections::HashMap<String, String>,
+    /// User/plugin options (@-prefixed, tmux convention).
+    /// Stored separately from `environment` so they are NOT passed as
+    /// shell environment variables to child panes (#105).
+    pub user_options: std::collections::HashMap<String, String>,
     /// pane-border-style: style for inactive pane borders
     pub pane_border_style: String,
     /// pane-active-border-style: style for active pane borders
@@ -340,6 +414,8 @@ pub struct AppState {
     pub command_history_idx: usize,
     /// status-interval: seconds between status-line refreshes (default 15)
     pub status_interval: u64,
+    /// Last time the status-interval hook was fired
+    pub last_status_interval_fire: std::time::Instant,
     /// status-justify: left, centre, right, absolute-centre
     pub status_justify: String,
     /// main-pane-width: percentage for main pane in main-vertical layout (0 = use 60% heuristic)
@@ -364,6 +440,38 @@ pub struct AppState {
     pub command_aliases: std::collections::HashMap<String, String>,
     /// set-clipboard: "on", "off", "external" (default "on")
     pub set_clipboard: String,
+    /// One-shot clipboard text to be sent to the client via OSC 52 (set by yank, consumed by dump-state).
+    pub clipboard_osc52: Option<String>,
+    /// env-shim: inject a Unix-compatible `env` function into PowerShell panes
+    /// so that `env VAR=val command` syntax works (required by Claude Code, etc.).
+    /// Default: on
+    pub env_shim: bool,
+    /// claude-code-fix-tty: inject a Node.js preload script via NODE_OPTIONS
+    /// that patches process.stdout.isTTY = true inside ConPTY panes.  Works around
+    /// Claude Code's isTTY gate that forces in-process agent mode on Windows
+    /// (claude-code#26244).  Once Claude Code fixes the bug upstream, users can
+    /// disable this with: set -g claude-code-fix-tty off
+    /// Default: on
+    pub claude_code_fix_tty: bool,
+    /// claude-code-force-interactive: set CLAUDE_CODE_FORCE_INTERACTIVE=1 in
+    /// pane environments so Claude Code treats the session as interactive even
+    /// when its own heuristics disagree.  This prevents the non-interactive
+    /// fast-path that bypasses teammateMode entirely.
+    /// Once Claude Code fixes the bug upstream, disable with:
+    ///   set -g claude-code-force-interactive off
+    /// Default: on
+    pub claude_code_force_interactive: bool,
+    /// Last mouse hover position (col, row) for same-coordinate deduplication.
+    /// Windows Terminal suppresses consecutive MOUSE_MOVED at the same position.
+    pub last_hover_pos: Option<(u16, u16)>,
+    /// Transient status-bar message from display-message (without -p).
+    /// Tuple of (message_text, timestamp_when_set).
+    pub status_message: Option<(String, std::time::Instant)>,
+    /// Pre-spawned warm pane: shell already loaded, ready for instant new-window.
+    pub warm_pane: Option<WarmPane>,
+    /// Plugin .ps1 scripts queued during config loading for post-startup execution.
+    /// These need the server to be running (TCP listener) before they can apply.
+    pub pending_plugin_scripts: Vec<String>,
 }
 
 impl AppState {
@@ -376,6 +484,7 @@ impl AppState {
             mode: Mode::Passthrough,
             escape_time_ms: 500,
             repeat_time_ms: 500,
+            prefix_repeating: false,
             prefix_key: (crossterm::event::KeyCode::Char('b'), crossterm::event::KeyModifiers::CONTROL),
             prefix2_key: None,
             prediction_dimming: std::env::var("PSMUX_DIM_PREDICTIONS")
@@ -408,6 +517,7 @@ impl AppState {
             current_key_table: None,
             control_rx: None,
             control_port: None,
+            session_key: String::new(),
             session_name,
             session_id: {
                 static NEXT_SESSION_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -415,10 +525,12 @@ impl AppState {
             },
             socket_name: None,
             attached_clients: 0,
+            client_sizes: std::collections::HashMap::new(),
+            latest_client_id: None,
             created_at: Local::now(),
             next_win_id: 1,
             next_pane_id: 1,
-            zoom_saved: None,
+            client_prefix_active: false,
             sync_input: false,
             hooks: std::collections::HashMap::new(),
             wait_channels: std::collections::HashMap::new(),
@@ -439,13 +551,29 @@ impl AppState {
             word_separators: " -_@".to_string(),
             renumber_windows: false,
             automatic_rename: true,
+            allow_rename: true,
             monitor_activity: false,
             visual_activity: false,
+            activity_action: "other".to_string(),
+            silence_action: "other".to_string(),
             remain_on_exit: false,
+            destroy_unattached: false,
+            exit_empty: true,
             aggressive_resize: false,
             set_titles: false,
             set_titles_string: String::new(),
+            update_environment: vec![
+                "DISPLAY".to_string(),
+                "KRB5CCNAME".to_string(),
+                "SSH_ASKPASS".to_string(),
+                "SSH_AUTH_SOCK".to_string(),
+                "SSH_AGENT_PID".to_string(),
+                "SSH_CONNECTION".to_string(),
+                "WINDOWID".to_string(),
+                "XAUTHORITY".to_string(),
+            ],
             environment: std::collections::HashMap::new(),
+            user_options: std::collections::HashMap::new(),
             pane_border_style: String::new(),
             pane_active_border_style: "fg=green".to_string(),
             window_status_format: "#I:#W#{?window_flags,#{window_flags}, }".to_string(),
@@ -468,6 +596,7 @@ impl AppState {
             command_history: Vec::new(),
             command_history_idx: 0,
             status_interval: 15,
+            last_status_interval_fire: std::time::Instant::now(),
             status_justify: "left".to_string(),
             main_pane_width: 0,
             main_pane_height: 0,
@@ -480,6 +609,14 @@ impl AppState {
             copy_command: String::new(),
             command_aliases: std::collections::HashMap::new(),
             set_clipboard: "on".to_string(),
+            clipboard_osc52: None,
+            env_shim: true,
+            claude_code_fix_tty: true,
+            claude_code_force_interactive: true,
+            last_hover_pos: None,
+            status_message: None,
+            warm_pane: None,
+            pending_plugin_scripts: Vec::new(),
         }
     }
 
@@ -538,42 +675,51 @@ pub struct Bind { pub key: (KeyCode, KeyModifiers), pub action: Action, pub repe
 pub enum CtrlReq {
     NewWindow(Option<String>, Option<String>, bool, Option<String>),  // cmd, name, detached, start_dir
     NewWindowPrint(Option<String>, Option<String>, bool, Option<String>, Option<String>, mpsc::Sender<String>),  // cmd, name, detached, start_dir, format, resp
-    SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<u16>),  // kind, cmd, detached, start_dir, size_percent
+    SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<u16>, mpsc::Sender<String>),  // kind, cmd, detached, start_dir, size_percent, error_resp
     SplitWindowPrint(LayoutKind, Option<String>, bool, Option<String>, Option<u16>, Option<String>, mpsc::Sender<String>),  // kind, cmd, detached, start_dir, size_percent, format, resp
     KillPane,
+    KillPaneById(usize),
     CapturePane(mpsc::Sender<String>),
     CapturePaneStyled(mpsc::Sender<String>, Option<i32>, Option<i32>),
     FocusWindow(usize),
+    /// Temporary focus for -t targeting: server saves/restores active_idx
+    FocusWindowTemp(usize),
     FocusPane(usize),
     FocusPaneByIndex(usize),
+    /// Temporary pane focus for -t targeting
+    FocusPaneTemp(usize),
+    FocusPaneByIndexTemp(usize),
     SessionInfo(mpsc::Sender<String>),
     CapturePaneRange(mpsc::Sender<String>, Option<i32>, Option<i32>),
-    ClientAttach,
-    ClientDetach,
+    ClientAttach(u64),
+    ClientDetach(u64),
     DumpLayout(mpsc::Sender<String>),
-    DumpState(mpsc::Sender<String>),
+    DumpState(mpsc::Sender<String>, bool),  // (resp, allow_nc)
     SendText(String),
     SendKey(String),
     SendPaste(String),
     ZoomPane,
+    PrefixBegin,
+    PrefixEnd,
     CopyEnter,
     CopyEnterPageUp,
     CopyMove(i16, i16),
     CopyAnchor,
     CopyYank,
-    ClientSize(u16, u16),
+    CopyRectToggle,
+    ClientSize(u64, u16, u16),
     FocusPaneCmd(usize),
     FocusWindowCmd(usize),
-    MouseDown(u16,u16),
-    MouseDownRight(u16,u16),
-    MouseDownMiddle(u16,u16),
-    MouseDrag(u16,u16),
-    MouseUp(u16,u16),
-    MouseUpRight(u16,u16),
-    MouseUpMiddle(u16,u16),
-    MouseMove(u16,u16),
-    ScrollUp(u16, u16),
-    ScrollDown(u16, u16),
+    MouseDown(u64,u16,u16),
+    MouseDownRight(u64,u16,u16),
+    MouseDownMiddle(u64,u16,u16),
+    MouseDrag(u64,u16,u16),
+    MouseUp(u64,u16,u16),
+    MouseUpRight(u64,u16,u16),
+    MouseUpMiddle(u64,u16,u16),
+    MouseMove(u64,u16,u16),
+    ScrollUp(u64,u16, u16),
+    ScrollDown(u64,u16, u16),
     NextWindow,
     PrevWindow,
     RenameWindow(String),
@@ -583,6 +729,7 @@ pub enum CtrlReq {
     ListTree(mpsc::Sender<String>),
     ToggleSync,
     SetPaneTitle(String),
+    SetPaneStyle(String),
     SendKeys(String, bool),
     SendKeysX(String),  // send-keys -X copy-mode-command
     SelectPane(String),
@@ -595,6 +742,9 @@ pub enum CtrlReq {
     KillSession,
     HasSession(mpsc::Sender<bool>),
     RenameSession(String),
+    /// Claim a warm server: rename session + send response so CLI knows it's done.
+    /// Fields: session name, optional client CWD, response sender.
+    ClaimSession(String, Option<String>, mpsc::Sender<String>),
     SwapPane(String),
     ResizePane(String, u16),
     SetBuffer(String),
@@ -603,11 +753,12 @@ pub enum CtrlReq {
     ShowBuffer(mpsc::Sender<String>),
     ShowBufferAt(mpsc::Sender<String>, usize),
     DeleteBuffer,
-    DisplayMessage(mpsc::Sender<String>, String),
+    DisplayMessage(mpsc::Sender<String>, String, Option<usize>, bool),  // resp, format, target_pane_idx, set_status_bar
     LastWindow,
     LastPane,
     RotateWindow(bool),
     DisplayPanes,
+    DisplayPaneSelect(usize),
     BreakPane,
     JoinPane(usize),
     RespawnPane,
@@ -619,6 +770,7 @@ pub enum CtrlReq {
     SetOptionUnset(String),  // set-option -u
     SetOptionAppend(String, String),  // set-option -a
     ShowOptions(mpsc::Sender<String>),
+    ShowWindowOptions(mpsc::Sender<String>),
     SourceFile(String),
     MoveWindow(Option<usize>),
     SwapWindow(usize),
@@ -626,7 +778,7 @@ pub enum CtrlReq {
     UnlinkWindow,
     FindWindow(mpsc::Sender<String>, String),
     MovePane(usize),
-    PipePane(String, bool, bool),
+    PipePane(String, bool, bool, bool),
     SelectLayout(String),
     NextLayout,
     ListClients(mpsc::Sender<String>),
@@ -639,6 +791,7 @@ pub enum CtrlReq {
     SaveBuffer(String),
     LoadBuffer(String),
     SetEnvironment(String, String),
+    UnsetEnvironment(String),
     ShowEnvironment(mpsc::Sender<String>),
     SetHook(String, String),
     ShowHooks(mpsc::Sender<String>),
@@ -646,11 +799,14 @@ pub enum CtrlReq {
     KillServer,
     WaitFor(String, WaitForOp),
     DisplayMenu(String, Option<i16>, Option<i16>),
+    DisplayMenuDirect(Menu),
     DisplayPopup(String, u16, u16, bool),
     ConfirmBefore(String, String),
     ClockMode,
     ResizePaneAbsolute(String, u16),
+    ResizePanePercent(String, u8), // axis, percentage (0-100)
     ShowOptionValue(mpsc::Sender<String>, String),
+    ShowWindowOptionValue(mpsc::Sender<String>, String),
     ChooseBuffer(mpsc::Sender<String>),
     ServerInfo(mpsc::Sender<String>),
     SendPrefix,
@@ -663,12 +819,79 @@ pub enum CtrlReq {
     FocusOut,
     CommandPrompt(String),
     ShowMessages(mpsc::Sender<String>),
+    /// Forward raw bytes to the popup PTY (base64-decoded by connection handler)
+    PopupInput(Vec<u8>),
+    /// Close the current overlay (popup, menu, confirm, etc.)
+    OverlayClose,
+    /// Respond to confirm-before prompt (true = yes, false = no)
+    ConfirmRespond(bool),
+    /// Select a menu item by index
+    MenuSelect(usize),
+    /// Navigate menu up/down (delta: -1 = up, +1 = down)
+    MenuNavigate(i32),
 }
 
 /// Global flag set by PTY reader threads when new output arrives.
 /// The server loop checks this to use a shorter recv_timeout, reducing
 /// keystroke-to-display latency for nested shells (e.g. WSL inside pwsh).
 pub static PTY_DATA_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tracked persistent client TCP streams.
+/// Connection handlers register clones here so the server can explicitly
+/// `shutdown()` them before `process::exit(0)`.  Without this, Windows
+/// does not reliably deliver TCP RST on loopback sockets when a process
+/// exits, leaving the client's blocking `read_line()` stuck forever.
+static PERSISTENT_STREAMS: std::sync::Mutex<Vec<std::net::TcpStream>> = std::sync::Mutex::new(Vec::new());
+
+/// Register a persistent client stream (call from connection handler).
+pub fn register_persistent_stream(stream: &std::net::TcpStream) {
+    if let Ok(cloned) = stream.try_clone() {
+        if let Ok(mut v) = PERSISTENT_STREAMS.lock() {
+            v.push(cloned);
+        }
+    }
+}
+
+/// Shut down all tracked persistent client streams so their readers get EOF.
+pub fn shutdown_persistent_streams() {
+    if let Ok(mut v) = PERSISTENT_STREAMS.lock() {
+        for s in v.drain(..) {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+/// Server-push frame senders for persistent (attached) clients.
+/// Instead of clients polling dump-state, the server proactively pushes
+/// serialized frames through these channels whenever state changes.
+/// Each sender feeds a `Receiver<String>` into the persistent connection's
+/// existing writer-thread pipeline (which expects oneshot receivers).
+static FRAME_PUSH_SENDERS: std::sync::Mutex<Vec<std::sync::mpsc::Sender<std::sync::mpsc::Receiver<String>>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Register a persistent connection's resp_tx clone for server-pushed frames.
+pub fn register_frame_sender(tx: std::sync::mpsc::Sender<std::sync::mpsc::Receiver<String>>) {
+    if let Ok(mut v) = FRAME_PUSH_SENDERS.lock() {
+        v.push(tx);
+    }
+}
+
+/// Push a serialized frame to all persistent clients.  Dead senders are pruned.
+pub fn push_frame(frame: &str) {
+    if let Ok(mut senders) = FRAME_PUSH_SENDERS.lock() {
+        senders.retain(|tx| {
+            let (rtx, rrx) = std::sync::mpsc::channel();
+            // Send the frame through a oneshot so it fits the existing writer thread protocol
+            if rtx.send(frame.to_string()).is_err() { return false; }
+            tx.send(rrx).is_ok()
+        });
+    }
+}
+
+/// Check if any persistent clients are registered for push.
+pub fn has_frame_receivers() -> bool {
+    FRAME_PUSH_SENDERS.lock().map_or(false, |v| !v.is_empty())
+}
 
 /// Wait-for operation types
 #[derive(Clone, Copy)]

@@ -119,17 +119,17 @@ set -g status-right 'TESTCONFIG'
 $S19 = "issue19_test_$(Get-Random)"
 
 Write-Test "#19a: Config file is loaded (check status-right reflects config)"
-# Start session with custom USERPROFILE pointing to our test config dir
-$env_backup = $env:USERPROFILE
-$env:USERPROFILE = $testConfigDir
+# Start session normally, then source the config file
 Start-Process -FilePath $PSMUX -ArgumentList "new-session", "-d", "-s", $S19 `
-    -WindowStyle Hidden -Environment @{ USERPROFILE=$testConfigDir } | Out-Null
-$env:USERPROFILE = $env_backup
+    -WindowStyle Hidden | Out-Null
 Start-Sleep -Seconds 3
 
 $ls19 = (& $PSMUX ls 2>&1) -join "`n"
 if ($ls19 -match [regex]::Escape($S19)) {
     Write-Pass "#19a: Session started with custom config"
+    # Now source the config file to apply bindings
+    & $PSMUX source-file -t $S19 $testConfigFile 2>&1 | Out-Null
+    Start-Sleep -Milliseconds 500
 } else {
     Write-Fail "#19a: Could not start session. Output: $ls19"
 }

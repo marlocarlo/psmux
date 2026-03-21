@@ -1,5 +1,5 @@
 # Issue #42 Tests - tmux -V / -v version flag, $TMUX env var, format variables
-# https://github.com/marlocarlo/psmux/issues/42
+# https://github.com/psmux/psmux/issues/42
 $ErrorActionPreference = "Continue"
 $script:TestsPassed = 0
 $script:TestsFailed = 0

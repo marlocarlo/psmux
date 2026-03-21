@@ -1,5 +1,5 @@
 # psmux installation script for Windows
-# Run as: irm https://raw.githubusercontent.com/marlocarlo/psmux/master/scripts/install.ps1 | iex
+# Run as: irm https://raw.githubusercontent.com/psmux/psmux/master/scripts/install.ps1 | iex
 # Or locally: .\scripts\install.ps1
 
 param(
@@ -40,7 +40,7 @@ if ($LocalBuild) {
     Write-Host "Detected architecture: $archLabel" -ForegroundColor Cyan
     
     # Get latest release info
-    $ReleasesUrl = "https://api.github.com/repos/marlocarlo/psmux/releases/latest"
+    $ReleasesUrl = "https://api.github.com/repos/psmux/psmux/releases/latest"
     try {
         $Release = Invoke-RestMethod -Uri $ReleasesUrl -Headers @{ "User-Agent" = "psmux-installer" }
         $Asset = $Release.assets | Where-Object { $_.name -match "$assetPattern.*zip" } | Select-Object -First 1

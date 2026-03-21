@@ -10,8 +10,20 @@ use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, G
 #[cfg(windows)]
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 
-use crate::types::*;
-use crate::tree::*;
+use crate::types::{AppState, Mode, CopyModeState};
+use crate::tree::{active_pane, active_pane_mut};
+
+/// Emit an OSC 52 escape sequence to set the terminal clipboard.
+/// This works over SSH because the sequence travels through the SSH pipe
+/// to the local terminal emulator (e.g. Windows Terminal, iTerm2).
+/// The `writer` should be the client's stdout (not the server's).
+pub fn emit_osc52<W: Write>(writer: &mut W, text: &str) {
+    let encoded = crate::util::base64_encode(text);
+    // OSC 52 ; c ; <base64> ST   (ST = ESC \\ or BEL)
+    // Use BEL (\x07) as ST for broadest terminal compatibility.
+    let _ = write!(writer, "\x1b]52;c;{}\x07", encoded);
+    let _ = writer.flush();
+}
 
 pub fn enter_copy_mode(app: &mut AppState) { 
     app.mode = Mode::CopyMode; 
@@ -212,6 +224,9 @@ pub fn read_from_system_clipboard() -> Option<String> {
             let text = String::from_utf16_lossy(slice);
             GlobalUnlock(hmem);
             let _ = CloseClipboard();
+            // Normalize Windows CRLF to LF — ConPTY expands LF to CRLF on
+            // output, so keeping \r\n produces double-spaced text.
+            let text = text.replace("\r\n", "\n");
             Some(text)
         };
         return result;
@@ -572,6 +587,10 @@ pub fn yank_selection(app: &mut AppState) -> io::Result<()> {
     app.paste_buffers.insert(0, text.clone());
     if app.paste_buffers.len() > 10 { app.paste_buffers.pop(); }
     copy_to_system_clipboard(&text);
+    // Stage text for OSC 52 delivery to the client (works over SSH)
+    if app.set_clipboard != "off" {
+        app.clipboard_osc52 = Some(text.clone());
+    }
     // Pipe to copy-command if configured
     if !app.copy_command.is_empty() {
         let cmd = app.copy_command.clone();
@@ -607,13 +626,13 @@ pub fn paste_latest(app: &mut AppState) -> io::Result<()> {
     if let Some(reg) = app.copy_register.take() {
         if let Some(text) = app.named_registers.get(&reg).cloned() {
             let win = &mut app.windows[app.active_idx];
-            if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.master, "{}", text); }
+            if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.writer, "{}", text); }
         }
         return Ok(());
     }
     if let Some(buf) = app.paste_buffers.first() {
         let win = &mut app.windows[app.active_idx];
-        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.master, "{}", buf); }
+        if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { let _ = write!(p.writer, "{}", buf); }
     }
     Ok(())
 }
@@ -886,15 +905,16 @@ pub fn capture_active_pane_range(app: &mut AppState, s: Option<i32>, e: Option<i
     let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return Ok(None) };
     let parser = match p.term.lock() { Ok(g) => g, Err(_) => return Ok(None) };
     let screen = parser.screen();
-    let rows = p.last_rows as i32;
-    // Negative values mean offset from end of visible area
+    // Negative values are relative to the bottom of the visible area (tmux behavior):
+    // -S -3 means "start 3 lines from the bottom", -E -1 means "1 line from bottom"
+    let bottom = p.last_rows.saturating_sub(1) as i32;
     let start = match s {
-        Some(v) if v < 0 => (rows + v).max(0) as u16,
+        Some(v) if v < 0 => (bottom + v + 1).max(0) as u16,
         Some(v) => (v as u16).min(p.last_rows.saturating_sub(1)),
         None => 0,
     };
     let end = match e {
-        Some(v) if v < 0 => (rows + v).max(0) as u16,
+        Some(v) if v < 0 => (bottom + v + 1).max(0) as u16,
         Some(v) => (v as u16).min(p.last_rows.saturating_sub(1)),
         None => p.last_rows.saturating_sub(1),
     };
@@ -915,14 +935,14 @@ pub fn capture_active_pane_styled(app: &mut AppState, s: Option<i32>, e: Option<
     let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return Ok(None) };
     let parser = match p.term.lock() { Ok(g) => g, Err(_) => return Ok(None) };
     let screen = parser.screen();
-    let rows = p.last_rows as i32;
+    let bottom = p.last_rows.saturating_sub(1) as i32;
     let start_row = match s {
-        Some(v) if v < 0 => (rows + v).max(0) as u16,
+        Some(v) if v < 0 => (bottom + v + 1).max(0) as u16,
         Some(v) => (v as u16).min(p.last_rows.saturating_sub(1)),
         None => 0,
     };
     let end_row = match e {
-        Some(v) if v < 0 => (rows + v).max(0) as u16,
+        Some(v) if v < 0 => (bottom + v + 1).max(0) as u16,
         Some(v) => (v as u16).min(p.last_rows.saturating_sub(1)),
         None => p.last_rows.saturating_sub(1),
     };
@@ -930,9 +950,12 @@ pub fn capture_active_pane_styled(app: &mut AppState, s: Option<i32>, e: Option<
     let mut prev_fg: Option<vt100::Color> = None;
     let mut prev_bg: Option<vt100::Color> = None;
     let mut prev_bold = false;
+    let mut prev_dim = false;
     let mut prev_italic = false;
     let mut prev_underline = false;
+    let mut prev_blink = false;
     let mut prev_inverse = false;
+    let mut prev_hidden = false;
 
     for r in start_row..=end_row {
         // Build the row content, then trim trailing whitespace
@@ -944,22 +967,30 @@ pub fn capture_active_pane_styled(app: &mut AppState, s: Option<i32>, e: Option<
                 let fg = cell.fgcolor();
                 let bg = cell.bgcolor();
                 let bold = cell.bold();
+                let dim = cell.dim();
                 let italic = cell.italic();
                 let underline = cell.underline();
+                let blink = cell.blink();
                 let inverse = cell.inverse();
+                let hidden = cell.hidden();
 
                 // Emit SGR if attributes changed
                 let style_changed = Some(fg) != prev_fg || Some(bg) != prev_bg
-                    || bold != prev_bold || italic != prev_italic
-                    || underline != prev_underline || inverse != prev_inverse;
+                    || bold != prev_bold || dim != prev_dim
+                    || italic != prev_italic
+                    || underline != prev_underline || blink != prev_blink
+                    || inverse != prev_inverse || hidden != prev_hidden;
 
                 let sgr = if style_changed {
                     let mut params = Vec::new();
                     params.push("0".to_string()); // reset first
                     if bold { params.push("1".to_string()); }
+                    if dim { params.push("2".to_string()); }
                     if italic { params.push("3".to_string()); }
                     if underline { params.push("4".to_string()); }
+                    if blink { params.push("5".to_string()); }
                     if inverse { params.push("7".to_string()); }
+                    if hidden { params.push("8".to_string()); }
                     // Foreground
                     match fg {
                         vt100::Color::Default => {}
@@ -983,9 +1014,12 @@ pub fn capture_active_pane_styled(app: &mut AppState, s: Option<i32>, e: Option<
                     prev_fg = Some(fg);
                     prev_bg = Some(bg);
                     prev_bold = bold;
+                    prev_dim = dim;
                     prev_italic = italic;
                     prev_underline = underline;
+                    prev_blink = blink;
                     prev_inverse = inverse;
+                    prev_hidden = hidden;
                     any_style_active = true;
                     Some(format!("\x1b[{}m", params.join(";")))
                 } else {
@@ -1013,9 +1047,12 @@ pub fn capture_active_pane_styled(app: &mut AppState, s: Option<i32>, e: Option<
             prev_fg = None;
             prev_bg = None;
             prev_bold = false;
+            prev_dim = false;
             prev_italic = false;
             prev_underline = false;
+            prev_blink = false;
             prev_inverse = false;
+            prev_hidden = false;
         }
         text.push('\n');
     }
