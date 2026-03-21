@@ -329,12 +329,14 @@ fn run_main() -> io::Result<()> {
                                                 Duration::from_millis(50)
                                             ) {
                                                 let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
+                                                let _ = s.set_nodelay(true);
                                                 // Read session key and authenticate
                                                 let key_path = format!("{}\\.psmux\\{}.key", home, base);
                                                 if let Ok(key) = std::fs::read_to_string(&key_path) {
                                                     let _ = std::io::Write::write_all(&mut s, format!("AUTH {}\n", key.trim()).as_bytes());
                                                 }
                                                 let _ = std::io::Write::write_all(&mut s, b"session-info\n");
+                                                let _ = std::io::Write::flush(&mut s);
                                                 let mut br = std::io::BufReader::new(s);
                                                 let mut line = String::new();
                                                 // Skip "OK" response from AUTH

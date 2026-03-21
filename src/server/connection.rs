@@ -58,8 +58,8 @@ if provided_key != session_key {
 let _ = write_stream.write_all(b"OK\n");
 let _ = write_stream.flush();
 
-// Set short read timeout for batched command processing
-let _ = r.get_ref().set_read_timeout(Some(Duration::from_millis(10)));
+// Set read timeout for batched command processing
+let _ = r.get_ref().set_read_timeout(Some(Duration::from_millis(200)));
 
 // Check for PERSISTENT flag and optional TARGET line
 let mut persistent = false;
