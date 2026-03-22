@@ -580,7 +580,12 @@ match cmd {
         let (rtx, rrx) = mpsc::channel::<bool>();
         let _ = tx.send(CtrlReq::HasSession(rtx));
         if let Ok(exists) = rrx.recv() {
-            if !exists { std::process::exit(1); }
+            if exists {
+                let _ = write_stream.write_all(b"OK\n");
+            } else {
+                let _ = write_stream.write_all(b"ERROR: session not found\n");
+            }
+            let _ = write_stream.flush();
         }
     }
     "rename-session" | "rename" => {
