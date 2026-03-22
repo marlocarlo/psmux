@@ -225,7 +225,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let path = format!("{}\\.psmux\\{}.port", home, name);
-    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok())
+    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.lines().next().unwrap_or("").trim().parse::<u16>().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("can't find session '{}' (no server running)", name)))?;
     let addr = format!("127.0.0.1:{}", port);
     let session_key = read_session_key(&name).unwrap_or_default();
@@ -1132,7 +1132,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                         // Hide warm (standby) sessions from user
                                                         if crate::session::is_warm_session(base) { continue; }
                                                         if let Ok(port_str) = std::fs::read_to_string(e.path()) {
-                                                            if let Ok(p) = port_str.trim().parse::<u16>() {
+                                                            if let Ok(p) = port_str.lines().next().unwrap_or("").trim().parse::<u16>() {
                                                                 let sess_addr = format!("127.0.0.1:{}", p);
                                                                 let sess_key = read_session_key(base).unwrap_or_default();
                                                                 if let Ok(mut ss) = std::net::TcpStream::connect_timeout(
@@ -1228,7 +1228,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                     if ext == "port" {
                                                         if crate::session::is_warm_session(base) { continue; }
                                                         if let Ok(port_str) = std::fs::read_to_string(e.path()) {
-                                                            if let Ok(p) = port_str.trim().parse::<u16>() {
+                                                            if let Ok(p) = port_str.lines().next().unwrap_or("").trim().parse::<u16>() {
                                                                 let sess_addr = format!("127.0.0.1:{}", p);
                                                                 let sess_key = read_session_key(base).unwrap_or_default();
                                                                 let info = if let Ok(mut ss) = std::net::TcpStream::connect_timeout(
@@ -1280,7 +1280,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                     if ext == "port" {
                                                         if crate::session::is_warm_session(base) { continue; }
                                                         if let Ok(ps) = std::fs::read_to_string(e.path()) {
-                                                            if let Ok(p) = ps.trim().parse::<u16>() {
+                                                            if let Ok(p) = ps.lines().next().unwrap_or("").trim().parse::<u16>() {
                                                                 let a = format!("127.0.0.1:{}", p);
                                                                 if std::net::TcpStream::connect_timeout(
                                                                     &a.parse().unwrap(), Duration::from_millis(25)
@@ -1366,7 +1366,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                             let port_path = format!("{}\\.psmux\\{}.port", h, sname);
                                             let key_path = format!("{}\\.psmux\\{}.key", h, sname);
                                             if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                                                if let Ok(port) = port_str.trim().parse::<u16>() {
+                                                if let Ok(port) = port_str.lines().next().unwrap_or("").trim().parse::<u16>() {
                                                     let addr = format!("127.0.0.1:{}", port);
                                                     let sess_key = std::fs::read_to_string(&key_path).unwrap_or_default();
                                                     if let Ok(mut ss) = std::net::TcpStream::connect_timeout(

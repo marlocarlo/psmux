@@ -64,7 +64,7 @@ pub fn cleanup_stale_port_files() {
             let path = entry.path();
             if path.extension().map(|e| e == "port").unwrap_or(false) {
                 if let Ok(port_str) = std::fs::read_to_string(&path) {
-                    if let Ok(port) = port_str.trim().parse::<u16>() {
+                    if let Ok(port) = port_str.lines().next().unwrap_or("").trim().parse::<u16>() {
                         let addr = format!("127.0.0.1:{}", port);
                         if std::net::TcpStream::connect_timeout(
                             &addr.parse().unwrap(),
@@ -85,6 +85,60 @@ pub fn cleanup_stale_port_files() {
             }
         }
     }
+}
+
+/// Read port file and verify the server process is alive.
+/// Port file format: "PORT\nPID" (PID line is optional for backward compat).
+/// Returns (port, addr_string) if alive, None if stale (and cleans up files).
+pub fn read_port_file(session: &str) -> Option<(u16, String)> {
+    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+    let port_path = format!("{}\\.psmux\\{}.port", home, session);
+    let content = std::fs::read_to_string(&port_path).ok()?;
+    let mut lines = content.trim().lines();
+    let port: u16 = lines.next()?.trim().parse().ok()?;
+
+    // If PID line exists, check process liveness before connecting
+    if let Some(pid_str) = lines.next() {
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            if !is_process_alive(pid) {
+                // Stale port file — server is dead, clean up
+                let _ = std::fs::remove_file(&port_path);
+                let key_path = format!("{}\\.psmux\\{}.key", home, session);
+                let _ = std::fs::remove_file(&key_path);
+                return None;
+            }
+        }
+    }
+
+    Some((port, format!("127.0.0.1:{}", port)))
+}
+
+/// Check if a process with the given PID is still running.
+#[cfg(windows)]
+fn is_process_alive(pid: u32) -> bool {
+    use std::ptr;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+        fn GetExitCodeProcess(handle: *mut std::ffi::c_void, exit_code: *mut u32) -> i32;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() || handle == ptr::null_mut() {
+            return false;
+        }
+        let mut exit_code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+        ok != 0 && exit_code == STILL_ACTIVE
+    }
+}
+
+#[cfg(not(windows))]
+fn is_process_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
 /// Read the session key from the key file
@@ -131,7 +185,7 @@ pub fn send_control(line: String) -> io::Result<()> {
     }
     let full_target = env::var("PSMUX_TARGET_FULL").ok();
     let path = format!("{}\\.psmux\\{}.port", home, target);
-    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
+    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.lines().next().unwrap_or("").trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100))?;
@@ -160,7 +214,7 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
     }
     let full_target = env::var("PSMUX_TARGET_FULL").ok();
     let path = format!("{}\\.psmux\\{}.port", home, target);
-    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
+    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.lines().next().unwrap_or("").trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = std::net::TcpStream::connect(&addr)?;
@@ -288,7 +342,7 @@ pub fn list_all_sessions_tree(current_session: &str, current_windows: &[(String,
                     // Hide warm (standby) sessions from choose-tree
                     if is_warm_session(stem) { continue; }
                     if let Ok(port_str) = std::fs::read_to_string(&path) {
-                        if let Ok(port) = port_str.trim().parse::<u16>() {
+                        if let Ok(port) = port_str.lines().next().unwrap_or("").trim().parse::<u16>() {
                             let mtime = entry.metadata()
                                 .and_then(|m| m.modified())
                                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);

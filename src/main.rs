@@ -138,7 +138,7 @@ fn run_main() -> io::Result<()> {
                             let path = entry.path();
                             if path.extension().map(|e| e == "port").unwrap_or(false) {
                                 if let Ok(port_str) = std::fs::read_to_string(&path) {
-                                    if let Ok(file_port) = port_str.trim().parse::<u16>() {
+                                    if let Ok(file_port) = port_str.lines().next().unwrap_or("").trim().parse::<u16>() {
                                         if file_port == port {
                                             if let Some(port_file_base) = path.file_stem().and_then(|s| s.to_str()) {
                                                 // Skip warm (standby) sessions — they are internal-only
@@ -244,7 +244,7 @@ fn run_main() -> io::Result<()> {
                                 if !session_name.starts_with(pfx.as_str()) { continue; }
                             }
                             if let Ok(port_str) = std::fs::read_to_string(&path) {
-                                if let Ok(port) = port_str.trim().parse::<u16>() {
+                                if let Ok(port) = port_str.lines().next().unwrap_or("").trim().parse::<u16>() {
                                     let addr = format!("127.0.0.1:{}", port);
                                     let sess_key = read_session_key(session_name).unwrap_or_default();
                                     if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
@@ -321,41 +321,39 @@ fn run_main() -> io::Result<()> {
                                     } else {
                                         if base.contains("__") { continue; }
                                     }
-                                    if let Ok(port_str) = std::fs::read_to_string(e.path()) {
-                                        if let Ok(_p) = port_str.trim().parse::<u16>() {
-                                            let addr = format!("127.0.0.1:{}", port_str.trim());
-                                            if let Ok(mut s) = std::net::TcpStream::connect_timeout(
-                                                &addr.parse().unwrap(),
-                                                Duration::from_millis(50)
-                                            ) {
-                                                let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
-                                                let _ = s.set_nodelay(true);
-                                                // Read session key and authenticate
-                                                let key_path = format!("{}\\.psmux\\{}.key", home, base);
-                                                if let Ok(key) = std::fs::read_to_string(&key_path) {
-                                                    let _ = std::io::Write::write_all(&mut s, format!("AUTH {}\n", key.trim()).as_bytes());
-                                                }
-                                                let _ = std::io::Write::write_all(&mut s, b"session-info\n");
-                                                let _ = std::io::Write::flush(&mut s);
-                                                let mut br = std::io::BufReader::new(s);
-                                                let mut line = String::new();
-                                                // Skip "OK" response from AUTH
-                                                let _ = br.read_line(&mut line);
-                                                if line.trim() == "OK" {
-                                                    line.clear();
-                                                    let _ = br.read_line(&mut line);
-                                                }
-                                                if !line.trim().is_empty() && line.trim() != "ERROR: Authentication required" { 
-                                                    println!("{}", line.trim_end()); 
-                                                } else { 
-                                                    println!("{}", base); 
-                                                }
-                                            } else {
-                                                // stale port file - remove it along with matching key
-                                                let _ = std::fs::remove_file(e.path());
-                                                let key_path = e.path().with_extension("key");
-                                                let _ = std::fs::remove_file(&key_path);
+                                    // Check port file with PID liveness verification
+                                    if let Some((_port, addr)) = crate::session::read_port_file(base) {
+                                        if let Ok(mut s) = std::net::TcpStream::connect_timeout(
+                                            &addr.parse().unwrap(),
+                                            Duration::from_millis(50)
+                                        ) {
+                                            let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
+                                            let _ = s.set_nodelay(true);
+                                            // Read session key and authenticate
+                                            let key_path = format!("{}\\.psmux\\{}.key", home, base);
+                                            if let Ok(key) = std::fs::read_to_string(&key_path) {
+                                                let _ = std::io::Write::write_all(&mut s, format!("AUTH {}\n", key.trim()).as_bytes());
                                             }
+                                            let _ = std::io::Write::write_all(&mut s, b"session-info\n");
+                                            let _ = std::io::Write::flush(&mut s);
+                                            let mut br = std::io::BufReader::new(s);
+                                            let mut line = String::new();
+                                            // Skip "OK" response from AUTH
+                                            let _ = br.read_line(&mut line);
+                                            if line.trim() == "OK" {
+                                                line.clear();
+                                                let _ = br.read_line(&mut line);
+                                            }
+                                            if !line.trim().is_empty() && line.trim() != "ERROR: Authentication required" {
+                                                println!("{}", line.trim_end());
+                                            } else {
+                                                println!("{}", base);
+                                            }
+                                        } else {
+                                            // TCP connect failed — stale port file
+                                            let _ = std::fs::remove_file(e.path());
+                                            let key_path = e.path().with_extension("key");
+                                            let _ = std::fs::remove_file(&key_path);
                                         }
                                     }
                                 }
@@ -501,7 +499,7 @@ fn run_main() -> io::Result<()> {
                 if std::path::Path::new(&port_path).exists() {
                     // Verify server is actually running
                     let server_alive = if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                        if let Ok(port) = port_str.trim().parse::<u16>() {
+                        if let Ok(port) = port_str.lines().next().unwrap_or("").trim().parse::<u16>() {
                             let addr = format!("127.0.0.1:{}", port);
                             std::net::TcpStream::connect_timeout(
                                 &addr.parse().unwrap(),
@@ -544,7 +542,7 @@ fn run_main() -> io::Result<()> {
                     let warm_port_path = format!("{}\\.psmux\\{}.port", home, warm_base);
                     if std::path::Path::new(&warm_port_path).exists() {
                         if let Ok(warm_port_str) = std::fs::read_to_string(&warm_port_path) {
-                            if let Ok(warm_port) = warm_port_str.trim().parse::<u16>() {
+                            if let Ok(warm_port) = warm_port_str.lines().next().unwrap_or("").trim().parse::<u16>() {
                                 let warm_addr = format!("127.0.0.1:{}", warm_port);
                                 if std::net::TcpStream::connect_timeout(
                                     &warm_addr.parse().unwrap(),
@@ -683,7 +681,7 @@ fn run_main() -> io::Result<()> {
                 }
                 {
                     let server_alive = if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                        if let Ok(port) = port_str.trim().parse::<u16>() {
+                        if let Ok(port) = port_str.lines().next().unwrap_or("").trim().parse::<u16>() {
                             let addr = format!("127.0.0.1:{}", port);
                             std::net::TcpStream::connect_timeout(
                                 &addr.parse().unwrap(),
@@ -1141,7 +1139,7 @@ fn run_main() -> io::Result<()> {
                 let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                 let path = format!("{}\\.psmux\\{}.port", home, target);
                 if let Ok(port_str) = std::fs::read_to_string(&path) {
-                    if let Ok(port) = port_str.trim().parse::<u16>() {
+                    if let Ok(port) = port_str.lines().next().unwrap_or("").trim().parse::<u16>() {
                         let addr = format!("127.0.0.1:{}", port);
                         // Actually authenticate and query the server to ensure it's healthy
                         let session_key = read_session_key(&target).unwrap_or_default();
@@ -2417,7 +2415,7 @@ fn run_main() -> io::Result<()> {
         if std::path::Path::new(&warm_port_path).exists() {
             let warm_key = crate::session::read_session_key(&warm_base).unwrap_or_default();
             if let Ok(port_str) = std::fs::read_to_string(&warm_port_path) {
-                if let Ok(port) = port_str.trim().parse::<u16>() {
+                if let Ok(port) = port_str.lines().next().unwrap_or("").trim().parse::<u16>() {
                     let addr = format!("127.0.0.1:{}", port);
                     if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
                         &addr.parse().unwrap(),

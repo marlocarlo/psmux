@@ -174,7 +174,7 @@ fn spawn_warm_server(app: &AppState) {
     if std::path::Path::new(&warm_port_path).exists() {
         // Check if it's actually alive
         if let Ok(port_str) = std::fs::read_to_string(&warm_port_path) {
-            if let Ok(port) = port_str.trim().parse::<u16>() {
+            if let Ok(port) = port_str.lines().next().unwrap_or("").trim().parse::<u16>() {
                 let addr = format!("127.0.0.1:{}", port);
                 if std::net::TcpStream::connect_timeout(
                     &addr.parse().unwrap(),
@@ -375,7 +375,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     app.session_key = session_key.clone();
 
     let regpath = format!("{}\\{}.port", dir, app.port_file_base());
-    let _ = std::fs::write(&regpath, port.to_string());
+    let _ = std::fs::write(&regpath, format!("{}\n{}", port, std::process::id()));
     let keypath = format!("{}\\{}.key", dir, app.port_file_base());
     let _ = std::fs::write(&keypath, &session_key);
 
