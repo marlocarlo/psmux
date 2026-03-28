@@ -4,6 +4,8 @@
 
 mod types;
 mod platform;
+#[cfg(windows)]
+mod win32_input;
 mod cli;
 mod session;
 mod tree;
@@ -2510,6 +2512,11 @@ fn run_main() -> io::Result<()> {
     enable_raw_mode()?;
     execute!(stdout, EnterAlternateScreen, EnableBlinking, EnableMouseCapture, EnableBracketedPaste)?;
     apply_cursor_style(&mut stdout)?;
+    // Request win32-input-mode from the outer terminal so crossterm receives
+    // full-fidelity key events with correct modifier flags.  Terminals that
+    // don't support this silently ignore the sequence.
+    #[cfg(windows)]
+    { let _ = stdout.write_all(b"\x1b[?9001h"); let _ = stdout.flush(); }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -2547,6 +2554,8 @@ fn run_main() -> io::Result<()> {
 
     // Terminal cleanup — always runs, even on error, to prevent leaked
     // SGR attributes (invisible text), stuck raw mode, or stale cursor style.
+    #[cfg(windows)]
+    { let _ = execute!(terminal.backend_mut(), crossterm::style::Print("\x1b[?9001l")); }
     let _ = disable_raw_mode();
     let out = terminal.backend_mut();
     // Reset all SGR attributes (fg/bg color, bold, hidden, etc.) BEFORE

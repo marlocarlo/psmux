@@ -1182,128 +1182,6 @@ pub mod mouse_inject {
         send_modified_key_event(child_pid, ch, false, true, false)
     }
 
-    /// Inject a modified Enter (VK_RETURN) event via WriteConsoleInputW.
-    ///
-    /// ConPTY cannot reconstruct Shift+Enter from VT sequences (\x1b\r is
-    /// misinterpreted as Alt+Enter).  Native injection delivers the exact
-    /// KEY_EVENT_RECORD with the correct modifier flags, so PSReadLine and
-    /// other console-API-based readers see the true Shift/Ctrl/Alt+Enter.
-    pub fn send_modified_enter_event(child_pid: u32, ctrl: bool, alt: bool, shift: bool) -> bool {
-        unsafe {
-            let had_console = GetConsoleWindow() != 0;
-            FreeConsole();
-
-            if AttachConsole(child_pid) == 0 {
-                debug_log(&format!("send_modified_enter_event: AttachConsole({}) FAILED", child_pid));
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
-                return false;
-            }
-
-            let conin: [u16; 7] = [
-                'C' as u16, 'O' as u16, 'N' as u16,
-                'I' as u16, 'N' as u16, '$' as u16, 0,
-            ];
-            let handle = CreateFileW(
-                conin.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                0,
-                std::ptr::null(),
-            );
-
-            if handle == INVALID_HANDLE || handle == 0 {
-                debug_log(&format!("send_modified_enter_event: CreateFileW(CONIN$) FAILED"));
-                FreeConsole();
-                if had_console { AttachConsole(ATTACH_PARENT_PROCESS); }
-                return false;
-            }
-
-            const KEY_EVENT: u16 = 0x0001;
-            const LEFT_ALT_PRESSED: u32 = 0x0002;
-            const LEFT_CTRL_PRESSED: u32 = 0x0008;
-            const SHIFT_PRESSED: u32 = 0x0010;
-            const VK_RETURN: u16 = 0x0D;
-
-            #[repr(C)]
-            #[derive(Copy, Clone)]
-            struct KEY_EVENT_RECORD {
-                key_down: i32,
-                repeat_count: u16,
-                virtual_key_code: u16,
-                virtual_scan_code: u16,
-                u_char: u16,
-                control_key_state: u32,
-            }
-
-            #[repr(C)]
-            struct KEY_INPUT_RECORD {
-                event_type: u16,
-                _padding: u16,
-                event: KEY_EVENT_RECORD,
-            }
-
-            #[link(name = "user32")]
-            extern "system" {
-                fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
-            }
-
-            let mut flags: u32 = 0;
-            if ctrl  { flags |= LEFT_CTRL_PRESSED; }
-            if alt   { flags |= LEFT_ALT_PRESSED; }
-            if shift { flags |= SHIFT_PRESSED; }
-
-            // MAPVK_VK_TO_VSC = 0
-            let scan = MapVirtualKeyW(VK_RETURN as u32, 0) as u16;
-
-            let records = [
-                KEY_INPUT_RECORD {
-                    event_type: KEY_EVENT,
-                    _padding: 0,
-                    event: KEY_EVENT_RECORD {
-                        key_down: 1,
-                        repeat_count: 1,
-                        virtual_key_code: VK_RETURN,
-                        virtual_scan_code: scan,
-                        u_char: '\r' as u16,
-                        control_key_state: flags,
-                    },
-                },
-                KEY_INPUT_RECORD {
-                    event_type: KEY_EVENT,
-                    _padding: 0,
-                    event: KEY_EVENT_RECORD {
-                        key_down: 0,
-                        repeat_count: 1,
-                        virtual_key_code: VK_RETURN,
-                        virtual_scan_code: scan,
-                        u_char: '\r' as u16,
-                        control_key_state: flags,
-                    },
-                },
-            ];
-
-            let mut written: u32 = 0;
-            let result = WriteConsoleInputW(
-                handle,
-                records.as_ptr() as *const INPUT_RECORD,
-                2,
-                &mut written,
-            );
-
-            debug_log(&format!("send_modified_enter_event: pid={} ctrl={} alt={} shift={} scan=0x{:02X} flags=0x{:04X} => ok={} written={}",
-                child_pid, ctrl, alt, shift, scan, flags, result != 0, written));
-
-            CloseHandle(handle);
-            FreeConsole();
-            if had_console {
-                AttachConsole(ATTACH_PARENT_PROCESS);
-            }
-
-            result != 0 && written >= 1
-        }
-    }
 }
 
 #[cfg(not(windows))]
@@ -1317,7 +1195,6 @@ pub mod mouse_inject {
     pub fn send_bracketed_paste(_pid: u32, _text: &str, _bracket: bool) -> bool { false }
     pub fn send_modified_key_event(_pid: u32, _ch: char, _ctrl: bool, _alt: bool, _shift: bool) -> bool { false }
     pub fn send_alt_key_event(_pid: u32, _ch: char) -> bool { false }
-    pub fn send_modified_enter_event(_pid: u32, _ctrl: bool, _alt: bool, _shift: bool) -> bool { false }
 }
 
 // ---------------------------------------------------------------------------

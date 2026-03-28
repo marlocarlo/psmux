@@ -157,11 +157,10 @@ fn plain_enter_produces_cr() {
 
 #[test]
 fn shift_enter_produces_correct_encoding() {
+    // encode_key_event always produces CSI encoding now.
+    // On Windows, encode_key_win32 is used instead at the call site.
     let ev = key(KeyCode::Enter, KeyModifiers::SHIFT);
     let bytes = encode_key_event(&ev).unwrap();
-    #[cfg(windows)]
-    assert_eq!(bytes, b"\x1b\r", "Shift+Enter on Windows must produce ESC+CR for ConPTY");
-    #[cfg(not(windows))]
     assert_eq!(bytes, b"\x1b[13;2~", "Shift+Enter must produce CSI 13;2~");
 }
 
@@ -183,9 +182,6 @@ fn ctrl_shift_enter_produces_csi_13_6() {
 fn alt_enter_produces_correct_encoding() {
     let ev = key(KeyCode::Enter, KeyModifiers::ALT);
     let bytes = encode_key_event(&ev).unwrap();
-    #[cfg(windows)]
-    assert_eq!(bytes, b"\x1b\r", "Alt+Enter on Windows must produce ESC+CR for ConPTY");
-    #[cfg(not(windows))]
     assert_eq!(bytes, b"\x1b[13;3~", "Alt+Enter must produce CSI 13;3~");
 }
 
@@ -280,29 +276,6 @@ fn paste_bracket_markers_with_normalization() {
         "bracketed paste must normalize line endings; got {:?}", String::from_utf8_lossy(&output));
 }
 
-// ── PR #132: Shift+Enter ConPTY encoding tests ──
-
-#[cfg(windows)]
-#[test]
-fn shift_enter_encoding_for_conpty() {
-    // On Windows, Shift+Enter should produce \x1b\r (ESC+CR) instead of
-    // \x1b[13;2~ which ConPTY drops (code 13 is non-standard).
-    let ev = key(KeyCode::Enter, KeyModifiers::SHIFT);
-    let bytes = encode_key_event(&ev).unwrap();
-    assert_eq!(bytes, b"\x1b\r",
-        "Shift+Enter on Windows must produce ESC+CR for ConPTY compatibility; got {:?}", bytes);
-}
-
-#[cfg(windows)]
-#[test]
-fn alt_enter_encoding_for_conpty() {
-    // Alt+Enter should also produce \x1b\r on Windows
-    let ev = key(KeyCode::Enter, KeyModifiers::ALT);
-    let bytes = encode_key_event(&ev).unwrap();
-    assert_eq!(bytes, b"\x1b\r",
-        "Alt+Enter on Windows must produce ESC+CR for ConPTY; got {:?}", bytes);
-}
-
 // ── Issue #121 (whil0012 follow-up): PSReadLine Shift+Enter via native injection ──
 
 /// augment_enter_shift must remap Alt+Enter → Shift+Enter when physical Shift
@@ -347,14 +320,10 @@ fn ctrl_alt_enter_vt_encoding_works() {
 }
 
 #[test]
-fn shift_alt_enter_on_non_windows_produces_csi() {
-    // On non-Windows, Shift+Alt+Enter should use CSI encoding
+fn shift_alt_enter_produces_csi() {
     let ev = key(KeyCode::Enter, KeyModifiers::SHIFT | KeyModifiers::ALT);
     let bytes = encode_key_event(&ev).unwrap();
-    #[cfg(windows)]
-    assert_eq!(bytes, b"\x1b\r", "Shift+Alt+Enter on Windows → ESC+CR");
-    #[cfg(not(windows))]
-    assert_eq!(bytes, b"\x1b[13;4~", "Shift+Alt+Enter on non-Windows → CSI 13;4~");
+    assert_eq!(bytes, b"\x1b[13;4~", "Shift+Alt+Enter must produce CSI 13;4~");
 }
 
 // ── Issue #134: wrapped directional navigation geometry tests ──
