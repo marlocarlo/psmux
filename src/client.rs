@@ -875,6 +875,15 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         // keyboard to detect the real modifier.
                         #[cfg(windows)]
                         crate::platform::augment_enter_shift(&mut key);
+                        // Win32-input-mode: Shift+letter arrives as Char('a') + SHIFT.
+                        // Normalize to Char('A') to match VT-mode behavior so all
+                        // downstream KeyCode::Char('G') etc. matches work unchanged.
+                        if let KeyCode::Char(c) = key.code {
+                            if key.modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() {
+                                key.code = KeyCode::Char(c.to_ascii_uppercase());
+                                key.modifiers.remove(KeyModifiers::SHIFT);
+                            }
+                        }
                         // During paste suppression, discard duplicate key events.
                         // Timer-based: after right-click copy (no content to match).
                         // Content-matched: after right-click paste (match against clipboard).

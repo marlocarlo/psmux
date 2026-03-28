@@ -907,9 +907,18 @@ pub fn parse_unbind_key(app: &mut AppState, line: &str) {
 /// Normalize a key tuple for binding comparison.
 /// Strips SHIFT from Char events since the character itself encodes shift information.
 /// e.g., '|' already implies Shift was pressed, so (Char('|'), SHIFT) and (Char('|'), NONE) should match.
+/// When win32-input-mode is active, terminals report Shift+i as (Char('i'), SHIFT) rather than
+/// (Char('I'), NONE), so we uppercase lowercase letters before stripping SHIFT.
 pub fn normalize_key_for_binding(key: (KeyCode, KeyModifiers)) -> (KeyCode, KeyModifiers) {
     match key.0 {
-        KeyCode::Char(_) => (key.0, key.1.difference(KeyModifiers::SHIFT)),
+        KeyCode::Char(c) => {
+            let c = if key.1.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            };
+            (KeyCode::Char(c), key.1.difference(KeyModifiers::SHIFT))
+        }
         _ => key,
     }
 }
@@ -1108,43 +1117,15 @@ pub fn parse_key_string(key: &str) -> Option<(KeyCode, KeyModifiers)> {
         }
     }
     
+    // Single characters: preserve original case so uppercase letters like 'I'
+    // register as Char('I'), matching tmux convention where uppercase = Shift.
+    if key_part.len() == 1 {
+        let c = key_part.chars().next().unwrap();
+        return Some((KeyCode::Char(c), mods));
+    }
+
+    // Multi-character named keys (case-insensitive lookup)
     let keycode = match key_part.to_lowercase().as_str() {
-        "a" => KeyCode::Char('a'),
-        "b" => KeyCode::Char('b'),
-        "c" => KeyCode::Char('c'),
-        "d" => KeyCode::Char('d'),
-        "e" => KeyCode::Char('e'),
-        "f" => KeyCode::Char('f'),
-        "g" => KeyCode::Char('g'),
-        "h" => KeyCode::Char('h'),
-        "i" => KeyCode::Char('i'),
-        "j" => KeyCode::Char('j'),
-        "k" => KeyCode::Char('k'),
-        "l" => KeyCode::Char('l'),
-        "m" => KeyCode::Char('m'),
-        "n" => KeyCode::Char('n'),
-        "o" => KeyCode::Char('o'),
-        "p" => KeyCode::Char('p'),
-        "q" => KeyCode::Char('q'),
-        "r" => KeyCode::Char('r'),
-        "s" => KeyCode::Char('s'),
-        "t" => KeyCode::Char('t'),
-        "u" => KeyCode::Char('u'),
-        "v" => KeyCode::Char('v'),
-        "w" => KeyCode::Char('w'),
-        "x" => KeyCode::Char('x'),
-        "y" => KeyCode::Char('y'),
-        "z" => KeyCode::Char('z'),
-        "0" => KeyCode::Char('0'),
-        "1" => KeyCode::Char('1'),
-        "2" => KeyCode::Char('2'),
-        "3" => KeyCode::Char('3'),
-        "4" => KeyCode::Char('4'),
-        "5" => KeyCode::Char('5'),
-        "6" => KeyCode::Char('6'),
-        "7" => KeyCode::Char('7'),
-        "8" => KeyCode::Char('8'),
-        "9" => KeyCode::Char('9'),
         "space" => KeyCode::Char(' '),
         "enter" | "return" => KeyCode::Enter,
         "tab" => KeyCode::Tab,
@@ -1173,23 +1154,7 @@ pub fn parse_key_string(key: &str) -> Option<(KeyCode, KeyModifiers)> {
         "f10" => KeyCode::F(10),
         "f11" => KeyCode::F(11),
         "f12" => KeyCode::F(12),
-        "\"" => KeyCode::Char('"'),
-        "%" => KeyCode::Char('%'),
-        "," => KeyCode::Char(','),
-        "." => KeyCode::Char('.'),
-        ":" => KeyCode::Char(':'),
-        ";" => KeyCode::Char(';'),
-        "[" => KeyCode::Char('['),
-        "]" => KeyCode::Char(']'),
-        "{" => KeyCode::Char('{'),
-        "}" => KeyCode::Char('}'),
-        _ => {
-            if key_part.len() == 1 {
-                KeyCode::Char(key_part.chars().next().unwrap())
-            } else {
-                return None;
-            }
-        }
+        _ => return None,
     };
     
     Some((keycode, mods))

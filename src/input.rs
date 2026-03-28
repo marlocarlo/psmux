@@ -39,7 +39,16 @@ fn write_mouse_event(master: &mut dyn std::io::Write, button: u8, col: u16, row:
     }
 }
 
-pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
+pub fn handle_key(app: &mut AppState, mut key: KeyEvent) -> io::Result<bool> {
+    // Win32-input-mode: Shift+letter arrives as Char('a') + SHIFT.
+    // Normalize to Char('A') to match VT-mode behavior so all
+    // downstream KeyCode::Char('G') etc. matches work unchanged.
+    if let KeyCode::Char(c) = key.code {
+        if key.modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() {
+            key.code = KeyCode::Char(c.to_ascii_uppercase());
+            key.modifiers.remove(KeyModifiers::SHIFT);
+        }
+    }
     match app.mode {
         Mode::Passthrough => {
             // Check switch-client -T key table first
