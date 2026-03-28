@@ -351,17 +351,21 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     // ── Windows paste detection state ──────────────────────────────────
     // On Windows, Ctrl+V paste injects individual Key events BEFORE the
     // Ctrl+V Release event arrives (~184ms later).  We buffer ALL printable
-    // chars for a short 20ms window.  If ≥3 chars arrive within 20ms, it's
+    // chars for a short 5ms window.  If ≥3 chars arrive within 5ms, it's
     // almost certainly a paste — hold the buffer until Ctrl+V Release confirms
     // (up to 300ms), then send as a single bracketed paste (send-paste).
-    // If <3 chars arrive within 20ms, flush them as normal send-text.
+    // If <3 chars arrive within 5ms, flush them as normal send-text.
+    // NOTE: 5ms is short enough that human typing (max ~16 chars/sec = 62ms
+    // between keys) can never trigger the ≥3 char threshold, eliminating
+    // false paste detection while still catching real pastes (which inject
+    // dozens of chars in <2ms).
     // Pending chars being examined for paste detection.
     #[cfg(windows)]
     let mut paste_pend: String = String::new();
     // When the first char of the current pending group arrived.
     #[cfg(windows)]
     let mut paste_pend_start: Option<Instant> = None;
-    // True once the 20ms window showed ≥3 chars — waiting for Ctrl+V Release.
+    // True once the 5ms window showed ≥3 chars — waiting for Ctrl+V Release.
     #[cfg(windows)]
     let mut paste_stage2: bool = false;
     // Set to true when Ctrl+V Release is seen — confirms the burst was a paste.
@@ -722,27 +726,29 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                     paste_pend_start = None;
                     paste_stage2 = false;
                     paste_confirmed = false;
-                } else if !paste_stage2 && elapsed > Duration::from_millis(20) {
-                    // 20ms window expired
+                } else if !paste_stage2 && elapsed > Duration::from_millis(5) {
+                    // 5ms window expired — short enough that human typing
+                    // (max ~16 chars/sec) can never reach ≥3 chars, but
+                    // paste injection (dozens of chars in <2ms) easily does.
                     let has_non_ascii = paste_pend.chars().any(|c| !c.is_ascii());
                     if paste_pend.len() >= 3 && !has_non_ascii {
-                        // ≥3 ASCII chars in 20ms → likely paste, enter stage 2.
+                        // ≥3 ASCII chars in 5ms → likely paste, enter stage 2.
                         // Non-ASCII chars (IME composition, CJK input) are excluded
-                        // because IME routinely generates 3+ chars in <20ms and would
+                        // because IME routinely generates 3+ chars in <5ms and would
                         // trigger a false-positive 300ms delay (fixes #91).
                         paste_stage2 = true;
                         paste_stage2_last_len = paste_pend.len();
                         if input_log_enabled() {
-                            input_log("paste", &format!("stage2: {} chars in 20ms, waiting for Ctrl+V Release", paste_pend.len()));
+                            input_log("paste", &format!("stage2: {} chars in 5ms, waiting for Ctrl+V Release", paste_pend.len()));
                         }
-                    } else if paste_pend.len() >= 20 && has_non_ascii {
-                        // ≥8 non-ASCII chars in 20ms — almost certainly a paste
+                    } else if paste_pend.len() >= 8 && has_non_ascii {
+                        // ≥8 non-ASCII chars in 5ms — almost certainly a paste
                         // containing Unicode content (em-dashes, CJK, etc.), not
                         // IME composition (which rarely exceeds a few chars).
                         paste_stage2 = true;
                         paste_stage2_last_len = paste_pend.len();
                         if input_log_enabled() {
-                            input_log("paste", &format!("stage2 (large non-ASCII): {} chars in 20ms", paste_pend.len()));
+                            input_log("paste", &format!("stage2 (large non-ASCII): {} chars in 5ms", paste_pend.len()));
                         }
                     } else if paste_pend.len() >= 3 && has_non_ascii {
                         // ≥3 chars but contains non-ASCII (IME input) — flush
