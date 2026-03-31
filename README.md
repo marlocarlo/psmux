@@ -119,6 +119,23 @@ See [docker/README.md](docker/README.md) for full details.
 
 If you've used tmux on Linux/macOS and wished you had something like it on Windows, **this is it**. Split panes, multiple windows, session persistence, full mouse support, tmux themes, 76 commands, 126+ format variables, 53 vim copy-mode keys. Your existing `.tmux.conf` works. Full details: **[docs/features.md](docs/features.md)** · **[docs/compatibility.md](docs/compatibility.md)**
 
+## Sora-bluesky fork
+
+This is a minimal-diff fork of psmux maintained for winsmux integration.
+
+Changes:
+
+1. SetPaneTitle redraw fix (`meta_dirty`)
+2. `winsmux` feature flag in `Cargo.toml`
+
+Build:
+
+```powershell
+cargo build --release --features winsmux
+```
+
+Upstream: https://github.com/psmux/psmux
+
 ## Usage
 
 Use `psmux`, `pmux`, or `tmux` — they're identical:
