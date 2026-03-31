@@ -25,6 +25,9 @@ exclude = [
     "*.txt",
 ]
 
+[features]
+winsmux = []
+
 # Disable auto-discovery of integration tests from tests/ directory
 [[test]]
 name = "test_vt100_mouse"
