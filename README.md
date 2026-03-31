@@ -121,18 +121,12 @@ If you've used tmux on Linux/macOS and wished you had something like it on Windo
 
 ## Sora-bluesky fork
 
-This is a minimal-diff fork of psmux maintained for winsmux integration.
+Minimal-diff fork for future [winsmux](https://github.com/Sora-bluesky/winsmux) integration.
 
 Changes:
 
-1. SetPaneTitle redraw fix (`meta_dirty`)
-2. `winsmux` feature flag in `Cargo.toml`
-
-Build:
-
-```powershell
-cargo build --release --features winsmux
-```
+1. SetPaneTitle redraw fix — adds `meta_dirty = true` so pane border repaints after title change
+2. `winsmux` feature flag in `Cargo.toml` (placeholder, no conditional code yet)
 
 Upstream: https://github.com/psmux/psmux
 

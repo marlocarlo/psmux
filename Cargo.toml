@@ -26,6 +26,7 @@ exclude = [
 ]
 
 [features]
+# Reserved for winsmux-specific conditional compilation
 winsmux = []
 
 # Disable auto-discovery of integration tests from tests/ directory
