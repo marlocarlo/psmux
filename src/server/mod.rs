@@ -1378,6 +1378,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::SetPaneTitle(title) => {
                     let win = &mut app.windows[app.active_idx];
                     if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { p.title = title; }
+                    meta_dirty = true;
                 }
                 CtrlReq::SetPaneStyle(style) => {
                     // Per-pane styling (e.g. "bg=default,fg=blue") matching
@@ -3831,7 +3832,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
 #[cfg(test)]
 #[path = "../../tests-rs/test_server.rs"]
 mod tests;
-
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue169_manual_rename.rs"]
 mod test_issue169;
