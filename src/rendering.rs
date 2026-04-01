@@ -124,9 +124,14 @@ pub fn render_window(f: &mut Frame, app: &mut AppState, area: Rect) {
     let window_active_style = app.user_options.get("window-active-style").map(|s| parse_tmux_style(s));
     let border_status = app.user_options.get("pane-border-status").cloned().unwrap_or_else(|| "off".to_string());
     let border_format = app.user_options.get("pane-border-format").cloned().unwrap_or_default();
+    let app_ptr: *const AppState = &*app;
     let win = &mut app.windows[app.active_idx];
     let active_rect = compute_active_rect(&win.root, &win.active_path, area);
-    render_node(f, &mut win.root, &win.active_path, &mut Vec::new(), area, dim_preds, border_style, active_border_style, copy_cursor, active_rect, window_style, window_active_style, &border_status, &border_format, &mut 0);
+    // SAFETY: `render_node` only reads from `app`; the mutable borrow is limited
+    // to the active window's `root`, which is the only field mutated here.
+    unsafe {
+        render_node(f, &*app_ptr, &mut win.root, &win.active_path, &mut Vec::new(), area, dim_preds, border_style, active_border_style, copy_cursor, active_rect, window_style, window_active_style, &border_status, &border_format, &mut 0);
+    }
     fix_border_intersections(f.buffer_mut());
 }
 
@@ -194,6 +199,7 @@ pub fn fix_border_intersections(buf: &mut Buffer) {
 
 pub fn render_node(
     f: &mut Frame,
+    app: &crate::types::AppState,
     node: &mut Node,
     active_path: &Vec<usize>,
     cur_path: &mut Vec<usize>,
@@ -307,8 +313,7 @@ pub fn render_node(
             }
             // Pane border format/status overlay
             if border_status != "off" && !border_format.is_empty() && area.height > 1 {
-                let pane_label = border_format.replace("#{pane_index}", &pane_idx.to_string())
-                    .replace("#P", &pane_idx.to_string());
+                let pane_label = crate::format::expand_format_for_pane(border_format, app, app.active_idx, *pane_idx);
                 let label_width = UnicodeWidthStr::width(pane_label.as_str()) as u16;
                 if label_width > 0 && area.width >= label_width {
                     let label_y = if border_status == "bottom" { area.y + area.height.saturating_sub(1) } else { area.y };
@@ -328,7 +333,7 @@ pub fn render_node(
             for (i, child) in children.iter_mut().enumerate() {
                 cur_path.push(i);
                 if i < rects.len() {
-                    render_node(f, child, active_path, cur_path, rects[i], dim_preds, border_style, active_border_style, copy_cursor, active_rect, window_style, window_active_style, border_status, border_format, pane_idx);
+                    render_node(f, app, child, active_path, cur_path, rects[i], dim_preds, border_style, active_border_style, copy_cursor, active_rect, window_style, window_active_style, border_status, border_format, pane_idx);
                 }
                 cur_path.pop();
             }
