@@ -90,6 +90,9 @@ pub struct Pane {
     pub last_cols: u16,
     pub id: usize,
     pub title: String,
+    /// When true, `infer_title_from_prompt` will not overwrite the title.
+    /// Set by `select-pane -T` (explicit title).  Cleared by `select-pane -T ""`.
+    pub title_locked: bool,
     /// Cached child process PID for Windows console mouse injection.
     /// Lazily extracted on first mouse event.
     pub child_pid: Option<u32>,

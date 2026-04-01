@@ -1934,6 +1934,10 @@ fn dispatch_control_command(
             true
         }
         "select-pane" | "selectp" => {
+            // Handle -T title (set pane title)
+            if let Some(t) = args.windows(2).find(|w| w[0] == "-T").map(|w| w[1].to_string()) {
+                let _ = tx.send(CtrlReq::SetPaneTitle(t));
+            }
             let _ = resp_tx.send(String::new());
             true
         }

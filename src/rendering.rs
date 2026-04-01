@@ -218,7 +218,18 @@ pub fn render_node(
     match node {
         Node::Leaf(pane) => {
             let is_active = *cur_path == *active_path;
-            let inner = area;
+            // Reserve one row for pane-border-status label (top or bottom)
+            let has_border_label = border_status != "off" && !border_format.is_empty() && area.height > 2;
+            let inner = if has_border_label {
+                if border_status == "bottom" {
+                    Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1))
+                } else {
+                    // top (default)
+                    Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1))
+                }
+            } else {
+                area
+            };
             let target_rows = inner.height.max(1);
             let target_cols = inner.width.max(1);
             if pane.last_rows != target_rows || pane.last_cols != target_cols {
@@ -311,16 +322,18 @@ pub fn render_node(
                     f.set_cursor_position((cx, cy));
                 }
             }
-            // Pane border format/status overlay
-            if border_status != "off" && !border_format.is_empty() && area.height > 1 {
+            // Pane border format/status label (rendered in the reserved row)
+            if has_border_label {
                 let pane_label = crate::format::expand_format_for_pane(border_format, app, app.active_idx, *pane_idx);
-                let label_width = UnicodeWidthStr::width(pane_label.as_str()) as u16;
-                if label_width > 0 && area.width >= label_width {
-                    let label_y = if border_status == "bottom" { area.y + area.height.saturating_sub(1) } else { area.y };
-                    let label_area = Rect::new(area.x, label_y, label_width.min(area.width), 1);
-                    let label_style = if is_active { active_border_style } else { border_style };
-                    f.render_widget(Paragraph::new(Line::from(Span::styled(pane_label, label_style))), label_area);
-                }
+                let label_y = if border_status == "bottom" { area.y + area.height.saturating_sub(1) } else { area.y };
+                let label_row = Rect::new(area.x, label_y, area.width, 1);
+                let label_style = if is_active { active_border_style } else { border_style };
+                // Clear the label row first, then render the label text
+                f.render_widget(Clear, label_row);
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(pane_label, label_style))),
+                    label_row,
+                );
             }
             *pane_idx += 1;
         }

@@ -581,6 +581,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         pane_active_border_style: Option<String>,
         #[serde(default)]
         pane_border_hover_style: Option<String>,
+        #[serde(default)]
+        pane_border_status: Option<String>,
+        #[serde(default)]
+        pane_border_format: Option<String>,
         /// window-status-format (short key to save bandwidth)
         #[serde(default)]
         wsf: Option<String>,
@@ -2600,10 +2604,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 }
             }
 
-            fn render_json(f: &mut Frame, node: &LayoutJson, area: Rect, dim_preds: bool, border_fg: Color, active_border_fg: Color, clock_mode: bool, clock_colour: Color, active_rect: Option<Rect>, mode_style_str: &str, zoomed: bool) {
+            fn render_json(f: &mut Frame, node: &LayoutJson, area: Rect, dim_preds: bool, border_fg: Color, active_border_fg: Color, clock_mode: bool, clock_colour: Color, active_rect: Option<Rect>, mode_style_str: &str, zoomed: bool, border_status: &str, border_format: &str) {
                 match node {
                     LayoutJson::Leaf {
-                        id: _,
+                        id,
                         rows: _,
                         cols: _,
                         cursor_row,
@@ -2623,9 +2627,19 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         copy_cursor_col,
                         content,
                         rows_v2,
+                        title,
                     } => {
-                        // No borders — content fills entire area (tmux-style)
-                        let inner = area;
+                        // Reserve one row for pane-border-status label if enabled
+                        let has_border_label = border_status != "off" && !border_format.is_empty() && area.height > 2;
+                        let inner = if has_border_label {
+                            if border_status == "bottom" {
+                                Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1))
+                            } else {
+                                Rect::new(area.x, area.y + 1, area.width, area.height.saturating_sub(1))
+                            }
+                        } else {
+                            area
+                        };
                         let mut lines: Vec<Line> = Vec::new();
                         let use_full_cells = *copy_mode && *active && !content.is_empty();
                         if use_full_cells || rows_v2.is_empty() {
@@ -2841,6 +2855,22 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 }
                             }
                         }
+                        // Pane border format/status label (rendered in reserved row)
+                        if has_border_label {
+                            let label_y = if border_status == "bottom" { area.y + area.height.saturating_sub(1) } else { area.y };
+                            let label_row = Rect::new(area.x, label_y, area.width, 1);
+                            let label_style = Style::default().fg(if *active { active_border_fg } else { border_fg });
+                            f.render_widget(Clear, label_row);
+                            let pane_title_str = title.as_deref().unwrap_or("");
+                            let label_text = border_format
+                                .replace("#{pane_title}", pane_title_str)
+                                .replace("#{pane_index}", &id.to_string())
+                                .replace("#P", &id.to_string());
+                            f.render_widget(
+                                Paragraph::new(Line::from(Span::styled(label_text, label_style))),
+                                label_row,
+                            );
+                        }
                     }
                     LayoutJson::Split { kind, sizes, children } => {
                         let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
@@ -2853,7 +2883,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
 
                         // Render children first
                         for (i, child) in children.iter().enumerate() {
-                            if i < rects.len() { render_json(f, child, rects[i], dim_preds, border_fg, active_border_fg, clock_mode, clock_colour, active_rect, mode_style_str, zoomed); }
+                            if i < rects.len() { render_json(f, child, rects[i], dim_preds, border_fg, active_border_fg, clock_mode, clock_colour, active_rect, mode_style_str, zoomed, border_status, border_format); }
                         }
 
                         // Draw separator lines between children using direct buffer access.
@@ -2951,7 +2981,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
 
             let active_rect = compute_active_rect_json(&root, content_chunk);
             let clock_col = clock_colour_str.as_deref().map(|s| map_color(s)).unwrap_or(Color::Cyan);
-            render_json(f, &root, content_chunk, dim_preds, pane_border_fg, pane_active_border_fg, clock_active, clock_col, active_rect, &mode_style_str, state.zoomed);
+            let border_status = state.pane_border_status.as_deref().unwrap_or("off");
+            let border_format = state.pane_border_format.as_deref().unwrap_or("");
+            render_json(f, &root, content_chunk, dim_preds, pane_border_fg, pane_active_border_fg, clock_active, clock_col, active_rect, &mode_style_str, state.zoomed, border_status, border_format);
             fix_border_intersections(f.buffer_mut());
             // Re-color all border characters based on adjacency to the active pane.
             // render_json and fix_border_intersections can leave inconsistent styles

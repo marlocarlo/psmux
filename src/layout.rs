@@ -151,6 +151,9 @@ pub enum LayoutJson {
         content: Vec<Vec<CellJson>>,
         #[serde(default)]
         rows_v2: Vec<RowRunsJson>,
+        /// Pane title for border label expansion
+        #[serde(default)]
+        title: Option<String>,
     },
 }
 
@@ -206,7 +209,7 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                             sel_end_row: None, sel_end_col: None,
                             sel_mode: None,
                             copy_cursor_row: None, copy_cursor_col: None,
-                            content: vec![], rows_v2: vec![],
+                            content: vec![], rows_v2: vec![], title: None,
                         };
                     } else {
                         // Safety timeout expired without sentinel; unsquelch anyway.
@@ -226,7 +229,7 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                         sel_end_row: None, sel_end_col: None,
                         sel_mode: None,
                         copy_cursor_row: None, copy_cursor_col: None,
-                        content: vec![], rows_v2: vec![],
+                        content: vec![], rows_v2: vec![], title: None,
                     };
                 };
                 let screen = parser.screen();
@@ -255,7 +258,7 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                 let now = std::time::Instant::now();
                 let has_placeholder_title = p.title.starts_with("pane %");
                 let throttle_ms = if has_placeholder_title { 80 } else { 500 };
-                if now.duration_since(p.last_infer_title).as_millis() >= throttle_ms {
+                if !p.title_locked && now.duration_since(p.last_infer_title).as_millis() >= throttle_ms {
                     if let Some(t) = infer_title_from_prompt(&screen, p.last_rows, p.last_cols) {
                         p.title = t;
                         p.last_infer_title = now;
@@ -409,6 +412,7 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     copy_cursor_col: None,
                     content: lines,
                     rows_v2,
+                    title: if p.title.is_empty() { None } else { Some(p.title.clone()) },
                 }
             }
         }
@@ -615,7 +619,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                 "\"cursor_shape\":0,",
                                 "\"active\":{},\"copy_mode\":false,",
                                 "\"scroll_offset\":0,",
-                                "\"rows_v2\":[],\"content\":[]}}"),
+                                "\"rows_v2\":[],\"content\":[],\"title\":null}}"),
                             p.id, p.last_rows, p.last_cols, is_active,
                         ));
                         return;
@@ -667,7 +671,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                     let now = std::time::Instant::now();
                     let has_placeholder_title = p.title.starts_with("pane %");
                     let throttle_ms = if has_placeholder_title { 80 } else { 500 };
-                    if now.duration_since(p.last_infer_title).as_millis() >= throttle_ms {
+                    if !p.title_locked && now.duration_since(p.last_infer_title).as_millis() >= throttle_ms {
                         if let Some(t) = infer_title_from_prompt(screen, p.last_rows, p.last_cols) {
                             p.title = t;
                             p.last_infer_title = now;
@@ -902,7 +906,14 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                     }
                     out.push_str("]}");
                 }
-                out.push_str("]}");
+                out.push_str("]");
+                // Append pane title if set
+                if !p.title.is_empty() {
+                    out.push_str(",\"title\":\"");
+                    json_esc(&p.title, out);
+                    out.push('"');
+                }
+                out.push_str("}");
             }
         }
     }

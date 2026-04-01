@@ -108,6 +108,7 @@ pub fn create_popup_pane(
         last_cols: cols,
         id: pane_id,
         title: String::new(),
+        title_locked: false,
         child_pid,
         data_version,
         last_title_check: epoch,
