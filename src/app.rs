@@ -1112,7 +1112,10 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 CtrlReq::ToggleSync => { app.sync_input = !app.sync_input; }
                 CtrlReq::SetPaneTitle(title) => {
                     let win = &mut app.windows[app.active_idx];
-                    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) { p.title = title; }
+                    if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+                        p.title_locked = !title.is_empty();
+                        p.title = title;
+                    }
                 }
                 CtrlReq::KillServer | CtrlReq::KillSession => {
                     // Kill all child processes and exit
