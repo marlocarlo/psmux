@@ -269,6 +269,7 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     // If still a placeholder and inference failed, don't update
                     // last_infer_title — retry aggressively on the next frame.
                 }
+
                 let need_full_content = include_full_content && *cur_path == active_path;
                 let mut lines: Vec<Vec<CellJson>> = if need_full_content {
                     Vec::with_capacity(p.last_rows as usize)

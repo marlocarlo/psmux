@@ -983,12 +983,28 @@ fn run_main() -> io::Result<()> {
                                 i += 1;
                             }
                         }
+                        "-T" => {
+                            if let Some(t) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -T \"{}\"", t));
+                                i += 1;
+                            }
+                        }
+                        "-P" => {
+                            if let Some(s) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -P \"{}\"", s));
+                                i += 1;
+                            }
+                        }
                         "-D" => { cmd.push_str(" -D"); }
                         "-U" => { cmd.push_str(" -U"); }
                         "-L" => { cmd.push_str(" -L"); }
                         "-R" => { cmd.push_str(" -R"); }
                         "-l" => { cmd.push_str(" -l"); }
                         "-Z" => { cmd.push_str(" -Z"); }
+                        "-e" => { cmd.push_str(" -e"); }
+                        "-d" => { cmd.push_str(" -d"); }
+                        "-m" => { cmd.push_str(" -m"); }
+                        "-M" => { cmd.push_str(" -M"); }
                         _ => {}
                     }
                     i += 1;
