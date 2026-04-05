@@ -2,6 +2,33 @@
 
 psmux has first-class support for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) agent teams. When Claude Code runs inside a psmux session, it automatically spawns teammate agents in separate tmux panes instead of running them in-process — giving you full visibility into what each agent is doing.
 
+## Prerequisites
+
+### PowerShell 7+
+
+[Install PowerShell 7 on Windows](https://learn.microsoft.com/en-us/powershell/scripting/install/install-powershell-on-windows?view=powershell-7.6)
+
+To work with Claude Code psmux requires **PowerShell 7 or later**.
+
+Check your current version:
+
+```powershell
+$PSVersionTable.PSVersion
+```
+
+If you are on an older version, install PowerShell 7+ via winget:
+
+```powershell
+winget install --id Microsoft.PowerShell --source winget
+```
+
+After installation, restart your terminal and verify the version again.
+
+`pwsh` will run the new version
+`powershell` will still work as a fallback to run the older version
+
+You may need to restart vscode for changes to the terminal to apply.
+
 ## Quick Start
 
 1. **Install psmux** (see [README](../README.md#installation))
