@@ -2480,6 +2480,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     output.push_str(&format!("pane-base-index {}\n", app.pane_base_index));
                     output.push_str(&format!("escape-time {}\n", app.escape_time_ms));
                     output.push_str(&format!("mouse {}\n", if app.mouse_enabled { "on" } else { "off" }));
+                    output.push_str(&format!("scroll-enter-copy-mode {}\n", if app.scroll_enter_copy_mode { "on" } else { "off" }));
                     output.push_str(&format!("status {}\n", if app.status_visible { "on" } else { "off" }));
                     output.push_str(&format!("status-position {}\n", app.status_position));
                     output.push_str(&format!("status-left \"{}\"\n", app.status_left));

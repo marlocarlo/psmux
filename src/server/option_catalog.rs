@@ -27,6 +27,7 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "display-panes-time", scope: "session", option_type: "number", default: "1000", description: "Duration of pane numbers display in ms" },
     OptionDef { name: "repeat-time", scope: "session", option_type: "number", default: "500", description: "Repeat timeout for prefix keys in ms" },
     OptionDef { name: "mouse", scope: "session", option_type: "boolean", default: "off", description: "Enable mouse support" },
+    OptionDef { name: "scroll-enter-copy-mode", scope: "session", option_type: "boolean", default: "on", description: "Enter copy mode on mouse scroll up at shell prompt" },
     OptionDef { name: "mode-keys", scope: "session", option_type: "choice", default: "emacs", description: "Key bindings in copy mode (vi/emacs)" },
     OptionDef { name: "status", scope: "session", option_type: "boolean", default: "on", description: "Show/hide the status bar" },
     OptionDef { name: "status-position", scope: "session", option_type: "choice", default: "bottom", description: "Status bar position (top/bottom)" },

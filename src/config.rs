@@ -489,6 +489,7 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
         "status-left" => app.status_left = value.to_string(),
         "status-right" => app.status_right = value.to_string(),
         "mouse" => app.mouse_enabled = matches!(value, "on" | "true" | "1"),
+        "scroll-enter-copy-mode" => app.scroll_enter_copy_mode = matches!(value, "on" | "true" | "1"),
         "prefix" => {
             if let Some(key) = parse_key_name(value) {
                 app.prefix_key = key;

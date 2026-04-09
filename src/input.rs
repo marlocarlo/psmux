@@ -12,7 +12,7 @@ use crate::pane::{create_window, split_active};
 use crate::commands::{execute_action, execute_command_prompt, execute_command_string};
 use crate::config::normalize_key_for_binding;
 use crate::copy_mode::{enter_copy_mode, exit_copy_mode, switch_with_copy_save, move_copy_cursor,
-    scroll_copy_up, scroll_copy_down, paste_latest, yank_selection,
+    scroll_copy_up, scroll_copy_down, scroll_pane_scrollback, paste_latest, yank_selection,
     search_copy_mode, search_next, search_prev, scroll_to_top, scroll_to_bottom};
 use crate::layout::{cycle_top_layout, apply_layout};
 use crate::window_ops::{toggle_zoom, swap_pane, break_pane_to_window};
@@ -2353,11 +2353,13 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                             64, true); // SGR button 64 = scroll-up
                     }
                 }
-            } else {
+            } else if app.scroll_enter_copy_mode {
                 // Shell prompt — auto-enter copy mode and scroll (tmux parity)
                 enter_copy_mode(app);
                 scroll_copy_up(app, 3);
                 return Ok(());
+            } else {
+                scroll_pane_scrollback(app, 3, true);
             }
         }
         MouseEventKind::ScrollDown => {
@@ -2400,6 +2402,8 @@ pub fn handle_mouse(app: &mut AppState, me: MouseEvent, window_area: Rect) -> io
                             65, true); // SGR button 65 = scroll-down
                     }
                 }
+            } else if !app.scroll_enter_copy_mode {
+                scroll_pane_scrollback(app, 3, false);
             }
         }
         _ => {}

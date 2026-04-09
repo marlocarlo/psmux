@@ -454,23 +454,29 @@ pub fn move_word_end(app: &mut AppState) {
     }
 }
 
-pub fn scroll_copy_up(app: &mut AppState, lines: usize) {
+/// Scroll the active pane's scrollback buffer without entering copy mode.
+pub fn scroll_pane_scrollback(app: &mut AppState, lines: usize, up: bool) {
     let win = &mut app.windows[app.active_idx];
     let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return };
     let mut parser = match p.term.lock() { Ok(g) => g, Err(_) => return };
     let current = parser.screen().scrollback();
-    let new_offset = current.saturating_add(lines);
+    let new_offset = if up { current.saturating_add(lines) } else { current.saturating_sub(lines) };
     parser.screen_mut().set_scrollback(new_offset);
+}
+
+pub fn scroll_copy_up(app: &mut AppState, lines: usize) {
+    scroll_pane_scrollback(app, lines, true);
+    let win = &mut app.windows[app.active_idx];
+    let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return };
+    let parser = match p.term.lock() { Ok(g) => g, Err(_) => return };
     app.copy_scroll_offset = parser.screen().scrollback();
 }
 
 pub fn scroll_copy_down(app: &mut AppState, lines: usize) {
+    scroll_pane_scrollback(app, lines, false);
     let win = &mut app.windows[app.active_idx];
     let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return };
-    let mut parser = match p.term.lock() { Ok(g) => g, Err(_) => return };
-    let current = parser.screen().scrollback();
-    let new_offset = current.saturating_sub(lines);
-    parser.screen_mut().set_scrollback(new_offset);
+    let parser = match p.term.lock() { Ok(g) => g, Err(_) => return };
     app.copy_scroll_offset = parser.screen().scrollback();
 }
 
