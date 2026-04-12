@@ -285,17 +285,69 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
     let _ = std::fs::create_dir_all(&dir);
     let regpath = format!("{}\\{}.port", dir, app.port_file_base());
     let _ = std::fs::write(&regpath, port.to_string());
+
+    // Generate a random session key for security (mirrors server/mod.rs)
+    let session_key: String = {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        let s = RandomState::new();
+        let mut h = s.build_hasher();
+        h.write_u64(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64);
+        h.write_u64(std::process::id() as u64);
+        format!("{:016x}", h.finish())
+    };
+
+    app.session_key = session_key.clone();
+
+    let keypath = format!("{}\\{}.key", dir, app.port_file_base());
+    let _ = std::fs::write(&keypath, &session_key);
+
+    // Try to set file permissions to user-only (Windows)
+    #[cfg(windows)]
+    {
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&keypath)
+            .map(|mut f| std::io::Write::write_all(&mut f, session_key.as_bytes()));
+    }
+
     thread::spawn(move || {
         for conn in listener.incoming() {
             if let Ok(stream) = conn {
                 let tx = tx.clone();
+                let session_key_clone = session_key.clone();
                 // Handle each connection in its own thread so rapid-fire
                 // commands (e.g. 200x new-window) don't queue behind each
                 // other on the accept loop.
                 thread::spawn(move || {
                 let mut stream = stream;
-                let mut line = String::new();
                 let mut r = io::BufReader::new(stream.try_clone().unwrap());
+
+                // Authenticate the connection (mirrors server/connection.rs)
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
+                let mut auth_line = String::new();
+                if r.read_line(&mut auth_line).is_err() {
+                    return;
+                }
+                let auth_trimmed = auth_line.trim();
+                if !auth_trimmed.starts_with("AUTH ") {
+                    let _ = stream.write_all(b"ERROR: Authentication required\n");
+                    let _ = stream.flush();
+                    return;
+                }
+                let provided_key = auth_trimmed.strip_prefix("AUTH ").unwrap_or("");
+                if provided_key != session_key_clone.as_str() {
+                    let _ = stream.write_all(b"ERROR: Invalid session key\n");
+                    let _ = stream.flush();
+                    return;
+                }
+                let _ = stream.write_all(b"OK\n");
+                let _ = stream.flush();
+
+                // Read the actual command line (after successful auth)
+                let mut line = String::new();
                 let _ = r.read_line(&mut line);
                 
                 // Check for optional TARGET line (for session:window.pane addressing)
