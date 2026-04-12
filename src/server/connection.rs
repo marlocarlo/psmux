@@ -1799,6 +1799,8 @@ match cmd {
             let mut detached = false;
             let mut window_name: Option<String> = None;
             let mut start_dir: Option<String> = None;
+            let mut session_env: Vec<(String, String)> = Vec::new();
+            let mut session_env_parse_err: Option<String> = None;
             {
                 let mut i = 0;
                 while i < args.len() {
@@ -1808,12 +1810,33 @@ match cmd {
                         "-c" => { i += 1; if i < args.len() { start_dir = Some(args[i].trim_matches('"').to_string()); } }
                         "-d" => { detached = true; }
                         "-t" => { i += 1; /* already handled above */ }
-                        "-e" | "-F" | "-f" | "-x" | "-y" => { i += 1; /* skip value */ }
+                        "-e" => {
+                            i += 1;
+                            match crate::util::parse_new_session_e_value_token(args.get(i).copied()) {
+                                Ok(p) => session_env.push(p),
+                                Err(e) => {
+                                    session_env_parse_err = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                        "-F" | "-f" | "-x" | "-y" => { i += 1; /* skip value */ }
                         _ => {}
                     }
                     i += 1;
                 }
             }
+
+            if let Some(ref err) = session_env_parse_err {
+                let msg = format!("psmux: {}\n", err);
+                if persistent {
+                    let _ = tx.send(CtrlReq::StatusMessage(msg.trim().to_string()));
+                } else {
+                    let _ = write!(write_stream, "{}", msg);
+                    let _ = write_stream.flush();
+                }
+                if !persistent { break; }
+            } else {
 
             // Note: socket_name (from -L flag) is not directly available here;
             // the client-side handler in commands.rs has it via app.socket_name.
@@ -1854,6 +1877,10 @@ match cmd {
                     server_args.push("-n".into());
                     server_args.push(wn.clone());
                 }
+                for (k, v) in &session_env {
+                    server_args.push("-e".into());
+                    server_args.push(format!("{}={}", k, v));
+                }
                 #[cfg(windows)]
                 { let _ = crate::platform::spawn_server_hidden(&exe, &server_args); }
                 #[cfg(not(windows))]
@@ -1890,6 +1917,7 @@ match cmd {
                         let _ = write_stream.flush();
                     }
                 }
+            }
             }
         }
     }

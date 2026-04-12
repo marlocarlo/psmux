@@ -431,7 +431,10 @@ fn run_main() -> io::Result<()> {
                 let raw_cmd: Option<Vec<String>> = args.iter().position(|a| a == "--").map(|pos| {
                     args.iter().skip(pos + 1).cloned().collect()
                 }).filter(|v: &Vec<String>| !v.is_empty());
-                return run_server(name, server_socket_name, initial_cmd, raw_cmd, srv_start_dir, srv_window_name, srv_init_size, srv_group_target);
+                let session_env = crate::util::collect_server_session_env_args(&args).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidInput, e)
+                })?;
+                return run_server(name, server_socket_name, initial_cmd, raw_cmd, srv_start_dir, srv_window_name, srv_init_size, srv_group_target, session_env);
             }
             "new-session" | "new" => {
                 // Prevent nesting: block new-session inside an existing psmux session
@@ -462,6 +465,7 @@ fn run_main() -> io::Result<()> {
                 let mut group_target: Option<String> = None;
                 let mut positional_args: Vec<String> = Vec::new();
                 let mut raw_cmd_after_dd: Option<Vec<String>> = None;
+                let mut session_env: Vec<(String, String)> = Vec::new();
 
                 {
                     let mut i = 1; // skip command name (cmd_args[0])
@@ -502,7 +506,19 @@ fn run_main() -> io::Result<()> {
                             'c' => { i += 1; if i < cmd_args.len() { start_dir = Some(cmd_args[i].trim_matches('"').to_string()); } break; }
                             'x' => { i += 1; if i < cmd_args.len() { init_width = cmd_args[i].parse::<u16>().ok(); } break; }
                             'y' => { i += 1; if i < cmd_args.len() { init_height = cmd_args[i].parse::<u16>().ok(); } break; }
-                            'e' | 'f' => { i += 1; break; /* skip value */ }
+                            'e' => {
+                                i += 1;
+                                match crate::util::parse_new_session_e_value_token(
+                                    cmd_args.get(i).map(|s| s.as_str()),
+                                ) {
+                                    Ok(pair) => session_env.push(pair),
+                                    Err(msg) => {
+                                        return Err(io::Error::new(io::ErrorKind::InvalidInput, msg));
+                                    }
+                                }
+                                break;
+                            }
+                            'f' => { i += 1; break; /* skip value (client flags, ignored) */ }
                             't' => { i += 1; if i < cmd_args.len() { group_target = Some(cmd_args[i].to_string()); } break; }
                             // Boolean flags
                             'd' => { detached = true; }
@@ -579,7 +595,7 @@ fn run_main() -> io::Result<()> {
                 // Skipped when PSMUX_NO_WARM=1 is set or config has 'set -g warm off'.
                 let warm_disabled = std::env::var("PSMUX_NO_WARM").map(|v| v == "1" || v == "true").unwrap_or(false)
                     || crate::config::is_warm_disabled_by_config();
-                let claimed_warm = if !warm_disabled && initial_cmd.is_none() && raw_cmd_args.is_none() && start_dir.is_none() {
+                let claimed_warm = if !warm_disabled && initial_cmd.is_none() && raw_cmd_args.is_none() && start_dir.is_none() && session_env.is_empty() {
                     let warm_base = if let Some(ref l) = l_socket_name {
                         format!("{}____warm__", l)
                     } else {
@@ -667,6 +683,10 @@ fn run_main() -> io::Result<()> {
                 if let Some(ref gt) = group_target {
                     server_args.push("-g".into());
                     server_args.push(gt.clone());
+                }
+                for (k, v) in &session_env {
+                    server_args.push("-e".into());
+                    server_args.push(format!("{}={}", k, v));
                 }
                 // Pass raw command args (direct execution) if -- was used
                 if let Some(ref raw_args) = raw_cmd_args {

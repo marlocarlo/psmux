@@ -192,10 +192,76 @@ pub fn quote_arg(s: &str) -> String {
     format!("\"{}\"", escaped)
 }
 
+/// Parse `VARIABLE=value` for tmux `new-session -e` / internal `server -e`
+/// (split on the first `=` so values may contain `=`).
+pub fn parse_env_assignment(s: &str) -> Result<(String, String), &'static str> {
+    let s = s.trim();
+    let eq = s.find('=').ok_or("expected VARIABLE=value")?;
+    if eq == 0 {
+        return Err("invalid environment variable name");
+    }
+    let name = &s[..eq];
+    let value = &s[eq + 1..];
+    if name.is_empty() || !is_valid_env_var_name(name) {
+        return Err("invalid environment variable name");
+    }
+    Ok((name.to_string(), value.to_string()))
+}
+
+/// Parse the token after `-e` on `new-session` or internal `server -e` (`VAR=value`).
+/// Shared by CLI short flags, control-protocol `new-session`, and [`collect_server_session_env_args`].
+pub fn parse_new_session_e_value_token(next_arg: Option<&str>) -> Result<(String, String), String> {
+    let Some(s) = next_arg else {
+        return Err("-e requires a value".to_string());
+    };
+    parse_env_assignment(s).map_err(|e| format!("invalid -e: {}", e))
+}
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    for c in chars {
+        if !(c.is_ascii_alphanumeric() || c == '_') {
+            return false;
+        }
+    }
+    true
+}
+
+/// Merge CLI `new-session -e` pairs into session environment (after `load_config`).
+pub fn merge_session_env_into_app(app: &mut AppState, session_env: &[(String, String)]) {
+    for (k, v) in session_env {
+        app.environment.insert(k.clone(), v.clone());
+    }
+}
+
+/// Collect `-e` flags from internal `server` argv (only before `--`).
+pub fn collect_server_session_env_args(args: &[String]) -> Result<Vec<(String, String)>, String> {
+    let limit = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < limit {
+        if args[i] == "-e" {
+            let pair = parse_new_session_e_value_token(args.get(i + 1).map(|s| s.as_str()))?;
+            out.push(pair);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::parse_command_line;
+    use crate::types::AppState;
 
     #[test]
     fn test_quote_arg_simple() {
@@ -361,6 +427,98 @@ mod tests {
         let line = "send-keys \"cd 'C:\\Users\\foo\\project'\" Enter";
         let args = parse_command_line(line);
         assert_eq!(args[1], "cd 'C:\\Users\\foo\\project'");
+    }
+
+    #[test]
+    fn parse_env_assignment_basic() {
+        assert_eq!(
+            parse_env_assignment("FOO=bar").unwrap(),
+            ("FOO".to_string(), "bar".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_env_assignment_empty_value() {
+        assert_eq!(
+            parse_env_assignment("VAR=").unwrap(),
+            ("VAR".to_string(), "".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_env_assignment_value_with_equals() {
+        assert_eq!(
+            parse_env_assignment("FOO=a=b=c").unwrap(),
+            ("FOO".to_string(), "a=b=c".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_env_assignment_rejects_no_equals() {
+        assert!(parse_env_assignment("FOO").is_err());
+    }
+
+    #[test]
+    fn parse_env_assignment_rejects_bad_name() {
+        assert!(parse_env_assignment("123=x").is_err());
+        assert!(parse_env_assignment("bad-name=x").is_err());
+    }
+
+    #[test]
+    fn parse_new_session_e_value_token_missing() {
+        assert_eq!(
+            parse_new_session_e_value_token(None).unwrap_err(),
+            "-e requires a value"
+        );
+    }
+
+    #[test]
+    fn parse_new_session_e_value_token_ok() {
+        let p = parse_new_session_e_value_token(Some("Z=1")).unwrap();
+        assert_eq!(p, ("Z".to_string(), "1".to_string()));
+    }
+
+    #[test]
+    fn collect_server_session_env_skips_after_dd() {
+        let args = vec![
+            "psmux".into(),
+            "server".into(),
+            "-s".into(),
+            "s1".into(),
+            "-e".into(),
+            "A=1".into(),
+            "--".into(),
+            "cmd".into(),
+            "-e".into(),
+            "IGNORE=me".into(),
+        ];
+        let v = collect_server_session_env_args(&args).unwrap();
+        assert_eq!(v, vec![("A".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn collect_server_session_env_duplicate_key_last_in_vec() {
+        let args = vec![
+            "psmux".into(),
+            "server".into(),
+            "-s".into(),
+            "s1".into(),
+            "-e".into(),
+            "FOO=first".into(),
+            "-e".into(),
+            "FOO=last".into(),
+        ];
+        let v = collect_server_session_env_args(&args).unwrap();
+        assert_eq!(
+            v,
+            vec![
+                ("FOO".to_string(), "first".to_string()),
+                ("FOO".to_string(), "last".to_string()),
+            ]
+        );
+        let mut app = AppState::new("t".to_string());
+        merge_session_env_into_app(&mut app, &v);
+        assert_eq!(app.environment.get("FOO").map(|s| s.as_str()), Some("last"));
     }
 }
 

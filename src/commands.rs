@@ -1564,11 +1564,12 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "new-session" | "new" => {
             // Issue #200: create a new session from inside a running session.
-            // Parse flags: -s name, -d (detached), -n windowname, -c startdir
+            // Parse flags: -s name, -d (detached), -n windowname, -c startdir, -e VAR=val
             let mut session_name: Option<String> = None;
             let mut detached = false;
             let mut window_name: Option<String> = None;
             let mut start_dir: Option<String> = None;
+            let mut session_env: Vec<(String, String)> = Vec::new();
             {
                 let mut i = 1;
                 while i < parts.len() {
@@ -1578,7 +1579,17 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                         "-c" => { i += 1; if i < parts.len() { start_dir = Some(parts[i].trim_matches('"').to_string()); } }
                         "-d" => { detached = true; }
                         "-A" | "-D" | "-E" | "-P" | "-X" => { /* compatibility flags, ignored */ }
-                        "-e" | "-F" | "-f" | "-t" | "-x" | "-y" => { i += 1; /* skip value */ }
+                        "-e" => {
+                            i += 1;
+                            match crate::util::parse_new_session_e_value_token(parts.get(i).copied()) {
+                                Ok(p) => session_env.push(p),
+                                Err(e) => {
+                                    app.status_message = Some((format!("psmux: {}", e), Instant::now()));
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        "-F" | "-f" | "-t" | "-x" | "-y" => { i += 1; /* skip value */ }
                         _ => {}
                     }
                     i += 1;
@@ -1619,7 +1630,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             // Try to claim a warm server first (fast path)
             let warm_disabled = std::env::var("PSMUX_NO_WARM").map(|v| v == "1" || v == "true").unwrap_or(false)
                 || crate::config::is_warm_disabled_by_config();
-            let claimed_warm = if !warm_disabled && start_dir.is_none() {
+            let claimed_warm = if !warm_disabled && start_dir.is_none() && session_env.is_empty() {
                 let warm_base = if let Some(ref sn) = app.socket_name {
                     format!("{}____warm__", sn)
                 } else {
@@ -1683,6 +1694,10 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                     server_args.push(area.width.to_string());
                     server_args.push("-y".into());
                     server_args.push(area.height.to_string());
+                }
+                for (k, v) in &session_env {
+                    server_args.push("-e".into());
+                    server_args.push(format!("{}={}", k, v));
                 }
                 #[cfg(windows)]
                 { let _ = crate::platform::spawn_server_hidden(&exe, &server_args); }

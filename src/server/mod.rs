@@ -295,7 +295,7 @@ fn drain_plugin_req(
     }
 }
 
-pub fn run_server(session_name: String, socket_name: Option<String>, initial_command: Option<String>, raw_command: Option<Vec<String>>, start_dir: Option<String>, window_name: Option<String>, init_size: Option<(u16, u16)>, group_target: Option<String>) -> io::Result<()> {
+pub fn run_server(session_name: String, socket_name: Option<String>, initial_command: Option<String>, raw_command: Option<Vec<String>>, start_dir: Option<String>, window_name: Option<String>, init_size: Option<(u16, u16)>, group_target: Option<String>, session_env: Vec<(String, String)>) -> io::Result<()> {
     // Write crash info to a log file when stderr is unavailable (detached server)
     std::panic::set_hook(Box::new(|info| {
         let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
@@ -414,6 +414,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
 
     crate::config::populate_default_bindings(&mut app);
     load_config(&mut app);
+    // new-session -e: apply after config so CLI overrides set-environment from config
+    crate::util::merge_session_env_into_app(&mut app, &session_env);
 
     // Execute queued plugin .ps1 scripts (e.g. theme plugins that use
     // PowerShell variables and call back to psmux via CLI).  We spawn
@@ -4039,3 +4041,7 @@ mod test_pane_title;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue202_switch_client.rs"]
 mod test_issue202;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_new_session_env.rs"]
+mod test_new_session_env;
