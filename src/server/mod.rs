@@ -1272,7 +1272,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     };
                     let cursor_style_code = crate::rendering::configured_cursor_code();
                     let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"defaults_suppressed\":{}}}",
+                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"defaults_suppressed\":{},\"pwsh_mouse_selection\":{}}}",
                         layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, pbhs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                         matches!(app.mode, Mode::ClockMode), cached_bindings_json,
                         app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
@@ -1280,6 +1280,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         cursor_style_code, app.status_visible, app.repeat_time_ms,
                         app.windows.get(app.active_idx).map_or(false, |w| w.zoom_saved.is_some()),
                         app.defaults_suppressed,
+                        app.pwsh_mouse_selection,
                     ));
                     // Inject overlay state (popup, menu, confirm, display_panes)
                     {
@@ -2478,6 +2479,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             "status-right" => { app.status_right = "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#{=21:pane_title}\" %H:%M %d-%b-%y".to_string(); }
                             "mouse" => { app.mouse_enabled = true; }
                             "scroll-enter-copy-mode" => { app.scroll_enter_copy_mode = true; }
+                            "pwsh-mouse-selection" => { app.pwsh_mouse_selection = false; }
                             "escape-time" => { app.escape_time_ms = 500; }
                             "history-limit" => { app.history_limit = 2000; }
                             "display-time" => { app.display_time_ms = 750; }
@@ -2532,6 +2534,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     output.push_str(&format!("escape-time {}\n", app.escape_time_ms));
                     output.push_str(&format!("mouse {}\n", if app.mouse_enabled { "on" } else { "off" }));
                     output.push_str(&format!("scroll-enter-copy-mode {}\n", if app.scroll_enter_copy_mode { "on" } else { "off" }));
+                    output.push_str(&format!("pwsh-mouse-selection {}\n", if app.pwsh_mouse_selection { "on" } else { "off" }));
                     output.push_str(&format!("status {}\n", if app.status_visible { "on" } else { "off" }));
                     output.push_str(&format!("status-position {}\n", app.status_position));
                     output.push_str(&format!("status-left \"{}\"\n", app.status_left));
@@ -3842,13 +3845,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             };
             let cursor_style_code = crate::rendering::configured_cursor_code();
             let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{}}}",
+                "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"pwsh_mouse_selection\":{}}}",
                 layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, pbhs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                 matches!(app.mode, Mode::ClockMode), cached_bindings_json,
                 app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
                 mode_style_escaped, status_position_escaped, status_justify_escaped,
                 cursor_style_code, app.status_visible, app.repeat_time_ms,
                 app.windows.get(app.active_idx).map_or(false, |w| w.zoom_saved.is_some()),
+                app.pwsh_mouse_selection,
             ));
             // Inject overlay state (popup, menu, confirm, display_panes)
             {

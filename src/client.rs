@@ -35,73 +35,99 @@ fn modified_key_name(base: &str, mods: KeyModifiers) -> String {
 /// Extract selected text from the layout tree given absolute terminal coordinates.
 /// Computes pane areas via the same Layout splitting render_json uses, then reads
 /// characters from the run-length-encoded rows_v2 data.
-fn extract_selection_text(
-    layout: &LayoutJson,
-    term_width: u16,
-    content_height: u16, // excluding status bar
-    start: (u16, u16),   // (col, row)
-    end: (u16, u16),
-) -> String {
-    // Normalise so (r0,c0) <= (r1,c1) in reading order
-    let (r0, c0, r1, c1) = if (start.1, start.0) <= (end.1, end.0) {
-        (start.1, start.0, end.1, end.0)
-    } else {
-        (end.1, end.0, start.1, start.0)
-    };
+struct PaneLeaf<'a> {
+    inner: Rect,
+    rows_v2: &'a [RowRunsJson],
+}
 
-    // Collect leaf panes with their inner areas and content
-    struct PaneLeaf<'a> {
-        inner: Rect,
-        rows_v2: &'a [RowRunsJson],
-    }
-
-    fn collect_leaves<'a>(node: &'a LayoutJson, area: Rect, out: &mut Vec<PaneLeaf<'a>>) {
-        match node {
-            LayoutJson::Leaf { rows_v2, .. } => {
-                // No borders — content fills entire area (tmux-style)
-                out.push(PaneLeaf { inner: area, rows_v2 });
-            }
-            LayoutJson::Split { kind, sizes, children } => {
-                let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
-                    sizes.clone()
-                } else {
-                    vec![(100 / children.len().max(1)) as u16; children.len()]
-                };
-                let is_horizontal = kind == "Horizontal";
-                let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
-                for (i, child) in children.iter().enumerate() {
-                    if i < rects.len() {
-                        collect_leaves(child, rects[i], out);
-                    }
+fn collect_leaves<'a>(node: &'a LayoutJson, area: Rect, out: &mut Vec<PaneLeaf<'a>>) {
+    match node {
+        LayoutJson::Leaf { rows_v2, .. } => {
+            out.push(PaneLeaf { inner: area, rows_v2 });
+        }
+        LayoutJson::Split { kind, sizes, children } => {
+            let effective_sizes: Vec<u16> = if sizes.len() == children.len() {
+                sizes.clone()
+            } else {
+                vec![(100 / children.len().max(1)) as u16; children.len()]
+            };
+            let is_horizontal = kind == "Horizontal";
+            let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
+            for (i, child) in children.iter().enumerate() {
+                if i < rects.len() {
+                    collect_leaves(child, rects[i], out);
                 }
             }
         }
     }
+}
+
+/// Get the character at a column position within a row's runs.
+///
+/// `run.text` may be shorter than `run.width` (single repeated char) or
+/// multi-char (wide chars); pick the nth char if present.
+fn char_at_col(runs: &[crate::layout::CellRunJson], local_col: usize) -> char {
+    let mut cursor = 0usize;
+    for run in runs {
+        let run_width = run.width.max(1) as usize;
+        if local_col >= cursor && local_col < cursor + run_width {
+            let offset = local_col - cursor;
+            return run.text.chars().nth(offset).unwrap_or(' ');
+        }
+        cursor += run_width;
+    }
+    ' '
+}
+
+/// Expand a row's runs into a dense `Vec<char>` indexed by local column.
+/// Used by hot paths (word-boundary scan) that would otherwise call
+/// `char_at_col` O(width) times and pay O(width²) total.
+fn row_chars(runs: &[crate::layout::CellRunJson], width: usize) -> Vec<char> {
+    let mut out = vec![' '; width];
+    let mut cursor = 0usize;
+    for run in runs {
+        let run_width = run.width.max(1) as usize;
+        let chars: Vec<char> = run.text.chars().collect();
+        for i in 0..run_width {
+            let col = cursor + i;
+            if col >= width { break; }
+            out[col] = chars.get(i).copied().unwrap_or(' ');
+        }
+        cursor += run_width;
+        if cursor >= width { break; }
+    }
+    out
+}
+
+/// Normalise a selection (start, end) into reading-order or block-mode bounds.
+fn normalize_selection(start: (u16, u16), end: (u16, u16), block: bool) -> (u16, u16, u16, u16) {
+    if block {
+        (start.1.min(end.1), start.0.min(end.0), start.1.max(end.1), start.0.max(end.0))
+    } else if (start.1, start.0) <= (end.1, end.0) {
+        (start.1, start.0, end.1, end.0)
+    } else {
+        (end.1, end.0, start.1, start.0)
+    }
+}
+
+fn extract_selection_text(
+    layout: &LayoutJson,
+    term_width: u16,
+    content_height: u16,
+    start: (u16, u16),
+    end: (u16, u16),
+    block: bool,
+) -> String {
+    let (r0, c0, r1, c1) = normalize_selection(start, end, block);
 
     let content_area = Rect { x: 0, y: 0, width: term_width, height: content_height };
     let mut leaves: Vec<PaneLeaf> = Vec::new();
     collect_leaves(layout, content_area, &mut leaves);
 
-    // Helper: get character at a local column position within a row's runs
-    fn char_at_col(runs: &[crate::layout::CellRunJson], local_col: usize) -> char {
-        let mut cursor = 0usize;
-        for run in runs {
-            let run_width = run.width.max(1) as usize;
-            if local_col >= cursor && local_col < cursor + run_width {
-                let offset = local_col - cursor;
-                // Run text may be shorter than run_width (e.g. single char repeated)
-                // or multi-char for wide chars. Pick the nth char if available.
-                return run.text.chars().nth(offset).unwrap_or(' ');
-            }
-            cursor += run_width;
-        }
-        ' '
-    }
-
     let mut result = String::new();
     for row in r0..=r1 {
-        let col_start = if row == r0 { c0 } else { 0 };
-        let col_end = if row == r1 { c1 } else { term_width.saturating_sub(1) };
+        let col_start = if block || row == r0 { c0 } else { 0 };
+        let col_end = if block || row == r1 { c1 } else { term_width.saturating_sub(1) };
 
         let mut line = String::new();
         for col in col_start..=col_end {
@@ -121,7 +147,6 @@ fn extract_selection_text(
             }
             line.push(ch);
         }
-        // Trim trailing whitespace per line
         let trimmed = line.trim_end();
         result.push_str(trimmed);
         if row < r1 {
@@ -150,6 +175,51 @@ fn active_pane_in_copy_mode(layout: &LayoutJson) -> bool {
         LayoutJson::Leaf { active, copy_mode, .. } => *active && *copy_mode,
         LayoutJson::Split { children, .. } => children.iter().any(|c| active_pane_in_copy_mode(c)),
     }
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Find the (start_col, end_col) of the word at `(col, row)` inside the
+/// given pane. Returns None when the cell is not a word character.
+///
+/// `layout` is walked to resolve the clicked leaf's `rows_v2` — the caller
+/// already knows `pane_rect`, but it does not have a handle to the raw
+/// content, so we do a single targeted descent.
+fn word_bounds_at(
+    layout: &LayoutJson,
+    term_width: u16,
+    content_height: u16,
+    pane_rect: Rect,
+    col: u16,
+    row: u16,
+) -> Option<(u16, u16)> {
+    let content_area = Rect { x: 0, y: 0, width: term_width, height: content_height };
+    let mut leaves: Vec<PaneLeaf> = Vec::new();
+    collect_leaves(layout, content_area, &mut leaves);
+
+    let leaf = leaves.iter().find(|l| l.inner == pane_rect)?;
+
+    let local_row = row.checked_sub(leaf.inner.y)? as usize;
+    if local_row >= leaf.rows_v2.len() { return None; }
+    let width = leaf.inner.width as usize;
+    let chars = row_chars(&leaf.rows_v2[local_row].runs, width);
+
+    let local_col = col.checked_sub(leaf.inner.x)? as usize;
+    if local_col >= width { return None; }
+    if !is_word_char(chars[local_col]) { return None; }
+
+    let mut left = local_col;
+    while left > 0 && is_word_char(chars[left - 1]) {
+        left -= 1;
+    }
+    let mut right = local_col;
+    while right + 1 < width && is_word_char(chars[right + 1]) {
+        right += 1;
+    }
+
+    Some((leaf.inner.x + left as u16, leaf.inner.x + right as u16))
 }
 
 /// Check if screen coordinates (x, y) fall on a separator line in the layout.
@@ -621,6 +691,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         /// When true, hardcoded default keybindings are suppressed (set by unbind-key -a)
         #[serde(default)]
         defaults_suppressed: bool,
+        /// pwsh-mouse-selection option (mirror of server-side AppState field)
+        #[serde(default)]
+        pwsh_mouse_selection: bool,
         /// status-left-length (max display width for left status)
         #[serde(default = "default_status_left_length")]
         status_left_length: usize,
@@ -741,7 +814,14 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     // Text selection state (client-side only, left-click drag like pwsh)
     let mut rsel_start: Option<(u16, u16)> = None;  // (col, row) in terminal coords
     let mut rsel_end: Option<(u16, u16)> = None;
+    let mut rsel_pane_rect: Option<Rect> = None;    // clip bounds of the originating pane
     let mut rsel_dragged = false;
+    // Multi-click tracking for word/line selection.
+    let mut last_click: Option<(Instant, (u16, u16))> = None;
+    let mut click_count: u32 = 0;
+    // When true, the current rsel selection uses rectangular (block) mode
+    // instead of reading-order. Triggered by Alt held on MouseDown.
+    let mut rsel_block: bool = false;
     let mut selection_changed = false; // forces redraw for selection overlay
     let mut border_drag = false; // true when dragging a pane separator (resize)
     // Client-side tab position tracking for accurate mouse click detection.
@@ -754,6 +834,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let mut client_borders: Vec<(Vec<usize>, String, usize, u16, u16, Vec<u16>, Rect)> = Vec::new();
     let mut client_content_area: Rect = Rect::default();
     let mut client_copy_mode: bool = false;
+    let mut client_pwsh_selection: bool = false;
     let mut client_zoomed: bool = false;
     let mut client_drag: Option<ClientDragState> = None;
     // Border hover highlight: (position, kind, area) of the border under the cursor.
@@ -1907,6 +1988,81 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT) => {
                                     cmd_batch.push(format!("send-key M-{}\n", c));
                                 }
+                                // pwsh-mouse-selection: Ctrl+Shift+C / Ctrl+Shift+V
+                                // explicit copy/paste regardless of selection state.
+                                KeyCode::Char('C') if client_pwsh_selection
+                                    && key.kind == KeyEventKind::Press
+                                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                                {
+                                    if let (Some(s), Some(e)) = (rsel_start, rsel_end) {
+                                        if rsel_dragged {
+                                            if let Ok(state) = serde_json::from_str::<DumpState>(&prev_dump_buf) {
+                                                let text = extract_selection_text(
+                                                    &state.layout,
+                                                    last_sent_size.0,
+                                                    last_sent_size.1,
+                                                    s, e,
+                                                    rsel_block,
+                                                );
+                                                if !text.is_empty() {
+                                                    copy_to_system_clipboard(&text);
+                                                    pending_osc52 = Some(text);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    rsel_start = None;
+                                    rsel_end = None;
+                                    rsel_pane_rect = None;
+                                    rsel_block = false;
+                                    rsel_dragged = false;
+                                    selection_changed = true;
+                                }
+                                KeyCode::Char('V') if client_pwsh_selection
+                                    && key.kind == KeyEventKind::Press
+                                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                                {
+                                    if let Some(text) = read_from_system_clipboard() {
+                                        if !text.is_empty() {
+                                            let encoded = base64_encode(&text);
+                                            cmd_batch.push(format!("send-paste {}\n", encoded));
+                                        }
+                                    }
+                                }
+                                // Ctrl+C smart: when a selection is active in
+                                // pwsh-mouse-selection mode, copy and clear.
+                                // Otherwise fall through to the generic Ctrl handler
+                                // which sends SIGINT to the shell.
+                                KeyCode::Char('c') if client_pwsh_selection
+                                    && key.kind == KeyEventKind::Press
+                                    && key.modifiers == KeyModifiers::CONTROL
+                                    && rsel_dragged
+                                    && rsel_start.is_some() =>
+                                {
+                                    if let (Some(s), Some(e)) = (rsel_start, rsel_end) {
+                                        if let Ok(state) = serde_json::from_str::<DumpState>(&prev_dump_buf) {
+                                            let text = extract_selection_text(
+                                                &state.layout,
+                                                last_sent_size.0,
+                                                last_sent_size.1,
+                                                s, e,
+                                                rsel_block,
+                                            );
+                                            if !text.is_empty() {
+                                                copy_to_system_clipboard(&text);
+                                                pending_osc52 = Some(text);
+                                            }
+                                        }
+                                    }
+                                    rsel_start = None;
+                                    rsel_end = None;
+                                    rsel_pane_rect = None;
+                                    rsel_block = false;
+                                    rsel_dragged = false;
+                                    selection_changed = true;
+                                }
                                 // On Windows, suppress Ctrl+V Press — the console host
                                 // already injected clipboard content as character events
                                 // and the paste mechanism handles them.  Forwarding C-v
@@ -2072,15 +2228,81 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                     pane_id, rel_col, rel_row));
                                                 rsel_start = None;
                                                 rsel_end = None;
+                                                rsel_pane_rect = None;
+                                                rsel_block = false;
                                                 selection_changed = true;
                                             } else {
                                                 cmd_batch.push(format!("pane-mouse {} 0 {} {} M\n",
                                                     pane_id, rel_col, rel_row));
                                                 border_drag = false;
-                                                rsel_start = Some((me.column, me.row));
-                                                rsel_end = Some((me.column, me.row));
-                                                rsel_dragged = false;
-                                                selection_changed = true;
+
+                                                // Ctrl+click extends an existing selection to the click
+                                                // position without starting a new one. (Shift+click
+                                                // cannot be used on Windows Terminal — it is reserved
+                                                // for WT's native selection override.) Only active
+                                                // when pwsh-mouse-selection is on and a selection
+                                                // already exists in the same pane.
+                                                let ctrl_extend = client_pwsh_selection
+                                                    && me.modifiers.contains(KeyModifiers::CONTROL)
+                                                    && rsel_start.is_some()
+                                                    && rsel_pane_rect == Some(pane_rect);
+
+                                                if ctrl_extend {
+                                                    let r = pane_rect;
+                                                    let col = me.column.clamp(r.x, r.x + r.width.saturating_sub(1));
+                                                    let row = me.row.clamp(r.y, r.y + r.height.saturating_sub(1));
+                                                    rsel_end = Some((col, row));
+                                                    rsel_dragged = true;
+                                                    selection_changed = true;
+                                                } else if client_pwsh_selection {
+                                                    rsel_block = me.modifiers.contains(KeyModifiers::ALT);
+                                                    rsel_pane_rect = Some(pane_rect);
+                                                    rsel_dragged = false;
+                                                    selection_changed = true;
+
+                                                    let now = Instant::now();
+                                                    let is_multi = last_click.map_or(false, |(t, (c, r))| {
+                                                        now.duration_since(t) < Duration::from_millis(400)
+                                                            && c == me.column && r == me.row
+                                                    });
+                                                    click_count = if is_multi { click_count + 1 } else { 1 };
+                                                    last_click = Some((now, (me.column, me.row)));
+
+                                                    let word = if click_count == 2 {
+                                                        serde_json::from_str::<DumpState>(&prev_dump_buf).ok()
+                                                            .and_then(|s| word_bounds_at(
+                                                                &s.layout,
+                                                                last_sent_size.0,
+                                                                last_sent_size.1,
+                                                                pane_rect,
+                                                                me.column, me.row,
+                                                            ))
+                                                    } else {
+                                                        None
+                                                    };
+
+                                                    if let Some((ws, we)) = word {
+                                                        rsel_start = Some((ws, me.row));
+                                                        rsel_end = Some((we, me.row));
+                                                        rsel_dragged = true;
+                                                    } else if click_count >= 3 {
+                                                        let left = pane_rect.x;
+                                                        let right = pane_rect.x + pane_rect.width.saturating_sub(1);
+                                                        rsel_start = Some((left, me.row));
+                                                        rsel_end = Some((right, me.row));
+                                                        rsel_dragged = true;
+                                                    } else {
+                                                        rsel_start = Some((me.column, me.row));
+                                                        rsel_end = None;
+                                                    }
+                                                } else {
+                                                    // Legacy: start == end for 1-cell hint.
+                                                    rsel_start = Some((me.column, me.row));
+                                                    rsel_end = Some((me.column, me.row));
+                                                    rsel_pane_rect = Some(pane_rect);
+                                                    rsel_dragged = false;
+                                                    selection_changed = true;
+                                                }
                                             }
                                         } else {
                                             cmd_batch.push(format!("mouse-down {} {}\n", me.column, me.row));
@@ -2120,6 +2342,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                 last_sent_size.0,
                                                 last_sent_size.1,
                                                 s, e,
+                                                rsel_block,
                                             );
                                             if !text.is_empty() {
                                                 copy_to_system_clipboard(&text);
@@ -2194,10 +2417,28 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                         cmd_batch.push(format!("mouse-drag {} {}\n", me.column, me.row));
                                     }
                                 } else {
-                                    if rsel_start.is_some() {
-                                        rsel_end = Some((me.column, me.row));
-                                        rsel_dragged = true;
-                                        selection_changed = true;
+                                    if let Some(start) = rsel_start {
+                                        let (col, row) = if client_pwsh_selection {
+                                            if let Some(r) = rsel_pane_rect {
+                                                (
+                                                    me.column.clamp(r.x, r.x + r.width.saturating_sub(1)),
+                                                    me.row.clamp(r.y, r.y + r.height.saturating_sub(1)),
+                                                )
+                                            } else {
+                                                (me.column, me.row)
+                                            }
+                                        } else {
+                                            (me.column, me.row)
+                                        };
+                                        // Ignore micro-drags that stay on the
+                                        // initial click cell (#199 parity).
+                                        if (col, row) == start && !rsel_dragged {
+                                            // no-op
+                                        } else {
+                                            rsel_end = Some((col, row));
+                                            rsel_dragged = true;
+                                            selection_changed = true;
+                                        }
                                     }
                                 }
                             }
@@ -2208,28 +2449,44 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     border_drag = false;
                                     client_drag = None;
                                 } else if rsel_dragged {
-                                    rsel_end = Some((me.column, me.row));
-                                    if let (Some(s), Some(e)) = (rsel_start, rsel_end) {
-                                        if let Ok(state) = serde_json::from_str::<DumpState>(&prev_dump_buf) {
-                                            let text = extract_selection_text(
-                                                &state.layout,
-                                                last_sent_size.0,
-                                                last_sent_size.1,
-                                                s, e,
-                                            );
-                                            if !text.is_empty() {
-                                                copy_to_system_clipboard(&text);
-                                                pending_osc52 = Some(text);
+                                    if client_pwsh_selection {
+                                        // Windows 11 style: keep the selection
+                                        // visible until the user right-clicks to
+                                        // copy. Do not overwrite rsel_end here —
+                                        // the drag handler already tracks it,
+                                        // and double-click word bounds must not
+                                        // be replaced by the release-position.
+                                        selection_changed = true;
+                                    } else {
+                                        // Legacy: copy-on-release.
+                                        rsel_end = Some((me.column, me.row));
+                                        if let (Some(s), Some(e)) = (rsel_start, rsel_end) {
+                                            if let Ok(state) = serde_json::from_str::<DumpState>(&prev_dump_buf) {
+                                                let text = extract_selection_text(
+                                                    &state.layout,
+                                                    last_sent_size.0,
+                                                    last_sent_size.1,
+                                                    s, e,
+                                                    false,
+                                                );
+                                                if !text.is_empty() {
+                                                    copy_to_system_clipboard(&text);
+                                                    pending_osc52 = Some(text);
+                                                }
                                             }
                                         }
+                                        rsel_start = None;
+                                        rsel_end = None;
+                                        rsel_pane_rect = None;
+                                        rsel_block = false;
+                                        rsel_dragged = false;
+                                        selection_changed = true;
                                     }
-                                    rsel_start = None;
-                                    rsel_end = None;
-                                    rsel_dragged = false;
-                                    selection_changed = true;
                                 } else {
                                     rsel_start = None;
                                     rsel_end = None;
+                                    rsel_pane_rect = None;
+                                    rsel_block = false;
                                     selection_changed = true;
                                     if client_copy_mode {
                                         if let Some(&(pane_id, pane_rect)) = client_pane_rects.iter().find(|(_, r)| {
@@ -2473,6 +2730,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         let base_index = state.base_index;
         client_base_index = base_index;
         client_copy_mode = active_pane_in_copy_mode(&root);
+        client_pwsh_selection = state.pwsh_mouse_selection;
         client_zoomed = state.zoomed;
         let dim_preds = state.prediction_dimming;
         clock_active = state.clock_mode;
@@ -2676,6 +2934,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // ── STEP 3: Render ───────────────────────────────────────────────
         let sel_s = rsel_start;
         let sel_e = rsel_end;
+        let sel_rect = rsel_pane_rect;
+        let sel_pwsh = client_pwsh_selection;
+        let sel_block = rsel_block;
         let status_at_top = status_position_str == "top";
         if client_log_enabled() {
             let sz = terminal.size().unwrap_or_default();
@@ -3183,23 +3444,40 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             // selection and the blue overlay would hide everything.
             if let (Some(s), Some(e)) = (sel_s, sel_e) {
             if !active_pane_in_copy_mode(&root) {
-                // Normalise so (r0,c0) <= (r1,c1) in reading order
-                let (r0, c0, r1, c1) = if (s.1, s.0) <= (e.1, e.0) {
-                    (s.1, s.0, e.1, e.0)
+                let (r0, c0, r1, c1) = normalize_selection(s, e, sel_block);
+                // pwsh-mouse-selection: clip intermediate rows to the
+                // originating pane so they never bleed into neighbours.
+                // Legacy mode: full terminal width on intermediate rows.
+                let (pane_left, pane_right) = if sel_pwsh {
+                    if let Some(r) = sel_rect {
+                        (r.x, r.x + r.width.saturating_sub(1))
+                    } else {
+                        (0, area.width.saturating_sub(1))
+                    }
                 } else {
-                    (e.1, e.0, s.1, s.0)
+                    (0, area.width.saturating_sub(1))
                 };
                 let buf = f.buffer_mut();
                 let buf_area = buf.area;
                 for row in r0..=r1 {
-                    let col_start = if row == r0 { c0 } else { 0 };
-                    let col_end = if row == r1 { c1 } else { area.width.saturating_sub(1) };
+                    let col_start = if sel_block {
+                        c0.max(pane_left)
+                    } else if row == r0 { c0.max(pane_left) } else { pane_left };
+                    let col_end = if sel_block {
+                        c1.min(pane_right)
+                    } else if row == r1 { c1.min(pane_right) } else { pane_right };
+                    if col_start > col_end { continue; }
                     for col in col_start..=col_end {
                         if row < buf_area.height && col < buf_area.width {
                             let idx = (row - buf_area.y) as usize * buf_area.width as usize
                                 + (col - buf_area.x) as usize;
                             if idx < buf.content.len() {
-                                buf.content[idx].set_style(Style::default().fg(Color::Black).bg(Color::LightCyan));
+                                let style = if sel_pwsh {
+                                    Style::default().fg(Color::Black).bg(Color::White)
+                                } else {
+                                    Style::default().fg(Color::Black).bg(Color::LightCyan)
+                                };
+                                buf.content[idx].set_style(style);
                             }
                         }
                     }

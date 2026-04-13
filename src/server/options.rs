@@ -31,6 +31,7 @@ pub(crate) fn get_option_value(app: &AppState, name: &str) -> String {
         "escape-time" => app.escape_time_ms.to_string(),
         "mouse" => if app.mouse_enabled { "on".into() } else { "off".into() },
         "scroll-enter-copy-mode" => if app.scroll_enter_copy_mode { "on".into() } else { "off".into() },
+        "pwsh-mouse-selection" => if app.pwsh_mouse_selection { "on".into() } else { "off".into() },
         "status" => {
             if !app.status_visible { "off".into() }
             else if app.status_lines >= 2 { app.status_lines.to_string() }
@@ -169,6 +170,7 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
         }
         "mouse" => { app.mouse_enabled = value == "on" || value == "true" || value == "1"; }
         "scroll-enter-copy-mode" => { app.scroll_enter_copy_mode = matches!(value, "on" | "true" | "1"); }
+        "pwsh-mouse-selection" => { app.pwsh_mouse_selection = matches!(value, "on" | "true" | "1"); }
         "prefix" => {
             if let Some(kc) = parse_key_string(value) {
                 app.prefix_key = kc;
