@@ -13,11 +13,20 @@ pub fn expand_run_shell_path(cmd: &str) -> String {
         let home = std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
             .unwrap_or_default();
+        // On Windows, USERPROFILE may contain mixed slashes and config paths often use forward slashes.
+        // Normalize home to backslashes first to avoid creating mixed paths like C:\Users\user/.psmux/...
+        #[cfg(windows)]
+        let home = home.replace('/', "\\");
         cmd.replace("~/", &format!("{}/", home))
            .replace("~\\", &format!("{}\\", home))
     } else {
         cmd.to_string()
     };
+
+    // Step 1b: On Windows, normalize remaining forward slashes to backslashes
+    // to avoid issues with paths like C:\Users\user/.psmux/...
+    #[cfg(windows)]
+    let cmd = cmd.replace('/', "\\");
 
     // Step 2: XDG fallback for plugin paths
     let home = std::env::var("USERPROFILE")
