@@ -381,7 +381,25 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
                     let first = bytes[0];
                     let last = bytes[bytes.len() - 1];
                     if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
-                        trimmed[1..trimmed.len()-1].to_string()
+                        // Strip outer quotes AND unescape interior sequences (tmux-compatible)
+                        // \" becomes " and \\ becomes \
+                        let inner = &trimmed[1..trimmed.len()-1];
+                        let mut result = String::with_capacity(inner.len());
+                        let chars: Vec<char> = inner.chars().collect();
+                        let mut j = 0;
+                        while j < chars.len() {
+                            if chars[j] == '\\' && j + 1 < chars.len() {
+                                let next = chars[j + 1];
+                                if next == '"' || next == '\\' {
+                                    result.push(next);
+                                    j += 2;
+                                    continue;
+                                }
+                            }
+                            result.push(chars[j]);
+                            j += 1;
+                        }
+                        result
                     } else {
                         cmd
                     }
