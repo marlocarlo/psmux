@@ -960,7 +960,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         let encoded = base64_encode(&paste_pend);
                         cmd_batch.push(format!("send-paste {}\n", encoded));
                         // Suppress clipboard-read fallback
-                        paste_suppress_until = Some(Instant::now() + Duration::from_secs(2));
+                        paste_suppress_until = Some(Instant::now() + Duration::from_millis(200));
                     }
                     paste_pend.clear();
                     paste_pend_start = None;
@@ -1057,7 +1057,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         // Suppress the clipboard-read fallback that fires
                         // when Ctrl+V Release arrives later (the paste was
                         // already sent via stage2).
-                        paste_suppress_until = Some(Instant::now() + Duration::from_secs(2));
+                        paste_suppress_until = Some(Instant::now() + Duration::from_millis(200));
                     }
                 }
             }
@@ -2161,7 +2161,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                             paste_pend_start = None;
                             paste_stage2 = false;
                             paste_confirmed = false;
-                            paste_suppress_until = Some(Instant::now() + Duration::from_secs(2));
+                            paste_suppress_until = Some(Instant::now() + Duration::from_millis(200));
                         }
                     }
                     Event::Mouse(me) => {
@@ -2358,7 +2358,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     selection_changed = true;
                                     // Suppress text key events that VS Code's ConPTY
                                     // injects after a right-click copy action.
-                                    paste_suppress_until = Some(Instant::now() + Duration::from_secs(2));
+                                    paste_suppress_until = Some(Instant::now() + Duration::from_millis(200));
                                 } else {
                                     // No selection, no TUI — paste from clipboard (pwsh-style)
                                     rsel_start = None;
@@ -2602,7 +2602,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 paste_confirmed = false;
                 // Suppress subsequent char accumulation and clipboard-read
                 // fallback — the paste was already delivered.
-                paste_suppress_until = Some(Instant::now() + Duration::from_secs(2));
+                paste_suppress_until = Some(Instant::now() + Duration::from_millis(200));
             } else if paste_confirmed && paste_pend.is_empty() {
                 // Ctrl+V Release with no buffered chars.  If paste was
                 // already sent via stage2 timeout or Event::Paste, the
@@ -2621,7 +2621,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                             // Suppress subsequent char accumulation — the
                             // clipboard chars may arrive later (async inject)
                             // and would cause a duplicate paste via stage2.
-                            paste_suppress_until = Some(Instant::now() + Duration::from_secs(2));
+                            paste_suppress_until = Some(Instant::now() + Duration::from_millis(200));
                         }
                     }
                 }
