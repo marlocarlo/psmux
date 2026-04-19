@@ -1,0 +1,85 @@
+[package]
+name = "psmux"
+version = "3.3.2"
+edition = "2021"
+description = "Terminal multiplexer for Windows - tmux alternative for PowerShell and Windows Terminal"
+license = "MIT"
+repository = "https://github.com/psmux/psmux"
+readme = "README.md"
+keywords = ["terminal", "multiplexer", "tmux", "windows", "powershell"]
+categories = ["command-line-utilities"]
+
+[workspace]
+members = [".", "crates/portable-pty-psmux", "crates/vt100-psmux"]
+exclude = [
+    "target/",
+    "release/",
+    "tests/",
+    "tests-rs/",
+    "packages/",
+    "psmux-windows-x86_64/",
+    ".github/",
+    "scripts/",
+    "scoop/",
+    "examples/",
+    "*.txt",
+]
+
+# Disable auto-discovery of integration tests from tests/ directory
+[[test]]
+name = "test_vt100_mouse"
+path = "tests-rs/test_vt100_mouse.rs"
+
+[[test]]
+name = "test_issue155_sgr_attrs"
+path = "tests-rs/test_issue155_sgr_attrs.rs"
+
+[[test]]
+name = "test_issue155_rendering"
+path = "tests-rs/test_issue155_rendering.rs"
+
+[[test]]
+name = "test_issue201_rename_dialog"
+path = "tests-rs/test_issue201_rename_dialog.rs"
+
+# Windows only
+[target.'cfg(not(windows))'.dependencies]
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_DataExchange",
+] }
+
+[[bin]]
+name = "psmux"
+path = "src/main.rs"
+
+[[bin]]
+name = "pmux"
+path = "src/main.rs"
+
+[[bin]]
+name = "tmux"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+portable-pty = { version = "0.9.3", path = "crates/portable-pty-psmux", package = "portable-pty-psmux" }
+which = "8"
+chrono = "0.4"
+vt100 = { version = "0.16.6", path = "crates/vt100-psmux", package = "vt100-psmux" }
+unicode-width = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+regex = "1"
+glob = "0.3"
+anyhow = "1"
+base64 = "0.22"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "symbols"

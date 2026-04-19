@@ -1,0 +1,36 @@
+<svg width="512" height="512" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="iconbg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#00d9ff;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0066cc;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Background circle -->
+  <circle cx="256" cy="256" r="240" fill="url(#iconbg)"/>
+  
+  <!-- Terminal window -->
+  <rect x="100" y="140" width="312" height="232" rx="12" fill="#1a1a2e"/>
+  
+  <!-- Window title bar -->
+  <rect x="100" y="140" width="312" height="32" rx="12" fill="#0f3460"/>
+  
+  <!-- Window control buttons -->
+  <circle cx="120" cy="156" r="5" fill="#ff5f56"/>
+  <circle cx="140" cy="156" r="5" fill="#ffbd2e"/>
+  <circle cx="160" cy="156" r="5" fill="#27c93f"/>
+  
+  <!-- Split lines (representing panes) -->
+  <line x1="256" y1="185" x2="256" y2="360" stroke="#00d9ff" stroke-width="4"/>
+  <line x1="120" y1="272" x2="236" y2="272" stroke="#00d9ff" stroke-width="4"/>
+  
+  <!-- PS> prompts in panes -->
+  <text x="130" y="220" font-family="'Courier New', monospace" font-size="20" fill="#4ade80" font-weight="bold">PS&gt;</text>
+  <text x="130" y="320" font-family="'Courier New', monospace" font-size="20" fill="#4ade80" font-weight="bold">PS&gt;</text>
+  <text x="276" y="270" font-family="'Courier New', monospace" font-size="20" fill="#4ade80" font-weight="bold">PS&gt;</text>
+  
+  <!-- Active cursor -->
+  <rect x="242" y="208" width="10" height="18" fill="#00d9ff" opacity="0.8">
+    <animate attributeName="opacity" values="0.8;0.2;0.8" dur="1s" repeatCount="indefinite"/>
+  </rect>
+</svg>

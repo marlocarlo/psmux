@@ -1,0 +1,56 @@
+<svg width="1280" height="640" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1a2e;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#16213e;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Background -->
+  <rect width="1280" height="640" fill="url(#bg)"/>
+  
+  <!-- Terminal window frame -->
+  <rect x="80" y="120" width="1120" height="400" rx="12" fill="#0f3460" opacity="0.3"/>
+  <rect x="80" y="120" width="1120" height="40" rx="12" fill="#0f3460"/>
+  
+  <!-- Window buttons -->
+  <circle cx="110" cy="140" r="6" fill="#ff5f56"/>
+  <circle cx="135" cy="140" r="6" fill="#ffbd2e"/>
+  <circle cx="160" cy="140" r="6" fill="#27c93f"/>
+  
+  <!-- Split pane indicators -->
+  <line x1="640" y1="180" x2="640" y2="500" stroke="#00d9ff" stroke-width="3" opacity="0.5"/>
+  <line x1="150" y1="340" x2="570" y2="340" stroke="#00d9ff" stroke-width="3" opacity="0.5"/>
+  
+  <!-- Logo text -->
+  <text x="640" y="280" font-family="'Courier New', monospace" font-size="120" font-weight="bold" fill="#00d9ff" text-anchor="middle">psmux</text>
+  
+  <!-- Tagline -->
+  <text x="640" y="420" font-family="'Segoe UI', Arial, sans-serif" font-size="32" fill="#e0e0e0" text-anchor="middle">Terminal Multiplexer for Windows</text>
+  
+  <!-- Feature badges -->
+  <g transform="translate(280, 460)">
+    <rect width="140" height="40" rx="20" fill="#00d9ff" opacity="0.2"/>
+    <text x="70" y="27" font-family="'Segoe UI', Arial, sans-serif" font-size="16" fill="#00d9ff" text-anchor="middle" font-weight="600">tmux-compatible</text>
+  </g>
+  
+  <g transform="translate(440, 460)">
+    <rect width="120" height="40" rx="20" fill="#00d9ff" opacity="0.2"/>
+    <text x="60" y="27" font-family="'Segoe UI', Arial, sans-serif" font-size="16" fill="#00d9ff" text-anchor="middle" font-weight="600">Windows-native</text>
+  </g>
+  
+  <g transform="translate(580, 460)">
+    <rect width="100" height="40" rx="20" fill="#00d9ff" opacity="0.2"/>
+    <text x="50" y="27" font-family="'Segoe UI', Arial, sans-serif" font-size="16" fill="#00d9ff" text-anchor="middle" font-weight="600">Rust-powered</text>
+  </g>
+  
+  <g transform="translate(700, 460)">
+    <rect width="100" height="40" rx="20" fill="#00d9ff" opacity="0.2"/>
+    <text x="50" y="27" font-family="'Segoe UI', Arial, sans-serif" font-size="16" fill="#00d9ff" text-anchor="middle" font-weight="600">No WSL</text>
+  </g>
+  
+  <!-- Prompt symbols in panes -->
+  <text x="200" y="240" font-family="'Courier New', monospace" font-size="24" fill="#4ade80" opacity="0.6">PS&gt;</text>
+  <text x="200" y="450" font-family="'Courier New', monospace" font-size="24" fill="#4ade80" opacity="0.6">PS&gt;</text>
+  <text x="750" y="340" font-family="'Courier New', monospace" font-size="24" fill="#4ade80" opacity="0.6">PS&gt;</text>
+</svg>
