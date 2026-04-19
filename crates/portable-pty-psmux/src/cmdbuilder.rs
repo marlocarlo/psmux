@@ -140,7 +140,7 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
         {
             for res in sys_env.enum_values() {
                 if let Ok((name, value)) = res {
-                    if name.to_ascii_lowercase() == "username" {
+                    if name.eq_ignore_ascii_case("username") {
                         continue;
                     }
                     if let Ok(value) = reg_value_to_string(&value) {
@@ -163,7 +163,7 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
                 if let Ok((name, value)) = res {
                     if let Ok(value) = reg_value_to_string(&value) {
                         // Merge the system and user paths together
-                        let value = if name.to_ascii_lowercase() == "path" {
+                        let value = if name.eq_ignore_ascii_case("path") {
                             match env.get(&EnvEntry::map_key(name.clone().into())) {
                                 Some(entry) => {
                                     let mut result = OsString::new();
