@@ -1,3 +1,35 @@
+> ## ⚠️ This branch is archived. The modularization effort has been abandoned.
+>
+> **What happened:** We explored splitting psmux's monolithic `src/` (31 files, ~39,500 lines) into a deeply
+> modular structure (209 files across 6 top level modules: `base/`, `engine/`, `tui/`, `net/`, `os/`, `shell/`).
+> Every large file was decomposed into small, focused units under 400 lines each.
+>
+> **Why we stopped:** After completing the split and evaluating both codebases side by side, we concluded that
+> the modular layout was *harder* to work with overall. The reasons:
+>
+> 1. **Discovery overhead dominates.** Finding where code lives across 209 files requires far more searching
+>    than navigating 31 well named files. The flat structure lets you go straight to `client.rs` or `config.rs`
+>    without traversing nested directories.
+>
+> 2. **Cross file tracing is expensive.** A typical bug fix in the monolithic version touches 1 to 3 files.
+>    The same fix in the modular version touches 5 to 10 files, each requiring its own context load.
+>
+> 3. **No real readability gain.** The original files are large but coherent. Reading a 200 line range from
+>    `client.rs` (4,493 lines) gives you full surrounding context. Reading a 370 line modular file gives you
+>    an isolated fragment that still requires tracing imports and call sites.
+>
+> 4. **AI tooling strongly favors fewer, larger files.** Grep based search, targeted line reads, and context
+>    management all work better when the file count is low. The modular structure multiplied tool calls by 3x to 5x
+>    with no quality improvement.
+>
+> 5. **The line count stayed the same.** Modularization added ~400 lines of `mod.rs` re-exports and boilerplate
+>    while delivering zero reduction in actual logic.
+>
+> **The main psmux repo** continues active development with the original structure.
+> This branch is preserved as a reference for anyone considering a similar refactor.
+
+---
+
 ```
 ╔═══════════════════════════════════════════════════════════╗
 ║   ██████╗ ███████╗███╗   ███╗██╗   ██╗██╗  ██╗            ║
