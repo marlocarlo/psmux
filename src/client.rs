@@ -460,6 +460,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let mut session_entries: Vec<(String, String)> = Vec::new();
     let mut session_selected: usize = 0;
     let mut session_scroll: usize = 0;
+    // Digits typed while the picker is open accumulate here and are consumed
+    // when the user presses Enter — "12" + Enter jumps to the 12th session.
+    let mut session_num_buffer = String::new();
     let mut confirm_cmd: Option<String> = None;  // pending kill confirmation
     let current_session = name.clone();
     let mut last_sent_size: (u16, u16) = (0, 0);
@@ -1674,6 +1677,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 session_entries.clear();
                                 session_selected = 0;
                                 session_scroll = 0;
+                                session_num_buffer.clear();
                                 let dir = format!("{}\\.psmux", home);
                                 if let Ok(entries) = std::fs::read_dir(&dir) {
                                     for e in entries.flatten() {
@@ -1836,16 +1840,36 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 KeyCode::Home if session_chooser => { session_selected = 0; }
                                 KeyCode::End if session_chooser => { session_selected = session_entries.len().saturating_sub(1); }
                                 KeyCode::Enter if session_chooser => {
-                                    if let Some((sname, _)) = session_entries.get(session_selected) {
-                                        if sname != &current_session {
-                                            cmd_batch.push("client-detach\n".into());
-                                            env::set_var("PSMUX_SWITCH_TO", sname);
-                                            quit = true;
+                                    // If the user has typed a number, that wins over the arrow cursor.
+                                    // Buffer is 1-based: "1" → first entry, "12" → twelfth. Out-of-range
+                                    // or unparseable → do nothing (keep buffer so user can Backspace).
+                                    let target_idx: Option<usize> = if session_num_buffer.is_empty() {
+                                        Some(session_selected)
+                                    } else {
+                                        match session_num_buffer.parse::<usize>() {
+                                            Ok(n) if n >= 1 && n <= session_entries.len() => Some(n - 1),
+                                            _ => None,
                                         }
-                                        session_chooser = false;
+                                    };
+                                    if let Some(idx) = target_idx {
+                                        if let Some((sname, _)) = session_entries.get(idx) {
+                                            if sname != &current_session {
+                                                cmd_batch.push("client-detach\n".into());
+                                                env::set_var("PSMUX_SWITCH_TO", sname);
+                                                quit = true;
+                                            }
+                                            session_chooser = false;
+                                            session_num_buffer.clear();
+                                        }
                                     }
                                 }
-                                KeyCode::Esc if session_chooser => { session_chooser = false; }
+                                KeyCode::Esc if session_chooser => {
+                                    session_chooser = false;
+                                    session_num_buffer.clear();
+                                }
+                                KeyCode::Backspace if session_chooser => {
+                                    session_num_buffer.pop();
+                                }
                                 KeyCode::Char('x') if session_chooser => {
                                     // Kill the selected session (like tmux session chooser)
                                     if let Some((sname, _)) = session_entries.get(session_selected) {
@@ -1880,9 +1904,21 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                             if session_entries.is_empty() {
                                                 session_chooser = false;
                                             }
+                                            // Indexes shifted; drop any pending jump buffer.
+                                            session_num_buffer.clear();
                                         }
                                     }
                                 }
+                                KeyCode::Char(c) if session_chooser && c.is_ascii_digit() => {
+                                    // Accumulate into the jump buffer — Enter consumes it.
+                                    // Cap length so extremely long inputs can't grow unbounded.
+                                    if session_num_buffer.len() < 6 {
+                                        session_num_buffer.push(c);
+                                    }
+                                }
+                                // Absorb any other char while the session picker is open so
+                                // it cannot leak through to the focused pane's PTY.
+                                KeyCode::Char(_) if session_chooser => {}
                                 KeyCode::Up if tree_chooser => { if tree_selected > 0 { tree_selected -= 1; } }
                                 KeyCode::Down if tree_chooser => { if tree_selected + 1 < tree_entries.len() { tree_selected += 1; } }
                                 KeyCode::Enter if tree_chooser => {
@@ -3685,33 +3721,50 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
 
             if session_chooser {
                 let sel_style = crate::rendering::parse_tmux_style(&mode_style_str);
-                let overlay = Block::default().borders(Borders::ALL).title("choose-session (enter=switch, x=kill, esc=close)").border_style(sel_style);
-                // Dynamic height: content lines + 2 (borders), capped to
-                // available space so the overlay never exceeds the terminal.
-                let sess_h = ((session_entries.len() as u16).saturating_add(2))
+                let overlay = Block::default().borders(Borders::ALL).title("choose-session (digits+enter=jump, enter=switch, x=kill, esc=close)").border_style(sel_style);
+                // Dynamic height: content lines + 2 (borders), plus a blank
+                // line and a "go to N" line while the jump buffer is open.
+                let buffer_rows: u16 = if session_num_buffer.is_empty() { 0 } else { 2 };
+                let sess_h = (session_entries.len() as u16)
+                    .saturating_add(2)
+                    .saturating_add(buffer_rows)
                     .max(5)
                     .min(content_chunk.height.saturating_sub(2));
                 let oa = centered_rect(70, sess_h, content_chunk);
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
                 let inner = overlay.inner(oa);
-                let visible_h = inner.height as usize;
+                // Reserve the last two inner rows for the jump-buffer indicator
+                // when active; the entry list scrolls within the remaining rows.
+                let reserved = buffer_rows as usize;
+                let visible_h = (inner.height as usize).saturating_sub(reserved);
                 // Keep session_selected in view
-                if session_selected >= session_scroll + visible_h {
+                if visible_h > 0 && session_selected >= session_scroll + visible_h {
                     session_scroll = session_selected.saturating_sub(visible_h - 1);
                 }
                 if session_selected < session_scroll {
                     session_scroll = session_selected;
                 }
+                // Width of the row-number column — grows with session count so
+                // entries stay aligned past 9, 99, 999.
+                let num_width = session_entries.len().to_string().len();
                 let mut lines: Vec<Line> = Vec::new();
                 for (i, (sname, info)) in session_entries.iter().enumerate().skip(session_scroll).take(visible_h) {
                     let marker = if sname == &current_session { "*" } else { " " };
+                    let row = format!("{:>w$}. {} {}", i + 1, marker, info, w = num_width);
                     let line = if i == session_selected {
-                        Line::from(Span::styled(format!("{} {}", marker, info), sel_style))
+                        Line::from(Span::styled(row, sel_style))
                     } else {
-                        Line::from(format!("{} {}", marker, info))
+                        Line::from(row)
                     };
                     lines.push(line);
+                }
+                if !session_num_buffer.is_empty() {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        format!("go to {}", session_num_buffer),
+                        sel_style,
+                    )));
                 }
                 let para = Paragraph::new(Text::from(lines));
                 f.render_widget(para, inner);
