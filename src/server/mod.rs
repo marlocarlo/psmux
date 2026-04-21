@@ -25,7 +25,7 @@ use helpers::{collect_pane_paths_server, serialize_bindings_json, json_escape_st
     list_windows_json_with_tabs, combined_data_version, TMUX_COMMANDS};
 use options::{get_option_value, get_window_option_value, render_window_options, apply_set_option};
 
-use crate::input::{send_text_to_active, send_key_to_active, send_paste_to_active, move_focus, find_best_pane_in_direction, find_wrap_target};
+use crate::input::{send_text_to_active, send_key_to_active, send_paste_to_active, move_focus, move_focus_preserving_zoom, find_best_pane_in_direction, find_wrap_target};
 use crate::copy_mode::{enter_copy_mode, exit_copy_mode, move_copy_cursor, current_prompt_pos,
     yank_selection, scroll_copy_up, scroll_copy_down, switch_with_copy_save,
     capture_active_pane_text, capture_active_pane_range, capture_active_pane_styled};
@@ -1889,7 +1889,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         _ => {} // ignore unknown copy-mode commands
                     }
                 }
-                CtrlReq::SelectPane(dir) => {
+                CtrlReq::SelectPane(dir, keep_zoom) => {
                     if let Some(cmds) = app.hooks.get("before-select-pane") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
                     // Auto-unzoom when navigating to another pane (tmux behavior).
                     // For directional nav: unzoom first so compute_rects uses
@@ -1902,36 +1902,47 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 "U" => FocusDir::Up, "D" => FocusDir::Down,
                                 "L" => FocusDir::Left, _ => FocusDir::Right,
                             };
-                            let was_zoomed = unzoom_if_zoomed(&mut app);
-                            if was_zoomed {
+                            if keep_zoom {
+                                let old_path = app.windows[app.active_idx].active_path.clone();
+                                switch_with_copy_save(&mut app, |app| {
+                                    move_focus_preserving_zoom(app, focus_dir);
+                                });
+                                if app.windows[app.active_idx].active_path != old_path {
+                                    app.last_pane_path = old_path;
+                                }
+                            } else {
+                                let was_zoomed = unzoom_if_zoomed(&mut app);
+                                if was_zoomed {
                                 // Zoom-aware: check direct neighbor or wrap target (tmux parity: unzoom+wrap).
                                 let win = &app.windows[app.active_idx];
                                 let mut rects: Vec<(Vec<usize>, ratatui::layout::Rect)> = Vec::new();
                                 crate::tree::compute_rects(&win.root, app.last_window_area, &mut rects);
                                 let active_idx = rects.iter().position(|(path, _)| *path == win.active_path);
-                                let has_target = if let Some(ai) = active_idx {
-                                    let (_, arect) = &rects[ai];
-                                    find_best_pane_in_direction(&rects, ai, arect, focus_dir, &[], &[])
-                                        .or_else(|| find_wrap_target(&rects, ai, arect, focus_dir, &[], &[]))
-                                        .is_some()
-                                } else { false };
-                                if has_target {
+                                let has_target = 
+                                    if let Some(ai) = active_idx {
+                                        let (_, arect) = &rects[ai];
+                                        find_best_pane_in_direction(&rects, ai, arect, focus_dir, &[], &[])
+                                            .or_else(|| find_wrap_target(&rects, ai, arect, focus_dir, &[], &[]))
+                                            .is_some()
+                                    } else { false };
+                                    if has_target {
+                                        let old_path = app.windows[app.active_idx].active_path.clone();
+                                        switch_with_copy_save(&mut app, |app| {
+                                            move_focus(app, focus_dir);
+                                        });
+                                        app.last_pane_path = old_path;
+                                    } else {
+                                        // No reachable pane (single-pane window) — re-zoom
+                                        toggle_zoom(&mut app);
+                                    }
+                                } else {
                                     let old_path = app.windows[app.active_idx].active_path.clone();
                                     switch_with_copy_save(&mut app, |app| {
                                         move_focus(app, focus_dir);
                                     });
-                                    app.last_pane_path = old_path;
-                                } else {
-                                    // No reachable pane (single-pane window) — re-zoom
-                                    toggle_zoom(&mut app);
-                                }
-                            } else {
-                                let old_path = app.windows[app.active_idx].active_path.clone();
-                                switch_with_copy_save(&mut app, |app| {
-                                    move_focus(app, focus_dir);
-                                });
-                                if app.windows[app.active_idx].active_path != old_path {
-                                    app.last_pane_path = old_path;
+                                    if app.windows[app.active_idx].active_path != old_path {
+                                        app.last_pane_path = old_path;
+                                    }
                                 }
                             }
                         }

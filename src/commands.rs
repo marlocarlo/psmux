@@ -503,7 +503,9 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
         "resize-pane" | "resizep" if parts.iter().any(|p| *p == "-Z") => Some(Action::ZoomPane),
         "zoom-pane" => Some(Action::ZoomPane),
         "select-pane" | "selectp" => {
-            if parts.iter().any(|p| *p == "-U") {
+            if parts.iter().any(|p| *p == "-Z") {
+                Some(Action::Command(cmd.to_string()))
+            } else if parts.iter().any(|p| *p == "-U") {
                 Some(Action::MoveFocus(FocusDir::Up))
             } else if parts.iter().any(|p| *p == "-D") {
                 Some(Action::MoveFocus(FocusDir::Down))
@@ -1010,16 +1012,23 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 });
                 return Ok(());
             }
+            let keep_zoom = parts.iter().any(|p| *p == "-Z");
             let dir = if parts.iter().any(|p| *p == "-U") { FocusDir::Up }
                 else if parts.iter().any(|p| *p == "-D") { FocusDir::Down }
                 else if parts.iter().any(|p| *p == "-L") { FocusDir::Left }
                 else if parts.iter().any(|p| *p == "-R") { FocusDir::Right }
                 else { return Ok(()); };
-            // Zoom-aware directional navigation (tmux parity #134):
-            // If zoomed, check if there's a direct neighbor OR a wrap target.
-            // If yes: cancel zoom and navigate to it.
-            // If no (single-pane window): no-op — stay zoomed.
-            if app.windows[app.active_idx].zoom_saved.is_some() {
+            if keep_zoom {
+                switch_with_copy_save(app, |app| {
+                    let win = &app.windows[app.active_idx];
+                    app.last_pane_path = win.active_path.clone();
+                    crate::input::move_focus_preserving_zoom(app, dir);
+                });
+            } else if app.windows[app.active_idx].zoom_saved.is_some() {
+                // Zoom-aware directional navigation (tmux parity #134):
+                // If zoomed, check if there's a direct neighbor OR a wrap target.
+                // If yes: cancel zoom and navigate to it.
+                // If no (single-pane window): no-op — stay zoomed.
                 // Temporarily unzoom to compute real geometry
                 let saved = app.windows[app.active_idx].zoom_saved.take();
                 if let Some(ref s) = saved {

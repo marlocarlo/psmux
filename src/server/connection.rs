@@ -874,7 +874,8 @@ match cmd {
             let _ = tx.send(CtrlReq::SetPaneStyle(style));
         }
         if !dir.is_empty() {
-            let _ = tx.send(CtrlReq::SelectPane(dir.to_string()));
+            let keep_zoom = args.iter().any(|a| *a == "-Z");
+            let _ = tx.send(CtrlReq::SelectPane(dir.to_string(), keep_zoom));
         }
     }
     "select-window" | "selectw" => {

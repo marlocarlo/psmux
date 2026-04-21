@@ -1388,6 +1388,20 @@ pub fn move_focus(app: &mut AppState, dir: FocusDir) {
     }
 }
 
+pub fn move_focus_preserving_zoom(app: &mut AppState, dir: FocusDir) {
+    if app.windows.get(app.active_idx).map_or(false, |w| w.zoom_saved.is_some()) {
+        let old_path = app.windows[app.active_idx].active_path.clone();
+        toggle_zoom(app);
+        move_focus(app, dir);
+        toggle_zoom(app);
+        if app.windows[app.active_idx].active_path == old_path {
+            app.last_pane_path = old_path;
+        }
+    } else {
+        move_focus(app, dir);
+    }
+}
+
 /// Spatial pane navigation: find the best pane in the given direction.
 /// Prefers panes that overlap on the perpendicular axis (visually adjacent),
 /// then picks the closest by primary-axis gap, tie-broken by MRU recency

@@ -285,6 +285,32 @@ fn normalize_only_strips_shift_from_char() {
     assert_eq!(shift_bs, (KeyCode::Backspace, KeyModifiers::SHIFT));
 }
 
+#[test]
+fn bind_key_select_pane_z_stays_as_command() {
+    let mut app = AppState::new("test".to_string());
+    crate::config::parse_bind_key(&mut app, "bind-key -n C-h select-pane -Z -L");
+    let root = app.key_tables.get("root").expect("root table should exist");
+    let bind = &root[0];
+    assert!(matches!(&bind.action, crate::types::Action::Command(cmd) if cmd == "select-pane -Z -L"));
+}
+
+#[test]
+fn parse_config_line_select_pane_z_stays_as_command() {
+    let mut app = AppState::new("test".to_string());
+    crate::config::parse_config_line(&mut app, "bind-key -r h select-pane -Z -L");
+    let prefix = app.key_tables.get("prefix").expect("prefix table should exist");
+    let bind = prefix.iter().find(|b| matches!(b.key.0, KeyCode::Char('h'))).expect("h binding should exist");
+    assert!(matches!(&bind.action, crate::types::Action::Command(cmd) if cmd == "select-pane -Z -L"));
+}
+
+#[test]
+fn serialized_bindings_preserve_select_pane_z_command() {
+    let mut app = AppState::new("test".to_string());
+    crate::config::parse_config_line(&mut app, "bind-key -r h select-pane -Z -L");
+    let json = crate::server::helpers::serialize_bindings_json(&app);
+    assert!(json.contains("select-pane -Z -L"));
+}
+
 // ── combined_data_version includes copy mode state (issue #152) ──
 
 #[test]

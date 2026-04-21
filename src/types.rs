@@ -932,7 +932,7 @@ pub enum CtrlReq {
     SetPaneStyle(String),
     SendKeys(String, bool),
     SendKeysX(String),  // send-keys -X copy-mode-command
-    SelectPane(String),
+    SelectPane(String, bool),
     SelectWindow(usize),
     ListPanes(mpsc::Sender<String>),
     ListPanesFormat(mpsc::Sender<String>, String),
