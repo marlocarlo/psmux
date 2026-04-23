@@ -3208,7 +3208,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 }
             }
 
-            fn render_json(f: &mut Frame, node: &LayoutJson, area: Rect, dim_preds: bool, border_fg: Color, active_border_fg: Color, clock_mode: bool, clock_colour: Color, active_rect: Option<Rect>, mode_style_str: &str, zoomed: bool, border_status: &str, border_format: &str) {
+            fn render_json(f: &mut Frame, node: &LayoutJson, area: Rect, dim_preds: bool, border_fg: Color, active_border_fg: Color, clock_mode: bool, clock_colour: Color, active_rect: Option<Rect>, mode_style_str: &str, zoomed: bool, border_status: &str, border_format: &str, total_panes: usize) {
                 match node {
                     LayoutJson::Leaf {
                         id,
@@ -3477,7 +3477,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
 
                         // Render children first
                         for (i, child) in children.iter().enumerate() {
-                            if i < rects.len() { render_json(f, child, rects[i], dim_preds, border_fg, active_border_fg, clock_mode, clock_colour, active_rect, mode_style_str, zoomed, border_status, border_format); }
+                            if i < rects.len() { render_json(f, child, rects[i], dim_preds, border_fg, active_border_fg, clock_mode, clock_colour, active_rect, mode_style_str, zoomed, border_status, border_format, total_panes); }
                         }
 
                         // Draw separator lines between children using direct buffer access.
@@ -3501,7 +3501,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 // Vertical separator line between left/right children.
                                 let sep_x = rects[i].x + rects[i].width;
                                 if sep_x < buf.area.x + buf.area.width {
-                                    if both_leaves {
+                                    if both_leaves && total_panes == 2 {
+                                        // total_panes is the whole-tree count, not local.
+                                        // When the entire window has exactly 2 panes, use a
+                                        // midpoint top/bottom split so each half of │ reflects
+                                        // its adjacent pane's active state (matches tmux behaviour).
                                         let left_active = matches!(&children[i], LayoutJson::Leaf { active, .. } if *active);
                                         let right_active = matches!(children.get(i + 1), Some(LayoutJson::Leaf { active, .. }) if *active);
                                         let left_sty = if left_active { active_border_style } else { border_style };
@@ -3517,6 +3521,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                             }
                                         }
                                     } else {
+                                        // 3+ panes: per-row adjacency — only rows that border
+                                        // the active pane are highlighted.
                                         for y in area.y..area.y + area.height {
                                             let active = active_rect.map_or(false, |ar| {
                                                 y >= ar.y && y < ar.y + ar.height
@@ -3536,7 +3542,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 // Horizontal separator line between top/bottom children.
                                 let sep_y = rects[i].y + rects[i].height;
                                 if sep_y < buf.area.y + buf.area.height {
-                                    if both_leaves {
+                                    if both_leaves && total_panes == 2 {
+                                        // total_panes is the whole-tree count, not local.
+                                        // When the entire window has exactly 2 panes, use a
+                                        // midpoint left/right split so each half of ─ reflects
+                                        // its adjacent pane's active state (matches tmux behaviour).
                                         let top_active = matches!(&children[i], LayoutJson::Leaf { active, .. } if *active);
                                         let bot_active = matches!(children.get(i + 1), Some(LayoutJson::Leaf { active, .. }) if *active);
                                         let top_sty = if top_active { active_border_style } else { border_style };
@@ -3552,6 +3562,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                             }
                                         }
                                     } else {
+                                        // 3+ panes: per-column adjacency — only columns that border
+                                        // the active pane are highlighted.
                                         for x in area.x..area.x + area.width {
                                             let active = active_rect.map_or(false, |ar| {
                                                 x >= ar.x && x < ar.x + ar.width
@@ -3577,7 +3589,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             let clock_col = clock_colour_str.as_deref().map(|s| map_color(s)).unwrap_or(Color::Cyan);
             let border_status = state.pane_border_status.as_deref().unwrap_or("off");
             let border_format = state.pane_border_format.as_deref().unwrap_or("");
-            render_json(f, &root, content_chunk, dim_preds, pane_border_fg, pane_active_border_fg, clock_active, clock_col, active_rect, &mode_style_str, state.zoomed, border_status, border_format);
+            // O(N) per frame but pane counts are small in practice (typically < 20).
+            let total_panes = if state.zoomed { 1 } else { root.count_leaves() };
+            render_json(f, &root, content_chunk, dim_preds, pane_border_fg, pane_active_border_fg, clock_active, clock_col, active_rect, &mode_style_str, state.zoomed, border_status, border_format, total_panes);
             fix_border_intersections(f.buffer_mut());
             // Re-color all border characters based on adjacency to the active pane.
             // render_json and fix_border_intersections can leave inconsistent styles
@@ -3593,7 +3607,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         let idx = row * w + col;
                         if idx >= buf.content.len() { continue; }
                         let ch = buf.content[idx].symbol().chars().next().unwrap_or(' ');
-                        if !matches!(ch, '│' | '─' | '┼' | '├' | '┤' | '┬' | '┴') { continue; }
+                        if !matches!(ch, '┼' | '├' | '┤' | '┬' | '┴') { continue; }
                         let x = buf.area.x + col as u16;
                         let y = buf.area.y + row as u16;
                         let adj = (x + 1 == ar.x && y >= ar.y && y < ar.y + ar.height)

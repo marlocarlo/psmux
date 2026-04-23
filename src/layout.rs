@@ -156,6 +156,15 @@ pub enum LayoutJson {
     },
 }
 
+impl LayoutJson {
+    pub fn count_leaves(&self) -> usize {
+        match self {
+            LayoutJson::Leaf { .. } => 1,
+            LayoutJson::Split { children, .. } => children.iter().map(|c| c.count_leaves()).sum(),
+        }
+    }
+}
+
 pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
     let in_copy_mode = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
     let scroll_offset = app.copy_scroll_offset;
