@@ -110,7 +110,6 @@ if line.trim() == "PERSISTENT" {
     let directive_rx = crate::types::register_directive_channel(client_id);
 
     std::thread::spawn(move || {
-        let frame_rx = frame_chan.rx.lock().unwrap();
         loop {
             // 0. Check for queued directives (non-blocking) — these take priority
             while let Ok(directive) = directive_rx.try_recv() {
@@ -136,9 +135,13 @@ if line.trim() == "PERSISTENT" {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             // 2. Drain all queued frames from the bounded channel
-            while let Ok(text) = frame_rx.try_recv() {
-                if write!(ws_bg, "{}\n", text).is_err() { return; }
-                if ws_bg.flush().is_err() { return; }
+            if let Ok(frame_rx) = frame_chan.rx.lock() {
+                while let Ok(text) = frame_rx.try_recv() {
+                    if write!(ws_bg, "{}\n", text).is_err() { return; }
+                    if ws_bg.flush().is_err() { return; }
+                }
+            } else {
+                return;
             }
         }
     });
