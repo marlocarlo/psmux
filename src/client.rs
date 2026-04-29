@@ -723,6 +723,16 @@ pub fn render_layout_json(
                 vec![(100 / children.len().max(1)) as u16; children.len()]
             };
             let is_horizontal = kind == "Horizontal";
+
+            if zoomed {
+                if let Some(i) = effective_sizes.iter().position(|&s| s != 0) {
+                    if let Some(child) = children.get(i) {
+                        render_layout_json(f, child, area, dim_preds, border_fg, active_border_fg, clock_mode, clock_colour, active_rect, mode_style_str, zoomed, border_status, border_format, total_panes);
+                    }
+                }
+                return;
+            }
+
             let rects = split_with_gaps(is_horizontal, &effective_sizes, area);
 
             for (i, child) in children.iter().enumerate() {
@@ -730,8 +740,6 @@ pub fn render_layout_json(
                     render_layout_json(f, child, rects[i], dim_preds, border_fg, active_border_fg, clock_mode, clock_colour, active_rect, mode_style_str, zoomed, border_status, border_format, total_panes);
                 }
             }
-
-            if zoomed { return; }
             let border_style = Style::default().fg(border_fg);
             let active_border_style = Style::default().fg(active_border_fg);
             let buf = f.buffer_mut();
@@ -5256,3 +5264,7 @@ fn paste_buffer_has_non_ascii(buf: &str) -> bool {
 #[cfg(test)]
 #[path = "../tests-rs/test_client.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_zoom_bleed.rs"]
+mod test_zoom_bleed;
