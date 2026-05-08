@@ -125,6 +125,12 @@ pub struct Pane {
     /// Set by the PTY reader thread when a BEL character (\x07) is detected.
     /// Consumed by the server loop to set the window's bell_flag.
     pub bell_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the PTY reader thread when ESC[6n (Cursor Position Request) is
+    /// detected in the child's output.  Consumed by the server loop, which
+    /// then injects ESC[row;colR into the pane's PTY input.  This handles
+    /// the case where pwsh re-issues the CPR after lock/unlock — the single
+    /// preemptive write at spawn time is no longer in the pipe at that point.
+    pub cpr_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Per-pane copy mode state (tmux-style pane-local copy mode).
     /// Some(_) when this pane is in copy mode, None otherwise.
     pub copy_state: Option<CopyModeState>,
@@ -154,6 +160,7 @@ pub struct WarmPane {
     pub data_version: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub cursor_shape: std::sync::Arc<std::sync::atomic::AtomicU8>,
     pub bell_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub cpr_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub child_pid: Option<u32>,
     pub pane_id: usize,
     pub rows: u16,
@@ -1235,6 +1242,10 @@ pub enum CtrlReq {
 /// The server loop checks this to use a shorter recv_timeout, reducing
 /// keystroke-to-display latency for nested shells (e.g. WSL inside pwsh).
 pub static PTY_DATA_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the parser thread when any pane's `cpr_pending` flag is raised.
+/// Lets the server loop skip the tree walk when no CPR response is needed.
+pub static CPR_DATA_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Tracked persistent client TCP streams.
 /// Connection handlers register clones here so the server can explicitly

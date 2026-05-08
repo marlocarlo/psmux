@@ -268,6 +268,9 @@ pub fn create_proxy_pane(
         mouse_input_cache: None,
         cursor_shape: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         bell_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // CPR responses written via this field are TCP-forwarded to the source
+        // ConPTY via the ProxyMasterPty writer.
+        cpr_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         copy_state: None,
         pane_style: None,
         squelch_until: None,

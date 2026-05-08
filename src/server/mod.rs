@@ -772,6 +772,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                 }
             }
+            // Answer any ESC[6n queries — pwsh re-issues this after lock/unlock.
+            if crate::types::CPR_DATA_PENDING.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                for win in &mut app.windows {
+                    helpers::drain_cpr_pending(&mut win.root);
+                }
+            }
         }
         // When a popup PTY is active, always push frames so interactive
         // content (e.g. fzf, shell prompts) updates in real-time.

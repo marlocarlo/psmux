@@ -1296,14 +1296,16 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     
     let bell_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let bell_writer = bell_pending.clone();
-    
+    let cpr_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cpr_writer = cpr_pending.clone();
+
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, output_ring.clone());
+    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, output_ring.clone());
     pane.output_ring = output_ring;
-    
+
     let mut pty_writer = pair.master.take_writer().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
     crate::pane::conpty_preemptive_dsr_response(&mut *pty_writer);
-    
+
     pane.master = pair.master;
     pane.writer = pty_writer;
     pane.child = child;
@@ -1311,6 +1313,7 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     pane.data_version = data_version;
     pane.cursor_shape = cursor_shape;
     pane.bell_pending = bell_pending;
+    pane.cpr_pending = cpr_pending;
     pane.child_pid = None;
     pane.vt_bridge_cache = None;
     pane.vti_mode_cache = None;

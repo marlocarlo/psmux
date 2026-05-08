@@ -119,6 +119,11 @@ pub fn create_popup_pane(
         mouse_input_cache: None,
         cursor_shape,
         bell_pending,
+        // cpr_pending is intentionally unused for popups: the popup spawns its
+        // own inline reader thread (see lines ~71-85 of this file) that never
+        // calls scan_cpr_query.  Popups are not expected to run interactive
+        // shells, so CPR detection is not wired up here.
+        cpr_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         copy_state: None,
         pane_style: None,
         squelch_until: None,
