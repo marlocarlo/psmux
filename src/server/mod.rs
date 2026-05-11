@@ -23,7 +23,7 @@ use crate::tree::{self, active_pane, active_pane_mut, resize_all_panes, kill_all
 
 use helpers::{collect_pane_paths_server, serialize_bindings_json, json_escape_string,
     list_windows_json_with_tabs, combined_data_version, TMUX_COMMANDS};
-use options::{get_option_value, get_window_option_value, render_window_options, apply_set_option};
+use options::{get_option_value, render_window_options, apply_set_option};
 
 use crate::input::{send_text_to_active, send_key_to_active, send_paste_to_active, move_focus, move_focus_preserving_zoom, find_best_pane_in_direction, find_wrap_target};
 use crate::copy_mode::{enter_copy_mode, exit_copy_mode, move_copy_cursor, current_prompt_pos,
