@@ -25,6 +25,7 @@ mod client;
 mod app;
 mod ssh_input;
 mod debug_log;
+mod control_mode;
 
 use std::io::{self, Write, Read as _, BufRead as _, IsTerminal};
 use std::time::Duration;
@@ -70,6 +71,8 @@ fn run_main() -> io::Result<()> {
     // This avoids conflict with subcommand flags (e.g. select-pane -L, resize-pane -L).
     let mut l_socket_name: Option<String> = None;
     let mut f_config_file: Option<String> = None;
+    let mut control_mode = false;
+    let mut control_no_echo = false;
     {
         let mut i = 1; // skip binary name
         while i < args.len() {
@@ -80,6 +83,10 @@ fn run_main() -> io::Result<()> {
             } else if arg == "-f" && i + 1 < args.len() {
                 f_config_file = Some(args[i + 1].clone());
                 i += 2;
+            } else if arg == "-C" || arg == "-CC" {
+                control_mode = true;
+                control_no_echo = arg == "-CC";
+                i += 1;
             } else if (arg == "-S" || arg == "-t") && i + 1 < args.len() {
                 i += 2; // skip other global flag-value pairs
             } else if arg.starts_with('-') {
@@ -179,6 +186,9 @@ fn run_main() -> io::Result<()> {
                 // Before subcommand: skip global flags with values
                 if (args[i] == "-t" || args[i] == "-L" || args[i] == "-f" || args[i] == "-S") && i + 1 < args.len() {
                     i += 2; // skip flag and its value
+                    continue;
+                } else if args[i] == "-C" || args[i] == "-CC" {
+                    i += 1;
                     continue;
                 } else if args[i] == "-h" || args[i] == "--help"
                        || args[i] == "-V" || args[i] == "-v" || args[i] == "--version" {
@@ -375,6 +385,13 @@ fn run_main() -> io::Result<()> {
                     .unwrap_or_else(|| "0".to_string());
                 env::set_var("PSMUX_SESSION_NAME", name);
                 env::set_var("PSMUX_REMOTE_ATTACH", "1");
+                if control_mode {
+                    return crate::control_mode::run_control_mode(
+                        l_socket_name.as_deref(),
+                        env::var("PSMUX_SESSION_NAME").ok().as_deref(),
+                        control_no_echo,
+                    );
+                }
             }
             "server" => {
                 // Internal command - run headless server (used when spawning background server)
@@ -2392,7 +2409,7 @@ fn run_main() -> io::Result<()> {
     // If stdin is not a terminal (headless/non-interactive environment, e.g.
     // winget validation pipeline), print version and exit cleanly — starting
     // a TUI session would fail without an interactive console.
-    if !std::io::stdin().is_terminal() {
+    if !std::io::stdin().is_terminal() && !control_mode {
         print_version();
         return Ok(());
     }
