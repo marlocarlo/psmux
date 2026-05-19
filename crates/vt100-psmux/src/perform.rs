@@ -284,11 +284,173 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                     }
                 }
             }
+            // ---- OSC 133 FinalTerm semantic prompts (issue #299) ----
+            // 133;A (prompt start) — clear any pending command, shell is idle.
+            // Extras (k=i, cl=line, aid=...) are optional kitty/ghostty
+            // parameters; we ignore them via `..`.
+            [b"133", b"A", ..] => {
+                self.screen.set_shell_command(None);
+            }
+            // 133;C with cmdline_url= parameter (kitty's fish integration).
+            // vte splits on ';' so OSC 133;C;cmdline_url=foo arrives as
+            // [b"133", b"C", b"cmdline_url=foo"].
+            [b"133", b"C", param, ..] => {
+                if let Some(cmd) = parse_cmdline_param(param) {
+                    self.screen.set_shell_command(Some(cmd));
+                }
+                // else: bare C with unknown param — leave shell_command alone.
+            }
+            // Bare 133;C — leave whatever's there (latches prior SetUserVar/633E).
+            [b"133", b"C"] => {}
+            // 133;D[;<exit>] — command done. Clear.
+            [b"133", b"D", ..] => {
+                self.screen.set_shell_command(None);
+            }
+            // 133;B (end of prompt / start of input) — no-op for our purposes.
+            [b"133", b"B", ..] => {}
+            // ---- OSC 1337 SetUserVar (iTerm2 user vars; WezTerm precedent) ----
+            // Form: 1337;SetUserVar=<NAME>=<base64-value>
+            //   * vte presents this as a SINGLE param slot because there's no
+            //     ';' separator between SetUserVar=... and the next field.
+            //   * Only WEZTERM_PROG is recognized as a command-identity source
+            //     for now; other vars (WEZTERM_HOST, WEZTERM_USER, custom)
+            //     are not relevant here.
+            [b"1337", payload] if payload.starts_with(b"SetUserVar=") => {
+                let after = &payload[b"SetUserVar=".len()..];
+                if let Some(eq) = after.iter().position(|&b| b == b'=') {
+                    let name = &after[..eq];
+                    let value_b64 = &after[eq + 1..];
+                    if name == b"WEZTERM_PROG" {
+                        if let Some(decoded) = decode_base64(value_b64) {
+                            if let Ok(s) = String::from_utf8(decoded) {
+                                self.screen.set_shell_command(Some(s));
+                            }
+                        }
+                    }
+                }
+            }
+            // ---- OSC 633 VS Code shell-integration lifecycle (issue #299) ----
+            // VS Code emits 633 rather than 133; mirror the 133 lifecycle so a
+            // finished command doesn't latch.
+            // 633;A (prompt start) — shell idle, clear.
+            [b"633", b"A", ..] => {
+                self.screen.set_shell_command(None);
+            }
+            // 633;D[;<exit>] — command done, clear.
+            [b"633", b"D", ..] => {
+                self.screen.set_shell_command(None);
+            }
+            // 633;B (prompt end) / 633;C (pre-exec) — no-op; C keeps the E command.
+            [b"633", b"B", ..] => {}
+            [b"633", b"C", ..] => {}
+            // ---- OSC 633;E (VS Code shellIntegration.ps1) ----
+            // Form: 633;E;<escaped-command>[;<nonce>]
+            // Take the command segment (everything before the next ';' or end).
+            [b"633", b"E", cmd, ..] => {
+                if let Ok(s) = std::str::from_utf8(cmd) {
+                    // VS Code's __VSCode-Escape-Value replaces control chars,
+                    // backslashes, newlines, and ';' with `\x<hex>` sequences.
+                    // Full decode is non-trivial; for the common case (printable
+                    // command text), the value passes through unchanged.
+                    self.screen.set_shell_command(Some(s.to_string()));
+                }
+            }
             _ => {
                 self.callbacks.unhandled_osc(&mut self.screen, params);
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for issue #299 OSC parsing.
+// ---------------------------------------------------------------------------
+
+/// Parse a single OSC 133;C parameter slot. Returns the decoded command if the
+/// slot is `cmdline_url=<url-escaped>` (kitty's fish integration). Other
+/// parameter names (`cmdline=`, `aid=`, `redraw=`, etc.) return None.
+fn parse_cmdline_param(param: &[u8]) -> Option<String> {
+    if let Some(value) = param.strip_prefix(b"cmdline_url=") {
+        return percent_decode(value);
+    }
+    None
+}
+
+/// Decode `%xx` percent-encoded sequences. Returns None if the input is not
+/// valid UTF-8 after decode (drops the value rather than mangling it).
+fn percent_decode(input: &[u8]) -> Option<String> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%' && i + 2 < input.len() {
+            let hi = hex_digit(input[i + 1])?;
+            let lo = hex_digit(input[i + 2])?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(input[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Decode standard base64. Returns None on malformed input. Inlined to avoid
+/// pulling a base64 dependency into vt100-psmux.
+fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
+    fn val(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    // Strip trailing '=' padding, count it.
+    let pad = input.iter().rev().take_while(|&&b| b == b'=').count();
+    let body = &input[..input.len().saturating_sub(pad)];
+    if body.iter().any(|&b| val(b).is_none()) {
+        return None;
+    }
+    if body.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut out = Vec::with_capacity(body.len() * 3 / 4);
+    let mut chunk = [0u8; 4];
+    let mut idx = 0;
+    for &b in body {
+        chunk[idx] = val(b)?;
+        idx += 1;
+        if idx == 4 {
+            out.push((chunk[0] << 2) | (chunk[1] >> 4));
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+            out.push((chunk[2] << 6) | chunk[3]);
+            idx = 0;
+        }
+    }
+    // Handle remaining 2 or 3 chars (1 or 2 output bytes).
+    match idx {
+        2 => out.push((chunk[0] << 2) | (chunk[1] >> 4)),
+        3 => {
+            out.push((chunk[0] << 2) | (chunk[1] >> 4));
+            out.push((chunk[1] << 4) | (chunk[2] >> 2));
+        }
+        _ => {}
+    }
+    Some(out)
 }
 
 fn canonicalize_params_1(params: &vte::Params, default: u16) -> u16 {
