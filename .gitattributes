@@ -1,0 +1,3 @@
+
+# Binary fixtures for tests (must preserve exact bytes)
+*.bin binary

@@ -69,3 +69,70 @@ output\n\
         "after OSC 133;D the shell should be reported as idle"
     );
 }
+
+// ---------------------------------------------------------------------------
+// E2E: a captured pwsh + oh-my-posh (pwd: osc7) + command-mark stream
+// ---------------------------------------------------------------------------
+//
+// fixtures/issue299-omp-snippet-e2e.bin holds two real oh-my-posh prompt
+// renders (each an ANSI body + OSC 0 title + OSC 7 cwd) around one command
+// cycle: OSC 133;C;cmdline_url=git%20status, the command's output, then
+// OSC 133;D. It was captured from `oh-my-posh print primary` in a generic cwd,
+// with the OSC 133 marks emitted per the shell hook's format and the machine
+// hostname scrubbed to `dev-host`.
+//
+// This proves the division of labor: oh-my-posh emits OSC 7 (cwd) while the
+// shell hooks emit OSC 133;C/D (command identity); both flow through the same
+// byte stream, so psmux's parser surfaces Screen::path() (from OSC 7) and
+// Screen::shell_command() (from OSC 133;C;cmdline_url=) together.
+
+const OMP_SNIPPET_E2E_STREAM: &[u8] =
+    include_bytes!("fixtures/issue299-omp-snippet-e2e.bin");
+
+#[test]
+fn e2e_omp_cwd_and_command_marks_coexist() {
+    let mut p = vt100::Parser::new(24, 80, 0);
+    p.process(OMP_SNIPPET_E2E_STREAM);
+
+    // oh-my-posh (via pwd: osc7) must have populated the OSC 7 path. Assert a
+    // structural property that holds regardless of slash direction.
+    let path = p.screen().path().expect("OSC 7 path should be set");
+    assert!(
+        path.contains("example"),
+        "captured cwd was C:/repos/example; path={path:?}"
+    );
+
+    // The command marks surfaced the command identity, then OSC 133;D cleared
+    // it; the trailing prompt render emits no OSC 133, so the final state is
+    // Idle. Same check as osc133_idle_state_after_done, but on the real stream.
+    assert_eq!(
+        p.screen().shell_command(),
+        None,
+        "OSC 133;D must have cleared shell_command"
+    );
+}
+
+#[test]
+fn e2e_command_identity_visible_before_done() {
+    // Same captured stream, trimmed just AFTER OSC 133;C;cmdline_url and BEFORE
+    // OSC 133;D. At that moment shell_command must hold "git status".
+    let stream = OMP_SNIPPET_E2E_STREAM;
+    let needle_d = b"\x1b]133;D";
+    let d_pos = stream
+        .windows(needle_d.len())
+        .position(|w| w == needle_d)
+        .expect("133;D marker");
+
+    let mut p = vt100::Parser::new(24, 80, 0);
+    p.process(&stream[..d_pos]);
+
+    assert_eq!(
+        p.screen().shell_command(),
+        Some("git status"),
+        "mid-stream (after OSC 133;C;cmdline_url, before OSC 133;D), shell_command must hold the typed command"
+    );
+
+    // And the path is still set from the first prompt's OSC 7.
+    let path = p.screen().path().expect("OSC 7 path should still be set");
+    assert!(path.contains("example"));
+}
