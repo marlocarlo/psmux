@@ -1117,17 +1117,26 @@ pub mod mouse_inject {
             let err = GetLastError();
 
             log(&format!("GenerateConsoleCtrlEvent => ok={} err={}", ok, err));
+            
+            // Brief sleep to let the async CTRL_C_EVENT handler thread finish
+            // before we re-enable default handling.
+            std::thread::sleep(std::time::Duration::from_millis(5));
 
+            // GenerateConsoleCtrlEvent is Asynchronous delivery
+            // it returns as soon as the signal is queued for delivery, not when it's actually handled by the target process.
+            // FreeConsole will reset the table of control handlers in the client process.
+            // If current process finishes detaching before the console subsystem finishes distributing the event,
+            // the context tracking who generated the signal is destroyed, 
+            // or the signal execution queue for that instance is aborted.
+            // So the sleep above won't guarantee no race condition here,
+            // in the worst case, the signal might be lost and never delivered to the child process.
+            
             // Detach from the child's console BEFORE restoring Ctrl+C handling.
             // GenerateConsoleCtrlEvent dispatches asynchronously via a new thread;
             // if we restore the default handler while still attached, the async
             // handler thread might terminate psmux.  Detaching first ensures the
             // event only targets processes that remain on the console.
             FreeConsole();
-
-            // Brief sleep to let the async CTRL_C_EVENT handler thread finish
-            // before we re-enable default handling.
-            std::thread::sleep(std::time::Duration::from_millis(5));
 
             // Restore default Ctrl+C handling now that we're detached
             SetConsoleCtrlHandler(None, 0);
