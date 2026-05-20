@@ -967,6 +967,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     let mut command_cursor: usize = 0;
     let mut command_history: Vec<String> = Vec::new();
     let mut command_history_idx: usize = 0;
+    // When a command-prompt binding has a template (e.g. 'rename-window "%%"'),
+    // this holds that template so %% can be replaced with the user's input on Enter.
+    let mut command_prompt_template: Option<String> = None;
+    // Label from -p flag of command-prompt (shown as the overlay title).
+    let mut command_prompt_label: String = String::new();
     let mut window_idx_input = false;
     let mut window_idx_buf = String::new();
 
@@ -2038,6 +2043,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                         else if matches!(key.code, KeyCode::Esc) && (command_input || renaming || pane_renaming || tree_chooser || buffer_chooser || session_chooser || confirm_cmd.is_some() || keys_viewer) {
                             command_input = false;
                             command_cursor = 0;
+                            command_prompt_template = None;
+                            command_prompt_label.clear();
                             renaming = false;
                             pane_renaming = false;
                             tree_chooser = false;
@@ -2122,8 +2129,33 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     renaming = true; rename_buf.clear();
                                 } else if cmd == "rename-session" {
                                     renaming = true; rename_buf.clear(); session_renaming = true;
-                                } else if cmd == "command-prompt" {
-                                    command_input = true; command_buf.clear(); command_cursor = 0; command_history_idx = command_history.len();
+                                } else if cmd.split_whitespace().next().map_or(false, |w| w == "command-prompt") {
+                                    // Parse command-prompt arguments: -I <initial>, -p <label>, template
+                                    let args = crate::commands::parse_command_line(cmd);
+                                    let mut initial = String::new();
+                                    let mut label = String::new();
+                                    let mut template: Option<String> = None;
+                                    let mut ai = 1;
+                                    while ai < args.len() {
+                                        match args[ai].as_str() {
+                                            "-I" => { if ai + 1 < args.len() { initial = args[ai + 1].clone(); ai += 1; } }
+                                            "-p" => { if ai + 1 < args.len() { label = args[ai + 1].clone(); ai += 1; } }
+                                            "-1" | "-N" | "-W" => {}
+                                            "-T" | "-t" => { ai += 1; }
+                                            a if !a.starts_with('-') => { template = Some(a.to_string()); }
+                                            _ => {}
+                                        }
+                                        ai += 1;
+                                    }
+                                    // Expand #W (active window name) and #S (session name) in initial value
+                                    let active_win_name = last_tree.iter().find(|w| w.active).map(|w| w.name.as_str()).unwrap_or("").to_string();
+                                    initial = initial.replace("#W", &active_win_name).replace("#S", &current_session);
+                                    command_prompt_template = template;
+                                    command_prompt_label = label;
+                                    command_buf = initial;
+                                    command_cursor = command_buf.len();
+                                    command_input = true;
+                                    command_history_idx = command_history.len();
                                 } else if cmd == "list-keys" {
                                     keys_viewer_scroll = 0;
                                     let user_binds: Vec<(bool, String, String, String)> = synced_bindings
@@ -2783,6 +2815,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 KeyCode::Enter if command_input => {
                                     let trimmed = command_buf.trim().to_string();
                                     if !trimmed.is_empty() {
+                                        // If a template was set by command-prompt binding, substitute %% and execute
+                                        if let Some(tmpl) = command_prompt_template.take() {
+                                            let final_cmd = tmpl.replace("%%", &trimmed);
+                                            cmd_batch.push(format!("{}\n", final_cmd));
+                                        } else {
                                         command_history.push(trimmed.clone());
                                         command_history_idx = command_history.len();
                                         // Intercept client-side UI commands from command prompt
@@ -2856,14 +2893,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                 quit = true;
                                             }
                                         }
+                                        } // end else (no template)
                                     }
                                     command_input = false;
                                     command_cursor = 0;
+                                    command_prompt_template = None;
+                                    command_prompt_label.clear();
                                 }
                                 KeyCode::Esc if renaming => { renaming = false; session_renaming = false; }
                                 KeyCode::Esc if pane_renaming => { pane_renaming = false; }
                                 KeyCode::Esc if window_idx_input => { window_idx_input = false; }
-                                KeyCode::Esc if command_input => { command_input = false; command_cursor = 0; }
+                                KeyCode::Esc if command_input => { command_input = false; command_cursor = 0; command_prompt_template = None; command_prompt_label.clear(); }
 
                                 // Command prompt: cursor movement, history, and editing keys
                                 KeyCode::Left if command_input => { if command_cursor > 0 { command_cursor -= 1; } }
@@ -4909,15 +4949,25 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                 f.render_widget(para, overlay.inner(oa));
             }
             if command_input {
-                let overlay = Block::default().borders(Borders::ALL).title("command");
+                let title = if !command_prompt_label.is_empty() { command_prompt_label.as_str() } else { "command" };
+                let overlay = Block::default().borders(Borders::ALL).title(title);
                 let oa = centered_rect(60, 3, content_chunk);
                 f.render_widget(Clear, oa);
                 f.render_widget(&overlay, oa);
                 let inner = overlay.inner(oa);
-                let para = Paragraph::new(format!(": {}", command_buf));
+                // When using a template (command-prompt binding), show the input without ": " prefix;
+                // for normal command prompt, show ": " prefix to match tmux conventions.
+                let prefix_len: u16;
+                let para = if command_prompt_template.is_some() {
+                    prefix_len = 0;
+                    Paragraph::new(command_buf.clone())
+                } else {
+                    prefix_len = 2; // ": "
+                    Paragraph::new(format!(": {}", command_buf))
+                };
                 f.render_widget(para, inner);
                 // Show cursor at the correct position within the prompt
-                let cx = inner.x + 2 + command_cursor as u16; // +2 for ": "
+                let cx = inner.x + prefix_len + command_cursor as u16;
                 f.set_cursor_position((cx, inner.y));
             }
             if window_idx_input {

@@ -43,6 +43,10 @@ name = "test_issue201_rename_dialog"
 path = "tests-rs/test_issue201_rename_dialog.rs"
 
 [[test]]
+name = "test_command_prompt_binding"
+path = "tests-rs/test_command_prompt_binding.rs"
+
+[[test]]
 name = "test_issue269_osc94_dropped"
 path = "tests-rs/test_issue269_osc94_dropped.rs"
 
