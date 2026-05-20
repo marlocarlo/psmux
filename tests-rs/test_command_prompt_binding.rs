@@ -229,7 +229,7 @@ fn parse_command_prompt_args(cmd: &str) -> (String, String, Option<String>) {
         match args[ai].as_str() {
             "-I" => { if ai + 1 < args.len() { initial = args[ai + 1].clone(); ai += 1; } }
             "-p" => { if ai + 1 < args.len() { label = args[ai + 1].clone(); ai += 1; } }
-            "-1" | "-N" | "-W" => {}
+            "-1" | "-b" | "-e" | "-F" | "-i" | "-k" | "-l" | "-N" => {}
             "-T" | "-t" => { ai += 1; }
             a if !a.starts_with('-') => { template = Some(a.to_string()); }
             _ => {}

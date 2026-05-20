@@ -2140,7 +2140,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                         match args[ai].as_str() {
                                             "-I" => { if ai + 1 < args.len() { initial = args[ai + 1].clone(); ai += 1; } }
                                             "-p" => { if ai + 1 < args.len() { label = args[ai + 1].clone(); ai += 1; } }
-                                            "-1" | "-N" | "-W" => {}
+                                            "-1" | "-b" | "-e" | "-F" | "-i" | "-k" | "-l" | "-N" => {}
                                             "-T" | "-t" => { ai += 1; }
                                             a if !a.starts_with('-') => { template = Some(a.to_string()); }
                                             _ => {}
