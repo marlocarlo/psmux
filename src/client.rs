@@ -2148,7 +2148,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                         ai += 1;
                                     }
                                     // Expand #W (active window name) and #S (session name) in initial value
-                                    let active_win_name = last_tree.iter().find(|w| w.active).map(|w| w.name.as_str()).unwrap_or("").to_string();
+                                    let active_win_name: String = last_tree.iter()
+                                        .find(|w| w.active)
+                                        .map(|w| w.name.clone())
+                                        .unwrap_or_default();
                                     initial = initial.replace("#W", &active_win_name).replace("#S", &current_session);
                                     command_prompt_template = template;
                                     command_prompt_label = label;
