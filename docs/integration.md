@@ -554,6 +554,42 @@ When porting Unix tmux integrations to Windows:
 - **Ctrl+C**: `GenerateConsoleCtrlEvent` sends to all processes sharing the console. Prefer app-specific quit keys over `C-c` in automation.
 - **TUI exit timing**: After a TUI exits, ConPTY needs 4 to 6 seconds to restore the screen. Add a delay before `capture-pane` after TUI exit.
 
+## Live human-input marker (`@human-input-marker`)
+
+Some integrations need to know **when a human is actively typing into a
+pane**, as distinct from input they injected programmatically via
+`send-keys` / `paste-buffer`. `capture-pane` can't tell them apart (it only
+shows rendered output, where a human's echo and the app's output are
+already merged), and polling it misses typing while the app is busy
+streaming.
+
+psmux can export this signal directly. Set the session option
+`@human-input-marker` to a file path:
+
+```powershell
+psmux set-option -t mysession @human-input-marker "C:/path/to/typing.marker"
+```
+
+While it's set, psmux **touches that file** (updates its mtime) on every
+real human **text** keystroke routed to a pane in that session — and
+**never** on `send-keys` / `paste-buffer`, because those take a different
+internal path. Your tool then treats "marker mtime within the last N
+seconds" as "a human is typing now".
+
+- **Text only.** Printable characters; control codes, `Enter`, `Tab`,
+  navigation keys, and any `Ctrl`/`Alt`-modified key are ignored, so moving
+  around a pane doesn't read as typing.
+- **Throttled.** At most ~once per 200 ms, so fast typing doesn't hammer
+  the filesystem (the signal is "typed recently", not a keylog — the file
+  content is just a timestamp).
+- **Opt-in, zero-cost when unset.** No file I/O happens unless the option
+  points at a path.
+
+This is what [claude-loop](https://github.com/quazardous/aiball) uses on
+Windows to drive its "human present" status without a nested-PTY proxy
+(the bytes a human types and the bytes a tool injects are physically
+separate paths inside psmux, so no heuristic is needed).
+
 ## Related Documentation
 
 - [compatibility.md](compatibility.md) : Full tmux command and feature compatibility matrix

@@ -371,6 +371,11 @@ pub struct AppState {
     pub allow_predictions: bool,
     pub drag: Option<DragState>,
     pub last_window_area: Rect,
+    /// Throttle for the `@human-input-marker` integration (#281): the
+    /// last time a real human text keystroke touched the marker file.
+    /// `None` until the first keystroke. Keeps fast typing from hammering
+    /// the filesystem (we only need "typed recently", not every byte).
+    pub last_human_input: Option<Instant>,
     pub mouse_enabled: bool,
     /// scroll-enter-copy-mode: when off, mouse scroll at a shell prompt does NOT
     /// auto-enter copy mode.  Default: on (tmux parity).
@@ -697,6 +702,7 @@ impl AppState {
             allow_predictions: false,
             drag: None,
             last_window_area: Rect { x: 0, y: 0, width: 120, height: 30 },
+            last_human_input: None,
             mouse_enabled: true,
             scroll_enter_copy_mode: true,
             pwsh_mouse_selection: false,

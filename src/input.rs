@@ -1,5 +1,5 @@
 use std::io::{self, Write};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use portable_pty::native_pty_system;
@@ -1862,7 +1862,58 @@ pub fn encode_key_event(key: &KeyEvent) -> Option<Vec<u8>> {
     Some(encoded)
 }
 
+/// #281 strategy A: when the session option `@human-input-marker` points at
+/// a file, touch that file (its mtime) on every real human TEXT keystroke,
+/// so external tools (e.g. claude-loop) can tell "a human is typing in the
+/// pane" apart from programmatic `send-keys` — live, even while the child
+/// app is busy. Printable chars only (no Ctrl/Alt, no control codes);
+/// throttled to ~once per 200ms so fast typing doesn't hammer the FS. No-op
+/// (zero overhead) when the option is unset. Never fatal.
+/// Is `key` a printable human text keystroke (paint "typing")? Excludes
+/// control codes and any Ctrl/Alt-modified key, so navigation, shortcuts,
+/// Enter, Tab, etc. don't count. Shift is fine (capitals). Pure — unit
+/// tested in `tests_issue281_human_input`.
+pub(crate) fn is_human_text_key(key: &KeyEvent) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Char(c)
+            if !c.is_control()
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+    )
+}
+
+pub(crate) fn note_human_input(app: &mut AppState, key: &KeyEvent) {
+    if !is_human_text_key(key) {
+        return;
+    }
+    let path = match app.user_options.get("@human-input-marker") {
+        Some(p) if !p.is_empty() => p.clone(),
+        _ => return,
+    };
+    let now = Instant::now();
+    if let Some(prev) = app.last_human_input {
+        if now.duration_since(prev) < Duration::from_millis(200) {
+            return;
+        }
+    }
+    app.last_human_input = Some(now);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    // mtime is the signal the reader checks; the content is just for humans.
+    let _ = std::fs::write(&path, format!("{stamp}\n"));
+}
+
 pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()> {
+    // #281: record live human text input for external tooling. This is the
+    // ONLY path real client keystrokes take to the pane (handle_key →
+    // forward_key_to_active); send-keys/paste-buffer go through
+    // send_text_to_active instead, so the marker is never touched by
+    // programmatic injection — that physical separation is the whole point.
+    note_human_input(app, &key);
+
     // On Windows, modified Enter delivery depends on the modifier:
     //
     // Shift/Alt+Enter (no Ctrl): Use VT encoding ONLY (\x1b\r).  Native
@@ -3208,3 +3259,7 @@ mod tests_issue226_ctrl_slash;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue284_pageup_wsl.rs"]
 mod tests_issue284_pageup_wsl;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue281_human_input.rs"]
+mod tests_issue281_human_input;
