@@ -1122,9 +1122,9 @@ pub mod mouse_inject {
             // before we re-enable default handling.
             std::thread::sleep(std::time::Duration::from_millis(5));
 
-            // GenerateConsoleCtrlEvent is Asynchronous delivery
-            // it returns as soon as the signal is queued for delivery, not when it's actually handled by the target process.
-            // FreeConsole will reset the table of control handlers in the client process.
+            // GenerateConsoleCtrlEvent delivers asynchronously: it returns as soon as the
+            // signal is queued for delivery, not when it's actually handled by the target process.
+            // FreeConsole resets the table of control handlers in the client process.
             // If current process finishes detaching before the console subsystem finishes distributing the event,
             // the context tracking who generated the signal is destroyed, 
             // or the signal execution queue for that instance is aborted.
