@@ -159,6 +159,8 @@ No extra configuration needed. Full guide: **[docs/claude-code.md](docs/claude-c
 
 ## Related Projects
 
+* [KKTerm](https://github.com/ryantsai/KKTerm) - Windows-first, local-first terminal for managing connections, sessions, and workspaces.
+
 <table>
   <tr>
     <td align="center" width="50%">
