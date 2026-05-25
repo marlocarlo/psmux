@@ -1254,7 +1254,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 CtrlReq::SessionInfoFormat(resp, fmt) => {
                     let line = crate::format::format_list_sessions(&app, &fmt);
-                    let _ = resp.send(format!("{}\n", line));
+                    let _ = resp.send(line);
                 }
                 CtrlReq::ClientAttach(cid) => {
                     app.attached_clients = app.attached_clients.saturating_add(1);

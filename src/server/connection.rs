@@ -2536,7 +2536,7 @@ match cmd {
         let fmt = extract_flag_value(&args, "-F");
         if let Some(fmt_str) = fmt {
             let (rtx, rrx) = mpsc::channel::<String>();
-            let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt_str, None, false, None));
+            let _ = tx.send(CtrlReq::SessionInfoFormat(rtx, fmt_str));
             if let Ok(text) = rrx.recv() {
                 if persistent {
                     let _ = tx.send(CtrlReq::ShowTextPopup("list-sessions".to_string(), text));
