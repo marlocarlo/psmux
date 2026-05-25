@@ -1146,6 +1146,24 @@ pub fn expand_var(var: &str, app: &AppState, win_idx: usize) -> String {
                 None => String::new(),
             }
         }
+        // The last NON-text key received on the INTERACTIVE input route
+        // (handle_key), by canonical bind-key name (Escape, Enter, Up, F9,
+        // C-c, M-a, …); companion _ms gives its age in ms. Empty if none yet.
+        // Like pane_last_text_input, the injected route (send-keys /
+        // send-paste / send-text) does NOT update it. A read-only route signal
+        // — consumers own any policy on top.
+        "pane_last_special_key" => {
+            match target_pane().and_then(|p| p.last_special_key.as_ref()) {
+                Some((_, name)) => name.clone(),
+                None => String::new(),
+            }
+        }
+        "pane_last_special_key_ms" => {
+            match target_pane().and_then(|p| p.last_special_key.as_ref()) {
+                Some((t, _)) => t.elapsed().as_millis().to_string(),
+                None => String::new(),
+            }
+        }
         "pane_active" => if fmt_pane_is_active { "1".into() } else { "0".into() },
         "pane_current_command" => {
             if let Some(p) = target_pane() {

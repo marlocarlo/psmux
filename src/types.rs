@@ -113,6 +113,14 @@ pub struct Pane {
     /// `#{pane_last_text_input}` format variable. Lives on the pane, so it's
     /// freed with it (no separate lifecycle / file).
     pub last_text_input: Option<Instant>,
+    /// The last NON-text key routed via the INTERACTIVE input route
+    /// (`handle_key -> forward_key_to_active`): its canonical bind-key name
+    /// (`Escape`, `Enter`, `Up`, `F9`, `C-c`, `M-a`, …) + the `Instant` it
+    /// arrived; `None` until the first one. Same route contract as
+    /// `last_text_input` (NOT updated by the injected route). The text vs
+    /// non-text split is `is_text_input_key`. Exposed read-only as
+    /// `#{pane_last_special_key}` / `#{pane_last_special_key_ms}`.
+    pub last_special_key: Option<(Instant, String)>,
     /// Cached VT bridge detection result (for mouse injection).
     /// Updated on first mouse event and refreshed every 2 seconds.
     pub vt_bridge_cache: Option<(Instant, bool)>,

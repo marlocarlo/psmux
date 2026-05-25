@@ -1883,32 +1883,45 @@ pub(crate) fn is_text_input_key(key: &KeyEvent) -> bool {
     )
 }
 
-pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()> {
-    // Record use of the INTERACTIVE text-input route, exposed read-only as
-    // `#{pane_last_text_input}`. This route is handle_key -> forward_key_to_active;
-    // the injected route (send-keys / send-paste / send-text -> send_text_to_active)
-    // does NOT pass here, so it never updates the signal. Printable text only
-    // (no control / Ctrl / Alt). Stamp exactly the panes that will RECEIVE the
-    // key — every non-dead pane under sync-input, else the active pane if alive
-    // — so the timestamp matches what's actually routed.
-    if is_text_input_key(&key) {
-        let now = Instant::now();
-        let sync = app.sync_input;
-        let win = &mut app.windows[app.active_idx];
-        if sync {
-            fn mark(node: &mut Node, now: Instant) {
-                match node {
-                    Node::Leaf(p) if !p.dead => p.last_text_input = Some(now),
-                    Node::Leaf(_) => {}
-                    Node::Split { children, .. } => { for c in children { mark(c, now); } }
-                }
-            }
-            mark(&mut win.root, now);
-        } else if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-            if !p.dead {
-                p.last_text_input = Some(now);
+/// Apply `f` to every pane that will RECEIVE the current interactive key —
+/// every non-dead pane under sync-input, else the active pane if alive — so the
+/// route-signal timestamps match what's actually routed.
+fn for_each_receiving_pane<F: FnMut(&mut Pane)>(app: &mut AppState, mut f: F) {
+    let sync = app.sync_input;
+    let win = &mut app.windows[app.active_idx];
+    if sync {
+        fn walk<F: FnMut(&mut Pane)>(node: &mut Node, f: &mut F) {
+            match node {
+                Node::Leaf(p) if !p.dead => f(p),
+                Node::Leaf(_) => {}
+                Node::Split { children, .. } => { for c in children { walk(c, f); } }
             }
         }
+        walk(&mut win.root, &mut f);
+    } else if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
+        if !p.dead {
+            f(p);
+        }
+    }
+}
+
+pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()> {
+    // Record use of the INTERACTIVE input route as read-only route signals:
+    // `#{pane_last_text_input}` (printable text) and, for every other key,
+    // `#{pane_last_special_key}` / `_ms` (the last non-text key — Esc, Enter,
+    // arrows, function keys, Ctrl/Alt chords — by canonical bind-key name).
+    // This route is handle_key -> forward_key_to_active; the injected route
+    // (send-keys / send-paste / send-text -> send_text_to_active) does NOT pass
+    // here, so it never updates these signals. for_each_receiving_pane stamps
+    // exactly the panes that will RECEIVE the key, so the timestamps match what
+    // is actually routed.
+    if is_text_input_key(&key) {
+        let now = Instant::now();
+        for_each_receiving_pane(app, |p| p.last_text_input = Some(now));
+    } else {
+        let now = Instant::now();
+        let name = crate::config::format_key_binding(&(key.code, key.modifiers));
+        for_each_receiving_pane(app, |p| p.last_special_key = Some((now, name.clone())));
     }
 
     // On Windows, modified Enter delivery depends on the modifier:
@@ -3370,3 +3383,7 @@ mod tests_issue284_pageup_wsl;
 #[cfg(test)]
 #[path = "../tests-rs/test_pane_last_text_input.rs"]
 mod tests_pane_last_text_input;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pane_last_special_key.rs"]
+mod tests_pane_last_special_key;

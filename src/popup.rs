@@ -115,6 +115,7 @@ pub fn create_popup_pane(
         last_infer_title: epoch,
         dead: false,
         last_text_input: None,
+        last_special_key: None,
         vt_bridge_cache: None,
         vti_mode_cache: None,
         mouse_input_cache: None,
