@@ -1183,6 +1183,18 @@ fn run_main() -> io::Result<()> {
                                 i += 1;
                             }
                         }
+                        a if a.len() > 2
+                            && a.starts_with('-')
+                            && !a.starts_with("--")
+                            && a.chars().skip(1).all(|c| matches!(c, 'p' | 'e' | 'J')) =>
+                        {
+                            // POSIX cluster of capture-pane booleans (-ep, -pe, -pJ, -eJ,
+                            // -epJ, ...). -t/-S/-E/-b take a value, so they are NOT
+                            // eligible for clustering.
+                            if a.contains('p') { cmd.push_str(" -p"); print_stdout = true; }
+                            if a.contains('e') { cmd.push_str(" -e"); }
+                            if a.contains('J') { cmd.push_str(" -J"); }
+                        }
                         _ => {}
                     }
                     i += 1;
