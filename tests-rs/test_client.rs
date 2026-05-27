@@ -200,6 +200,37 @@ fn make_row(runs: Vec<crate::layout::CellRunJson>) -> crate::layout::RowRunsJson
 }
 
 #[cfg(windows)]
+fn make_leaf(id: usize, rows: &[&str]) -> crate::layout::LayoutJson {
+    let cols = rows.first().map(|row| row.chars().count()).unwrap_or(0) as u16;
+    crate::layout::LayoutJson::Leaf {
+        id,
+        rows: rows.len() as u16,
+        cols,
+        cursor_row: 0,
+        cursor_col: 0,
+        alternate_screen: false,
+        hide_cursor: false,
+        cursor_shape: 0,
+        active: id == 0,
+        copy_mode: false,
+        scroll_offset: 0,
+        sel_start_row: None,
+        sel_start_col: None,
+        sel_end_row: None,
+        sel_end_col: None,
+        sel_mode: None,
+        copy_cursor_row: None,
+        copy_cursor_col: None,
+        content: Vec::new(),
+        rows_v2: rows
+            .iter()
+            .map(|row| make_row(vec![make_run(row, cols)]))
+            .collect(),
+        title: None,
+    }
+}
+
+#[cfg(windows)]
 #[test]
 fn normalize_selection_reading_order() {
     // Start before end: no swap
@@ -270,7 +301,6 @@ fn char_at_col_basics() {
 #[cfg(windows)]
 #[test]
 fn extract_selection_text_block_mode() {
-    use ratatui::layout::Rect as Rect;
     // A single leaf pane 10 cols wide, 3 rows
     let layout = crate::layout::LayoutJson::Leaf {
         id: 0,
@@ -301,12 +331,48 @@ fn extract_selection_text_block_mode() {
     };
 
     // Block select cols 2..5, rows 0..2
-    let text = extract_selection_text(&layout, 10, 3, (2, 0), (5, 2), true);
+    let text = extract_selection_text(&layout, 10, 3, (2, 0), (5, 2), true, None);
     assert_eq!(text, "2345\ncdef\nCDEF");
 
     // Non-block (reading order) same coordinates should give full intermediate rows
-    let text_normal = extract_selection_text(&layout, 10, 3, (2, 0), (5, 2), false);
+    let text_normal = extract_selection_text(&layout, 10, 3, (2, 0), (5, 2), false, None);
     assert_eq!(text_normal, "23456789\nabcdefghij\nABCDEF");
+}
+
+#[cfg(windows)]
+#[test]
+fn extract_selection_text_clips_reading_order_to_origin_pane() {
+    let layout = crate::layout::LayoutJson::Split {
+        kind: "Horizontal".to_string(),
+        sizes: vec![50, 50],
+        children: vec![
+            make_leaf(0, &["abcde", "fghij", "klmno"]),
+            make_leaf(1, &["ABCDE", "FGHIJ", "KLMNO"]),
+        ],
+    };
+    let pane_clip = ratatui::layout::Rect { x: 0, y: 0, width: 5, height: 3 };
+
+    let text = extract_selection_text(&layout, 11, 3, (1, 0), (3, 2), false, Some(pane_clip));
+
+    assert_eq!(text, "bcde\nfghij\nklmn");
+}
+
+#[cfg(windows)]
+#[test]
+fn extract_selection_text_clips_block_mode_to_origin_pane() {
+    let layout = crate::layout::LayoutJson::Split {
+        kind: "Horizontal".to_string(),
+        sizes: vec![50, 50],
+        children: vec![
+            make_leaf(0, &["abcde", "fghij", "klmno"]),
+            make_leaf(1, &["ABCDE", "FGHIJ", "KLMNO"]),
+        ],
+    };
+    let pane_clip = ratatui::layout::Rect { x: 0, y: 0, width: 5, height: 3 };
+
+    let text = extract_selection_text(&layout, 11, 3, (1, 0), (8, 2), true, Some(pane_clip));
+
+    assert_eq!(text, "bcde\nghij\nlmno");
 }
 
 #[cfg(windows)]

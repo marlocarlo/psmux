@@ -196,6 +196,45 @@ fn normalize_selection(start: (u16, u16), end: (u16, u16), block: bool) -> (u16,
     }
 }
 
+fn selection_row_cols(
+    row: u16,
+    r0: u16,
+    c0: u16,
+    r1: u16,
+    c1: u16,
+    block: bool,
+    term_width: u16,
+    pane_clip: Option<Rect>,
+) -> Option<(u16, u16)> {
+    if term_width == 0 {
+        return None;
+    }
+
+    let mut col_start = if block || row == r0 { c0 } else { 0 };
+    let mut col_end = if block || row == r1 {
+        c1
+    } else {
+        term_width.saturating_sub(1)
+    };
+
+    if let Some(clip) = pane_clip {
+        if clip.width == 0 || clip.height == 0 {
+            return None;
+        }
+
+        let clip_bottom = clip.y.saturating_add(clip.height).saturating_sub(1);
+        if row < clip.y || row > clip_bottom {
+            return None;
+        }
+
+        let clip_right = clip.x.saturating_add(clip.width).saturating_sub(1);
+        col_start = col_start.max(clip.x);
+        col_end = col_end.min(clip_right);
+    }
+
+    (col_start <= col_end).then_some((col_start, col_end))
+}
+
 fn extract_selection_text(
     layout: &LayoutJson,
     term_width: u16,
@@ -203,25 +242,37 @@ fn extract_selection_text(
     start: (u16, u16),
     end: (u16, u16),
     block: bool,
+    pane_clip: Option<Rect>,
 ) -> String {
     let (r0, c0, r1, c1) = normalize_selection(start, end, block);
 
-    let content_area = Rect { x: 0, y: 0, width: term_width, height: content_height };
+    let content_area = Rect {
+        x: 0,
+        y: 0,
+        width: term_width,
+        height: content_height,
+    };
     let mut leaves: Vec<PaneLeaf> = Vec::new();
     collect_leaves(layout, content_area, &mut leaves);
 
     let mut result = String::new();
+    let mut wrote_line = false;
     for row in r0..=r1 {
-        let col_start = if block || row == r0 { c0 } else { 0 };
-        let col_end = if block || row == r1 { c1 } else { term_width.saturating_sub(1) };
+        let Some((col_start, col_end)) =
+            selection_row_cols(row, r0, c0, r1, c1, block, term_width, pane_clip)
+        else {
+            continue;
+        };
 
         let mut line = String::new();
         for col in col_start..=col_end {
             let mut ch = ' ';
             for leaf in &leaves {
                 let inner = &leaf.inner;
-                if col >= inner.x && col < inner.x + inner.width
-                    && row >= inner.y && row < inner.y + inner.height
+                if col >= inner.x
+                    && col < inner.x + inner.width
+                    && row >= inner.y
+                    && row < inner.y + inner.height
                 {
                     let local_row = (row - inner.y) as usize;
                     let local_col = (col - inner.x) as usize;
@@ -233,11 +284,11 @@ fn extract_selection_text(
             }
             line.push(ch);
         }
-        let trimmed = line.trim_end();
-        result.push_str(trimmed);
-        if row < r1 {
+        if wrote_line {
             result.push('\n');
         }
+        result.push_str(line.trim_end());
+        wrote_line = true;
     }
 
     result
@@ -3107,6 +3158,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                     last_sent_size.1,
                                                     s, e,
                                                     rsel_block,
+                                                    rsel_pane_rect,
                                                 );
                                                 if !text.is_empty() {
                                                     copy_to_system_clipboard(&text);
@@ -3152,6 +3204,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                 last_sent_size.1,
                                                 s, e,
                                                 rsel_block,
+                                                rsel_pane_rect,
                                             );
                                             if !text.is_empty() {
                                                 copy_to_system_clipboard(&text);
@@ -3523,6 +3576,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                 last_sent_size.1,
                                                 s, e,
                                                 rsel_block,
+                                                rsel_pane_rect,
                                             );
                                             if !text.is_empty() {
                                                 copy_to_system_clipboard(&text);
@@ -3650,6 +3704,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                     last_sent_size.1,
                                                     s, e,
                                                     false,
+                                                    rsel_pane_rect,
                                                 );
                                                 if !text.is_empty() {
                                                     copy_to_system_clipboard(&text);
