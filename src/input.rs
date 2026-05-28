@@ -1946,7 +1946,7 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
             if ctrl {
                 let try_inject = |pane: &mut Pane| -> bool {
                     if let Some(pid) = pane.child_pid {
-                        crate::platform::mouse_inject::send_modified_enter_event(pid, ctrl, alt, shift)
+                        crate::platform::mouse_inject::send_modified_key_event(pid, '\r', ctrl, alt, shift)
                     } else {
                         false
                     }
@@ -1958,7 +1958,7 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
                         match node {
                             Node::Leaf(p) if !p.dead => {
                                 if let Some(pid) = p.child_pid {
-                                    if !crate::platform::mouse_inject::send_modified_enter_event(pid, ctrl, alt, shift) {
+                                    if !crate::platform::mouse_inject::send_modified_key_event(pid, '\r', ctrl, alt, shift) {
                                         // Fallback: xterm CSI encoding for non-console apps
                                         let m: u8 = 1 + (shift as u8) + (alt as u8) * 2 + (ctrl as u8) * 4;
                                         let bytes = if m > 1 { format!("\x1b[13;{}~", m).into_bytes() } else { b"\r".to_vec() };
@@ -1990,10 +1990,11 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
             // Shift/Alt+Enter (no Ctrl): fall through to VT encoding below.
         }
 
-        // Ctrl+letter: ConPTY cannot reconstruct Ctrl+key from raw control
-        // bytes (0x01..0x1A).  PSReadLine reads KEY_EVENT records, so it
-        // needs the actual VK code + LEFT_CTRL_PRESSED flag.  Use Win32
-        // input mode escape sequences through the ConPTY pipe (#305).
+        // Ctrl+letter: inject via WriteConsoleInputW so ConPTY's VT parser
+        // state is never touched.  Writing Win32 VT sequences to the pipe
+        // leaves the parser buffering \x1b, which blocks subsequent ESC
+        // delivery to apps like Neovim (#305, fixed for send-keys; this
+        // fixes the live-keypress path).
         //
         // crossterm may report Ctrl+K two ways:
         //   1. KeyCode::Char('k') with KeyModifiers::CONTROL
@@ -2017,38 +2018,41 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
             };
 
             if is_ctrl_letter {
-                let vk = crate::platform::mouse_inject::char_to_vk(inject_char);
-                let scan = crate::platform::mouse_inject::vk_to_scan(vk);
-                let u_char = (inject_char.to_ascii_lowercase() as u16) & 0x1F;
-                const LEFT_CTRL_PRESSED: u32 = 0x0008;
-                let seq = format!(
-                    "\x1b[{};{};{};1;{};1_\x1b[{};{};{};0;{};1_",
-                    vk, scan, u_char, LEFT_CTRL_PRESSED,
-                    vk, scan, u_char, LEFT_CTRL_PRESSED
-                );
-                let seq_bytes = seq.as_bytes();
+                let ctrl_char = (inject_char.to_ascii_lowercase() as u8) & 0x1F;
 
                 if app.sync_input {
                     let win = &mut app.windows[app.active_idx];
-                    fn write_ctrl_all(node: &mut Node, data: &[u8]) {
+                    fn inject_ctrl_all(node: &mut Node, ch: char, raw: u8) {
                         match node {
                             Node::Leaf(p) if !p.dead => {
-                                let _ = p.writer.write_all(data);
+                                let _ = p.writer.write_all(&[raw]);
                                 let _ = p.writer.flush();
+                                #[cfg(windows)]
+                                if let Some(pid) = p.child_pid {
+                                    crate::platform::mouse_inject::send_modified_key_event(pid, ch, true, false, false);
+                                }
+                                crate::debug_log::input_log("ctrl-key",
+                                    &format!("sync inject_ctrl char='{}' pid={:?}", ch, p.child_pid));
                             }
                             Node::Leaf(_) => {}
                             Node::Split { children, .. } => {
-                                for ch in children { write_ctrl_all(ch, data); }
+                                for child in children { inject_ctrl_all(child, ch, raw); }
                             }
                         }
                     }
-                    write_ctrl_all(&mut win.root, seq_bytes);
+                    inject_ctrl_all(&mut win.root, inject_char, ctrl_char);
                 } else {
                     let win = &mut app.windows[app.active_idx];
                     if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
                         if !active.dead {
-                            let _ = active.writer.write_all(seq_bytes);
+                            let _ = active.writer.write_all(&[ctrl_char]);
                             let _ = active.writer.flush();
+                            #[cfg(windows)]
+                            if let Some(pid) = active.child_pid {
+                                crate::platform::mouse_inject::send_modified_key_event(pid, inject_char, true, false, false);
+                            }
+                            crate::debug_log::input_log("ctrl-key",
+                                &format!("inject_ctrl char='{}' pid={:?}", inject_char, active.child_pid));
                         }
                     }
                 }
@@ -3243,32 +3247,22 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             }
             s if s.starts_with("C-") && s.len() == 3 => {
                 let c = s.chars().nth(2).unwrap_or('c');
-                // Use Win32 input mode escape sequence so ConPTY generates a
-                // proper KEY_EVENT with VK code + LEFT_CTRL_PRESSED (#305).
-                // Format: ESC [ Vk ; Sc ; Uc ; Kd ; Cs ; Rc _
+                let ctrl_char = (c.to_ascii_lowercase() as u8) & 0x1F;
+                // Always write the raw control byte so ConPTY can generate
+                // console control events (e.g. CTRL_C_EVENT for \x03).
+                // Raw bytes do NOT start with \x1b so they never corrupt
+                // ConPTY's VT parser state.
+                //
+                // On Windows, also inject a KEY_EVENT via WriteConsoleInputW
+                // so PSReadLine sees the proper VK + LEFT_CTRL_PRESSED flags
+                // (ConPTY cannot reconstruct modifier state from a raw byte).
+                let _ = p.writer.write_all(&[ctrl_char]);
+                let _ = p.writer.flush();
                 #[cfg(windows)]
                 if c.is_ascii_alphabetic() {
-                    let vk = crate::platform::mouse_inject::char_to_vk(c);
-                    let scan = crate::platform::mouse_inject::vk_to_scan(vk);
-                    let u_char = (c.to_ascii_lowercase() as u16) & 0x1F;
-                    const LEFT_CTRL_PRESSED: u32 = 0x0008;
-                    // Key down
-                    let seq_down = format!("\x1b[{};{};{};1;{};1_",
-                        vk, scan, u_char, LEFT_CTRL_PRESSED);
-                    // Key up
-                    let seq_up = format!("\x1b[{};{};{};0;{};1_",
-                        vk, scan, u_char, LEFT_CTRL_PRESSED);
-                    let _ = p.writer.write_all(seq_down.as_bytes());
-                    let _ = p.writer.write_all(seq_up.as_bytes());
-                    let _ = p.writer.flush();
-                } else {
-                    let ctrl_char = (c.to_ascii_lowercase() as u8) & 0x1F;
-                    let _ = p.writer.write_all(&[ctrl_char]);
-                }
-                #[cfg(not(windows))]
-                {
-                    let ctrl_char = (c.to_ascii_lowercase() as u8) & 0x1F;
-                    let _ = p.writer.write_all(&[ctrl_char]);
+                    if let Some(pid) = p.child_pid {
+                        crate::platform::mouse_inject::send_modified_key_event(pid, c, true, false, false);
+                    }
                 }
             }
             s if (s.starts_with("M-") || s.starts_with("m-")) && s.len() == 3 => {
@@ -3318,7 +3312,7 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 let injected = if has_ctrl {
                     // Only use native injection for Ctrl combos.
                     if let Some(pid) = p.child_pid {
-                        crate::platform::mouse_inject::send_modified_enter_event(pid, has_ctrl, has_alt, has_shift)
+                        crate::platform::mouse_inject::send_modified_key_event(pid, '\r', has_ctrl, has_alt, has_shift)
                     } else {
                         false
                     }

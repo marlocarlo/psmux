@@ -1141,28 +1141,21 @@ pub mod mouse_inject {
         }
     }
 
-    /// Inject a modified key event into a child process's console input buffer.
-    ///
-    /// Uses WriteConsoleInputW with the appropriate control_key_state flags
-    /// (LEFT_CTRL_PRESSED, LEFT_ALT_PRESSED, SHIFT_PRESSED) matching how
-    /// Windows Terminal synthesises input events.
-    ///
-    /// This is necessary because ConPTY does NOT reassemble ESC+char into
-    /// native Alt+key events — PSReadLine and other console apps receive
-    /// them as separate key events.  Similarly, Ctrl+Alt+key written as
-    /// ESC + control-char is not reassembled.
-    ///
-    /// For Ctrl+key: `u_char` = control character (ch & 0x1F), matching the
-    /// Map a character to its Windows virtual key code.
     pub fn char_to_vk(ch: char) -> u16 {
-        #[link(name = "user32")]
-        extern "system" {
-            fn VkKeyScanW(ch: u16) -> i16;
+        match ch {
+            '\x1b' => 0x1B,  // VK_ESCAPE — VkKeyScanW returns -1 for non-printable
+            '\r'   => 0x0D,  // VK_RETURN
+            _ => {
+                #[link(name = "user32")]
+                extern "system" {
+                    fn VkKeyScanW(ch: u16) -> i16;
+                }
+                let mut buf = [0u16; 2];
+                let wch = ch.to_ascii_lowercase().encode_utf16(&mut buf)[0];
+                let result = unsafe { VkKeyScanW(wch) };
+                if result == -1 { 0u16 } else { (result & 0xFF) as u16 }
+            }
         }
-        let mut buf = [0u16; 2];
-        let wch = ch.to_ascii_lowercase().encode_utf16(&mut buf)[0];
-        let result = unsafe { VkKeyScanW(wch) };
-        if result == -1 { 0u16 } else { (result & 0xFF) as u16 }
     }
 
     /// Map a virtual key code to its scan code.
@@ -1175,12 +1168,20 @@ pub mod mouse_inject {
         unsafe { MapVirtualKeyW(vk as u32, 0) as u16 }
     }
 
-    /// Windows console convention.  For Alt+key: `u_char` = the plain char.
-    /// For Ctrl+Alt: `u_char` = control character.
+    /// Inject a modified key event into a child process's console input buffer.
     ///
+    /// Uses WriteConsoleInputW with the appropriate control_key_state flags
+    /// (LEFT_CTRL_PRESSED, LEFT_ALT_PRESSED, SHIFT_PRESSED) matching how
+    /// Windows Terminal synthesises input events.
+    ///
+    /// This is necessary because ConPTY does NOT reassemble ESC+char into
+    /// native Alt+key events — PSReadLine and other console apps receive
+    /// them as separate key events.  Similarly, Ctrl+Alt+key written as
+    /// ESC + control-char is not reassembled.
+    ///
+    /// For Ctrl+key: `u_char` = control character (ch & 0x1F); for Alt+key:
+    /// `u_char` = the plain char; for Ctrl+Alt: `u_char` = control character.
     /// Sends both key-down and key-up events for proper event pairing.
-    ///
-    /// Convenience wrapper: `send_alt_key_event` calls this with ctrl=false, alt=true, shift=false.
     pub fn send_modified_key_event(child_pid: u32, ch: char, ctrl: bool, alt: bool, shift: bool) -> bool {
         unsafe {
             let had_console = GetConsoleWindow() != 0;
@@ -1236,46 +1237,22 @@ pub mod mouse_inject {
                 event: KEY_EVENT_RECORD,
             }
 
-            #[link(name = "user32")]
-            extern "system" {
-                fn VkKeyScanW(ch: u16) -> i16;
-                fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
-            }
-
             // Build control_key_state flags (matching Windows Terminal convention)
             let mut flags: u32 = 0;
             if ctrl { flags |= LEFT_CTRL_PRESSED; }
             if alt  { flags |= LEFT_ALT_PRESSED; }
             if shift { flags |= SHIFT_PRESSED; }
 
-            // Determine the character to send:
-            // - Ctrl+key: u_char = control character (ch & 0x1F)
-            // - Alt+key: u_char = plain character
-            // - Ctrl+Alt+key: u_char = control character
-            // - Shift+key: u_char = uppercase/shifted character
-            let base_char = if shift && !ctrl {
-                ch.to_ascii_uppercase()
-            } else {
-                ch
-            };
-
+            let base_char = if shift && !ctrl { ch.to_ascii_uppercase() } else { ch };
             let u_char_value: u16 = if ctrl {
-                // Control character: letter & 0x1F
                 (base_char.to_ascii_lowercase() as u16) & 0x1F
             } else {
                 let mut buf = [0u16; 2];
-                let encoded = base_char.encode_utf16(&mut buf);
-                encoded[0]
+                base_char.encode_utf16(&mut buf)[0]
             };
 
-            // VK code is always the unmodified letter key
-            let mut buf = [0u16; 2];
-            let plain_wch = ch.to_ascii_lowercase().encode_utf16(&mut buf)[0];
-            let vk_result = VkKeyScanW(plain_wch);
-            let vk = if vk_result == -1 { 0u16 } else { (vk_result & 0xFF) as u16 };
-
-            // MAPVK_VK_TO_VSC = 0
-            let scan = MapVirtualKeyW(vk as u32, 0) as u16;
+            let vk = char_to_vk(ch);
+            let scan = vk_to_scan(vk);
 
             let records = [
                 KEY_INPUT_RECORD {
@@ -2507,3 +2484,8 @@ pub fn ime_restore() {
 #[cfg(windows)]
 #[path = "../tests-rs/test_issue265_argv_backslash.rs"]
 mod tests_issue265_argv_backslash;
+
+#[cfg(test)]
+#[cfg(windows)]
+#[path = "../tests-rs/test_char_to_vk.rs"]
+mod tests_char_to_vk;
