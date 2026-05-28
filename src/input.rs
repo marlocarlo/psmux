@@ -2025,11 +2025,18 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
                     fn inject_ctrl_all(node: &mut Node, ch: char, raw: u8) {
                         match node {
                             Node::Leaf(p) if !p.dead => {
-                                let _ = p.writer.write_all(&[raw]);
-                                let _ = p.writer.flush();
+                                let mut injected = false;
                                 #[cfg(windows)]
-                                if let Some(pid) = p.child_pid {
-                                    crate::platform::mouse_inject::send_modified_key_event(pid, ch, true, false, false);
+                                // Ctrl+C must use the raw byte so ConPTY generates CTRL_C_EVENT;
+                                // WriteConsoleInputW cannot trigger process signals.
+                                if ch.to_ascii_lowercase() != 'c' {
+                                    if let Some(pid) = p.child_pid {
+                                        injected = crate::platform::mouse_inject::send_modified_key_event(pid, ch, true, false, false);
+                                    }
+                                }
+                                if !injected {
+                                    let _ = p.writer.write_all(&[raw]);
+                                    let _ = p.writer.flush();
                                 }
                                 crate::debug_log::input_log("ctrl-key",
                                     &format!("sync inject_ctrl char='{}' pid={:?}", ch, p.child_pid));
@@ -2045,11 +2052,16 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
                     let win = &mut app.windows[app.active_idx];
                     if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
                         if !active.dead {
-                            let _ = active.writer.write_all(&[ctrl_char]);
-                            let _ = active.writer.flush();
+                            let mut injected = false;
                             #[cfg(windows)]
-                            if let Some(pid) = active.child_pid {
-                                crate::platform::mouse_inject::send_modified_key_event(pid, inject_char, true, false, false);
+                            if inject_char.to_ascii_lowercase() != 'c' {
+                                if let Some(pid) = active.child_pid {
+                                    injected = crate::platform::mouse_inject::send_modified_key_event(pid, inject_char, true, false, false);
+                                }
+                            }
+                            if !injected {
+                                let _ = active.writer.write_all(&[ctrl_char]);
+                                let _ = active.writer.flush();
                             }
                             crate::debug_log::input_log("ctrl-key",
                                 &format!("inject_ctrl char='{}' pid={:?}", inject_char, active.child_pid));
@@ -3248,21 +3260,21 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             s if s.starts_with("C-") && s.len() == 3 => {
                 let c = s.chars().nth(2).unwrap_or('c');
                 let ctrl_char = (c.to_ascii_lowercase() as u8) & 0x1F;
-                // Always write the raw control byte so ConPTY can generate
-                // console control events (e.g. CTRL_C_EVENT for \x03).
-                // Raw bytes do NOT start with \x1b so they never corrupt
-                // ConPTY's VT parser state.
-                //
-                // On Windows, also inject a KEY_EVENT via WriteConsoleInputW
-                // so PSReadLine sees the proper VK + LEFT_CTRL_PRESSED flags
-                // (ConPTY cannot reconstruct modifier state from a raw byte).
-                let _ = p.writer.write_all(&[ctrl_char]);
-                let _ = p.writer.flush();
+                // On Windows, try WriteConsoleInputW first so PSReadLine sees the
+                // proper VK + LEFT_CTRL_PRESSED flags.  Only fall back to the raw
+                // control byte if injection fails (no pid or AttachConsole error).
+                // Writing both causes double delivery: ConPTY converts the raw byte
+                // into a KEY_EVENT and WriteConsoleInputW injects a second one.
+                let mut injected = false;
                 #[cfg(windows)]
-                if c.is_ascii_alphabetic() {
+                if c.is_ascii_alphabetic() && c.to_ascii_lowercase() != 'c' {
                     if let Some(pid) = p.child_pid {
-                        crate::platform::mouse_inject::send_modified_key_event(pid, c, true, false, false);
+                        injected = crate::platform::mouse_inject::send_modified_key_event(pid, c, true, false, false);
                     }
+                }
+                if !injected {
+                    let _ = p.writer.write_all(&[ctrl_char]);
+                    let _ = p.writer.flush();
                 }
             }
             s if (s.starts_with("M-") || s.starts_with("m-")) && s.len() == 3 => {
