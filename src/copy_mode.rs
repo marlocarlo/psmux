@@ -1069,6 +1069,21 @@ pub fn capture_active_pane_styled(app: &mut AppState, s: Option<i32>, e: Option<
             let screen = parser.screen();
             render_styled_row(screen, r, &mut text);
         }
+        // Trim trailing all-empty rows — match the behaviour the plain
+        // (non-styled) capture path has had for a long time (`while
+        // text.ends_with("\n\n") { text.pop(); }` + the iTerm2 comment in
+        // `capture_active_pane_text` and `capture_active_pane_range`).
+        // The styled path needs its own helper because empty rows that
+        // follow a styled row carry an `\x1b[0m` SGR reset between the
+        // newlines, so the plain ends_with("\n\n") test misses them.
+        // Without the trim, a downstream consumer that writes the snapshot
+        // into a terminal (xterm.js for a screen-mirror UI, fresh xterm
+        // window, …) leaves the cursor under the visible content — by as
+        // many rows as the pane has trailing blanks. Aiball #531 + POC
+        // (delta_y/x measured between display-message and xterm.js after
+        // term.write) reported the same shift on tmux Linux even though
+        // there the wrap at column 80 made it visually less obvious.
+        trim_trailing_empty_styled_lines(&mut text);
         return Ok(Some(text));
     }
 
@@ -1112,7 +1127,107 @@ pub fn capture_active_pane_styled(app: &mut AppState, s: Option<i32>, e: Option<
     }
 
     parser.screen_mut().set_scrollback(saved_sb);
+    trim_trailing_empty_styled_lines(&mut text);
     Ok(Some(text))
+}
+
+/// Strip trailing all-empty rows from a styled (`-e`) capture buffer.
+///
+/// A row in the styled output is one "line" terminated by `\n`. An empty
+/// row carries either `\n` (no style ever active) or `\x1b[0m\n` (the
+/// previous row left a style active and this row reset it). After all
+/// trailing empty rows are gone, the buffer ends with the last
+/// content-bearing row + its newline (or is empty if there was no
+/// content at all). The plain-capture siblings already do this via
+/// `while text.ends_with("\n\n") { text.pop(); }` — the styled path
+/// needs its own helper because of the SGR resets between newlines.
+fn trim_trailing_empty_styled_lines(text: &mut String) {
+    loop {
+        if !text.ends_with('\n') {
+            return;
+        }
+        let trailing_nl_at = text.len() - 1;
+        let line_start = text[..trailing_nl_at].rfind('\n').map_or(0, |i| i + 1);
+        let last_line = &text[line_start..trailing_nl_at];
+        // The line is "empty" when stripping any leading `\x1b[0m` SGR
+        // resets leaves nothing.
+        let mut remaining = last_line;
+        while let Some(rest) = remaining.strip_prefix("\x1b[0m") {
+            remaining = rest;
+        }
+        if !remaining.is_empty() {
+            return; // last line has content — done.
+        }
+        text.truncate(line_start);
+    }
+}
+
+#[cfg(test)]
+mod trim_trailing_empty_styled_lines_tests {
+    use super::trim_trailing_empty_styled_lines;
+
+    fn run(input: &str) -> String {
+        let mut s = String::from(input);
+        trim_trailing_empty_styled_lines(&mut s);
+        s
+    }
+
+    #[test]
+    fn empty_input_stays_empty() {
+        assert_eq!(run(""), "");
+    }
+
+    #[test]
+    fn no_trailing_newline_untouched() {
+        assert_eq!(run("hello"), "hello");
+        assert_eq!(run("\x1b[31mred"), "\x1b[31mred");
+    }
+
+    #[test]
+    fn single_trailing_newline_after_content_kept() {
+        assert_eq!(run("hello\n"), "hello\n");
+        assert_eq!(run("first\nsecond\n"), "first\nsecond\n");
+    }
+
+    #[test]
+    fn trailing_blank_lines_collapsed() {
+        assert_eq!(run("hello\n\n\n\n"), "hello\n");
+    }
+
+    #[test]
+    fn trailing_sgr_reset_lines_collapsed() {
+        // Each trailing empty row carries an SGR reset before its \n.
+        assert_eq!(run("hello\n\x1b[0m\n\x1b[0m\n"), "hello\n");
+    }
+
+    #[test]
+    fn mixed_trailing_blank_and_reset_lines_collapsed() {
+        assert_eq!(run("hello\n\n\x1b[0m\n\n\x1b[0m\n"), "hello\n");
+    }
+
+    #[test]
+    fn fully_empty_input_truncates() {
+        // Only resets + newlines, no content anywhere.
+        assert_eq!(run("\n\n\n"), "");
+        assert_eq!(run("\x1b[0m\n\x1b[0m\n"), "");
+    }
+
+    #[test]
+    fn content_with_inline_resets_kept() {
+        // SGR reset in the middle of a content row is part of that row, not a
+        // trailing-empty marker — must NOT be confused.
+        assert_eq!(
+            run("\x1b[31mred\x1b[0m text\n\n"),
+            "\x1b[31mred\x1b[0m text\n",
+        );
+    }
+
+    #[test]
+    fn multiple_sgr_resets_on_an_empty_line_still_empty() {
+        // Pathological but legal: a row that resets and then resets again
+        // (some renderers may emit double resets defensively).
+        assert_eq!(run("hello\n\x1b[0m\x1b[0m\n"), "hello\n");
+    }
 }
 
 /// Move to next empty line (paragraph boundary) — } key
