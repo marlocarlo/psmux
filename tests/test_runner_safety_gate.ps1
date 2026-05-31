@@ -33,8 +33,13 @@ Check "run_all_tests.ps1 has the PSMUX_TEST_SANDBOX gate" ($gateIdx -ge 0)
 Check "gate aborts with exit when not in a sandbox" ($gate.Success -and ($src.Substring($gateIdx) -match '^[\s\S]{0,1200}?exit\s+\d'))
 
 # 2. The gate must appear BEFORE every destructive operation, so the runner can
-#    never reach them without the opt-in.
-$destructive = @('kill-server', 'Stop-Process', 'taskkill', 'Remove-Item\s+"\$env:USERPROFILE\\\.psmux')
+#    never reach them without the opt-in. Remove-Item is matched broadly (ANY
+#    target, not just ~/.psmux): delete paths are often built from $env: vars,
+#    so a target-specific pattern wouldn't recognise them as destructive. Almost
+#    nothing should run before the gate anyway, so flagging any pre-gate delete
+#    is the safe default. (This is a drift guard, not a defence against a
+#    malicious runner — a small blacklist could never be that.)
+$destructive = @('kill-server', 'Stop-Process', 'taskkill', 'Remove-Item')
 foreach ($pat in $destructive) {
     $m = [regex]::Match($src, $pat)
     if ($m.Success) {
