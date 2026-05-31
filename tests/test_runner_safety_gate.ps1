@@ -27,7 +27,11 @@ $src = Get-Content -LiteralPath $runner -Raw
 #    not the first textual mention of the variable. Otherwise an explanatory
 #    comment naming the variable, placed before destructive code, would satisfy
 #    this guard while the real gate sat below the destructive operations.
-$gate = [regex]::Match($src, 'if\s*\(\s*\$env:PSMUX_TEST_SANDBOX')
+# Match case-insensitively throughout: PowerShell keywords, $env: lookups and
+# cmdlet/command names are all case-insensitive, so differently-cased code
+# (e.g. `remove-item`, `STOP-PROCESS`) must still be recognised.
+$ci = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+$gate = [regex]::Match($src, 'if\s*\(\s*\$env:PSMUX_TEST_SANDBOX', $ci)
 $gateIdx = if ($gate.Success) { $gate.Index } else { -1 }
 Check "run_all_tests.ps1 has the PSMUX_TEST_SANDBOX gate" ($gateIdx -ge 0)
 Check "gate aborts with exit when not in a sandbox" ($gate.Success -and ($src.Substring($gateIdx) -match '^[\s\S]{0,1200}?exit\s+\d'))
@@ -41,7 +45,7 @@ Check "gate aborts with exit when not in a sandbox" ($gate.Success -and ($src.Su
 #    malicious runner — a small blacklist could never be that.)
 $destructive = @('kill-server', 'Stop-Process', 'taskkill', 'Remove-Item')
 foreach ($pat in $destructive) {
-    $m = [regex]::Match($src, $pat)
+    $m = [regex]::Match($src, $pat, $ci)
     if ($m.Success) {
         Check "gate precedes destructive '$pat'" (($gateIdx -ge 0) -and ($gateIdx -lt $m.Index)) "gate@$gateIdx match@$($m.Index)"
     }
