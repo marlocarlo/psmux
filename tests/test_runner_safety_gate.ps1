@@ -23,9 +23,14 @@ if (-not (Test-Path $runner)) {
 $src = Get-Content -LiteralPath $runner -Raw
 
 # 1. The gate references PSMUX_TEST_SANDBOX and aborts (exit) shortly after.
-$gateIdx = $src.IndexOf('PSMUX_TEST_SANDBOX')
-Check "run_all_tests.ps1 references the PSMUX_TEST_SANDBOX gate" ($gateIdx -ge 0)
-Check "gate aborts with exit when not in a sandbox" ($src -match 'PSMUX_TEST_SANDBOX[\s\S]{0,1200}?exit\s+\d')
+#    Anchor on the ACTUAL executable check — `if ($env:PSMUX_TEST_SANDBOX ...)` —
+#    not the first textual mention of the variable. Otherwise an explanatory
+#    comment naming the variable, placed before destructive code, would satisfy
+#    this guard while the real gate sat below the destructive operations.
+$gate = [regex]::Match($src, 'if\s*\(\s*\$env:PSMUX_TEST_SANDBOX')
+$gateIdx = if ($gate.Success) { $gate.Index } else { -1 }
+Check "run_all_tests.ps1 has the PSMUX_TEST_SANDBOX gate" ($gateIdx -ge 0)
+Check "gate aborts with exit when not in a sandbox" ($gate.Success -and ($src.Substring($gateIdx) -match '^[\s\S]{0,1200}?exit\s+\d'))
 
 # 2. The gate must appear BEFORE every destructive operation, so the runner can
 #    never reach them without the opt-in.
