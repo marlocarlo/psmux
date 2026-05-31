@@ -14,6 +14,9 @@ ENV VS_INSTALL_PATH="C:\BuildTools"
 ENV RUSTUP_HOME="C:\rustup"
 ENV CARGO_HOME="C:\cargo"
 ENV PATH="C:\cargo\bin;C:\OpenSSH;C:\git\cmd;C:\Windows\System32;C:\Windows;C:\Program Files\PowerShell\latest;${PATH}"
+# Mark this as a throwaway sandbox so tests/run_all_tests.ps1 (which is
+# destructive: it kills all psmux processes and wipes ~/.psmux) will run here.
+ENV PSMUX_TEST_SANDBOX="1"
 
 # Create directories and copy all scripts first
 RUN mkdir C:\Tools && mkdir C:\Profile && mkdir "C:\Users\ContainerAdministrator\Documents\PowerShell"

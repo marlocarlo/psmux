@@ -10,6 +10,25 @@ param(
     [switch]$IncludeInteractive  # Include tests that need interactive TUI
 )
 
+# ── Safety gate: this runner is DESTRUCTIVE to a live psmux ──────────────────
+# Before every test it kills ALL psmux processes (by image name) and deletes
+# ~/.psmux\*.port, *.key and ~/.psmux.conf / ~/.psmuxrc. That is fine in a
+# throwaway sandbox (the Docker dev image / CI) but would wipe a real user's
+# running sessions and config. Refuse to run unless the caller has explicitly
+# confirmed a sandbox by setting PSMUX_TEST_SANDBOX=1.
+if ($env:PSMUX_TEST_SANDBOX -ne '1') {
+    Write-Host ''
+    Write-Host 'REFUSING TO RUN: this test runner is destructive to a live psmux.' -ForegroundColor Red
+    Write-Host 'Between tests it kills ALL psmux processes and deletes' -ForegroundColor Yellow
+    Write-Host '~/.psmux\*.port, *.key and ~/.psmux.conf / ~/.psmuxrc.' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host 'Run it only in a throwaway/sandbox environment (e.g. the Docker dev' -ForegroundColor Yellow
+    Write-Host 'image, which sets this automatically). To confirm a sandbox and run:' -ForegroundColor Yellow
+    Write-Host '    $env:PSMUX_TEST_SANDBOX = "1"; pwsh -File tests\run_all_tests.ps1' -ForegroundColor Cyan
+    Write-Host ''
+    exit 2
+}
+
 $ErrorActionPreference = "Continue"
 $startTime = Get-Date
 
