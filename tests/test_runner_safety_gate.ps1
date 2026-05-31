@@ -34,7 +34,7 @@ Check "gate aborts with exit when not in a sandbox" ($gate.Success -and ($src.Su
 
 # 2. The gate must appear BEFORE every destructive operation, so the runner can
 #    never reach them without the opt-in.
-$destructive = @('Stop-Process', 'taskkill', 'Remove-Item\s+"\$env:USERPROFILE\\\.psmux')
+$destructive = @('kill-server', 'Stop-Process', 'taskkill', 'Remove-Item\s+"\$env:USERPROFILE\\\.psmux')
 foreach ($pat in $destructive) {
     $m = [regex]::Match($src, $pat)
     if ($m.Success) {
