@@ -47,6 +47,19 @@ function Wait-PaneContent([string]$Target, [string]$Pattern, [int]$TimeoutMs = 8
 
 Write-Host "`n=== PR Smoke Tests ===" -ForegroundColor Cyan
 
+# Static safety-gate guard for the destructive comprehensive runner (#342).
+# It only reads run_all_tests.ps1 — no psmux binary or session needed — so a
+# removed or moved PSMUX_TEST_SANDBOX gate fails the PR build here too. Run it
+# first; surface its per-check output only when it fails.
+$gateGuard = Join-Path $PSScriptRoot "test_runner_safety_gate.ps1"
+$guardOut = & pwsh -NoProfile -ExecutionPolicy Bypass -File $gateGuard 2>&1
+if ($LASTEXITCODE -eq 0) {
+    Write-Pass "run_all_tests.ps1 sandbox gate intact (static guard)"
+} else {
+    Write-Fail "run_all_tests.ps1 sandbox gate guard failed (exit $LASTEXITCODE)"
+    $guardOut | ForEach-Object { Write-Host "    $_" }
+}
+
 Cleanup
 & $PSMUX new-session -d -s $SESSION -x 120 -y 30 | Out-Null
 if (-not (Wait-Session $SESSION)) {
