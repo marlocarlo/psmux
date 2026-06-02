@@ -582,6 +582,22 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     app.session_key = session_key.clone();
 
     ensure_session_registry_files(&home, &app);
+
+    // TEST-ONLY latency injection — compiled out of release builds entirely
+    // (gated on debug_assertions); inert in debug unless the env var is set.
+    // Delays the .port file write while the server is otherwise healthy, to
+    // deterministically reproduce a SLOW server startup under load. The client's
+    // startup gate must wait for the (eventually-reachable) server rather than
+    // give up and orphan it. See test_new_session_no_orphan.ps1.
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(ms) = env::var("PSMUX_TEST_PORTFILE_DELAY_MS") {
+            if let Ok(ms) = ms.parse::<u64>() {
+                thread::sleep(Duration::from_millis(ms));
+            }
+        }
+    }
+
     let regpath = format!("{}\\{}.port", dir, app.port_file_base());
     let keypath = format!("{}\\{}.key", dir, app.port_file_base());
 
@@ -724,6 +740,23 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // Update shared aliases now that config has been loaded
     if let Ok(mut w) = shared_aliases_main.write() {
         *w = app.command_aliases.clone();
+    }
+
+    // TEST-ONLY latency injection — compiled out of release builds entirely
+    // (gated on debug_assertions); inert in debug unless the env var is set.
+    // Widens the new-session readiness race deterministically: the .port file and
+    // accept thread are already up (the client's connect check passes), but the
+    // initial window does not yet exist. Lets test_new_session_readiness.ps1
+    // catch the session in its window-less state (server accepting connections,
+    // initial window not yet created), so the readiness gate is tested for the
+    // right reason.
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(ms) = env::var("PSMUX_TEST_WINDOW_DELAY_MS") {
+            if let Ok(ms) = ms.parse::<u64>() {
+                thread::sleep(Duration::from_millis(ms));
+            }
+        }
     }
 
     // Create initial window — if a warm pane was pre-spawned above,
