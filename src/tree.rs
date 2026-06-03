@@ -297,6 +297,18 @@ pub fn resize_all_panes(app: &mut AppState) {
         let win = &mut app.windows[app.active_idx];
         let mut rects: Vec<(Vec<usize>, Rect)> = Vec::new();
         compute_rects(&win.root, area, &mut rects);
+        // When the window is zoomed, split_with_gaps still subtracts the
+        // separator gap (1 px) AND the minimum-size steal (1 px) from the
+        // visible pane, making it 2 rows/cols shorter than the full viewport.
+        // The client renders the zoomed pane using the full area, so the PTY
+        // must also be sized to the full area — otherwise the bottom/right
+        // edge shows blank rows/columns.
+        if win.zoom_saved.is_some() {
+            let active_path = win.active_path.clone();
+            if let Some((_, rect)) = rects.iter_mut().find(|(p, _)| *p == active_path) {
+                *rect = area;
+            }
+        }
         let mut path = Vec::new();
         resize_node(&mut win.root, &rects, &mut path, border_status_rows);
     }

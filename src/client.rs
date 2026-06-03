@@ -4333,7 +4333,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             let mut border_path = Vec::new();
             collect_layout_borders(&root, content_chunk, &mut border_path, &mut client_borders);
 
-            let active_rect = compute_active_rect_json(&root, content_chunk);
+            let active_rect = compute_active_rect_json_zoom_aware(&root, content_chunk, state.zoomed);
             let clock_col = clock_colour_str.as_deref().map(|s| map_color(s)).unwrap_or(Color::Cyan);
             let border_status = state.pane_border_status.as_deref().unwrap_or("off");
             let border_format = state.pane_border_format.as_deref().unwrap_or("");
