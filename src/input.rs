@@ -2065,7 +2065,9 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
                                 #[cfg(windows)]
                                 if let Some(pid) = p.child_pid {
                                     if is_ctrl_c {
-                                        crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
+                                        // Keyboard pass-through: let raw-mode TUIs (opencode,
+                                        // neovim) handle 0x03 themselves (force=false).
+                                        crate::platform::mouse_inject::send_ctrl_c_event(pid, false, false);
                                     } else {
                                         crate::platform::mouse_inject::send_modified_key_event(pid, ch, true, false, false);
                                     }
@@ -2089,7 +2091,9 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
                             #[cfg(windows)]
                             if let Some(pid) = active.child_pid {
                                 if is_ctrl_c {
-                                    crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
+                                    // Keyboard pass-through: let raw-mode TUIs (opencode,
+                                    // neovim) handle 0x03 themselves (force=false).
+                                    crate::platform::mouse_inject::send_ctrl_c_event(pid, false, false);
                                 } else {
                                     crate::platform::mouse_inject::send_modified_key_event(pid, inject_char, true, false, false);
                                 }
@@ -3053,7 +3057,7 @@ fn handle_copy_mode_char(app: &mut AppState, c: char) -> io::Result<()> {
     Ok(())
 }
 
-pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
+pub fn send_key_to_active(app: &mut AppState, k: &str, force_signal: bool) -> io::Result<()> {
     // In clock mode, any key exits back to passthrough
     if matches!(app.mode, Mode::ClockMode) {
         app.mode = Mode::Passthrough;
@@ -3252,7 +3256,9 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
     }
     
     // Write a named key to a single pane (extracted for sync_input support).
-    fn write_named_key_to_pane(p: &mut crate::types::Pane, k: &str) {
+    // force_signal: when true, bypass the raw-mode TUI heuristic for C-c and
+    // always deliver CTRL_C_EVENT.  Pass true for `send-keys -f C-c` bindings.
+    fn write_named_key_to_pane(p: &mut crate::types::Pane, k: &str, force_signal: bool) {
         use std::io::Write as _;
         match k {
             "enter" => { let _ = write!(p.writer, "\r"); }
@@ -3312,10 +3318,15 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 let _ = p.writer.flush();
                 // Ctrl+C is the sole exception: a CTRL_C_EVENT must be raised so
                 // the child's console handler runs (SIGINT parity, issue #338).
+                // force_signal comes from `send-keys -f` in psmux.conf: when true,
+                // bypass the raw-mode TUI heuristic and always deliver the signal,
+                // allowing a dedicated keybinding (e.g. `bind -n C-F12 send-keys -f C-c`)
+                // to terminate any foreground app (including opencode, neovim).
+                // Without -f, direct keyboard Ctrl+C lets TUIs handle 0x03 themselves.
                 #[cfg(windows)]
                 if c.eq_ignore_ascii_case(&'c') {
                     if let Some(pid) = p.child_pid {
-                        crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
+                        crate::platform::mouse_inject::send_ctrl_c_event(pid, false, force_signal);
                     }
                 }
             }
@@ -3398,19 +3409,19 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
     // Distribute the key to all panes (sync) or just the active pane.
     if app.sync_input {
         let win = &mut app.windows[app.active_idx];
-        fn send_key_all_panes(node: &mut crate::types::Node, k: &str) {
+        fn send_key_all_panes(node: &mut crate::types::Node, k: &str, force_signal: bool) {
             match node {
-                crate::types::Node::Leaf(p) => write_named_key_to_pane(p, k),
+                crate::types::Node::Leaf(p) => write_named_key_to_pane(p, k, force_signal),
                 crate::types::Node::Split { children, .. } => {
-                    for c in children { send_key_all_panes(c, k); }
+                    for c in children { send_key_all_panes(c, k, force_signal); }
                 }
             }
         }
-        send_key_all_panes(&mut win.root, k);
+        send_key_all_panes(&mut win.root, k, force_signal);
     } else {
         let win = &mut app.windows[app.active_idx];
         if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-            write_named_key_to_pane(p, k);
+            write_named_key_to_pane(p, k, force_signal);
         }
     }
     Ok(())

@@ -1324,6 +1324,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             } else {
                 // Local: write key text directly to active pane
                 let literal = parts.iter().any(|p| *p == "-l");
+                let force_signal = parts.iter().any(|p| *p == "-f" || *p == "--force-signal");
                 let key_parts: Vec<&str> = parts[1..].iter().filter(|p| !p.starts_with('-')).copied().collect();
                 if !key_parts.is_empty() {
                     if literal {
@@ -1391,7 +1392,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                                                             p.child_pid = crate::platform::mouse_inject::get_child_pid(&*p.child);
                                                         }
                                                         if let Some(pid) = p.child_pid {
-                                                            crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
+                                                            crate::platform::mouse_inject::send_ctrl_c_event(pid, false, force_signal);
                                                         }
                                                     }
                                                 }

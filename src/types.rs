@@ -1006,7 +1006,7 @@ pub enum CtrlReq {
     ToggleSync,
     SetPaneTitle(String),
     SetPaneStyle(String),
-    SendKeys(String, bool),
+    SendKeys(String, bool, bool),  // (keys, literal, force_signal)
     SendKeysX(String),  // send-keys -X copy-mode-command
     SelectPane(String, bool),
     SelectWindow(usize),

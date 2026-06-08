@@ -1189,6 +1189,10 @@ match cmd {
         let literal = flag_has('l');
         let paste_mode = flag_has('p');
         let has_x = flag_has('X');
+        // -f / --force-signal: bypass raw-mode TUI heuristic and always deliver
+        // CTRL_C_EVENT when C-c is sent.  Intended for explicit kill bindings
+        // like `bind -n C-F12 send-keys -f C-c` in psmux.conf.
+        let force_signal = flag_has('f') || args.iter().any(|a| *a == "--force-signal");
         // Parse -N <count> for repeat (look for any cluster ending in 'N')
         let mut repeat_count: usize = 1;
         if let Some(n_pos) = args.iter().position(|a| a.starts_with('-') && !a.starts_with("--") && a.ends_with('N')) {
@@ -1241,9 +1245,9 @@ match cmd {
                     let _ = tx.send(CtrlReq::SendPaste(keys.join("")));
                 } else if effective_literal {
                     // Literal: concatenate without space separator.
-                    let _ = tx.send(CtrlReq::SendKeys(keys.join(""), true));
+                    let _ = tx.send(CtrlReq::SendKeys(keys.join(""), true, force_signal));
                 } else {
-                    let _ = tx.send(CtrlReq::SendKeys(keys.join(" "), false));
+                    let _ = tx.send(CtrlReq::SendKeys(keys.join(" "), false, force_signal));
                 }
             }
         }
@@ -3081,6 +3085,7 @@ fn dispatch_control_command(
                 false
             };
             let literal = flag_has('l');
+            let force_signal = flag_has('f') || args.iter().any(|a| *a == "--force-signal");
             // Convert real-tmux 0xNN hex codepoint syntax (used by iTerm2 for
             // every keystroke: `send -t %1 0xd` etc.) into literal characters.
             let keys: Vec<String> = args.iter().enumerate().filter(|(i, a)| {
@@ -3107,7 +3112,7 @@ fn dispatch_control_command(
             });
             let effective_literal = literal || any_hex;
             let text = if effective_literal { keys.join("") } else { keys.join(" ") };
-            let _ = tx.send(CtrlReq::SendKeys(text, effective_literal));
+            let _ = tx.send(CtrlReq::SendKeys(text, effective_literal, force_signal));
             let _ = resp_tx.send(String::new());
             true
         }

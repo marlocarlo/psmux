@@ -1050,7 +1050,16 @@ pub mod mouse_inject {
     /// (Call sites write the raw 0x03 either just before or just after invoking
     /// this function; the skip behavior is correct regardless of that ordering.)
     /// See `process_info::foreground_is_shell`.
-    pub fn send_ctrl_c_event(child_pid: u32, reattach: bool) -> bool {
+    /// `force`: when `true` (e.g. an explicit `send-keys -f C-c` command from a
+    /// keybinding like `bind -n C-F12 send-keys -f C-c`), the TUI-protection
+    /// heuristic is bypassed and `CTRL_C_EVENT` is always delivered.  This
+    /// lets users assign a dedicated "kill foreground app" key that works even
+    /// when the pane is running a raw-mode TUI such as opencode or neovim.
+    ///
+    /// When `force` is `false` (keyboard pass-through path), the heuristic
+    /// runs normally: raw-mode TUI apps receive raw 0x03 and decide for
+    /// themselves whether to treat it as copy or interrupt.
+    pub fn send_ctrl_c_event(child_pid: u32, reattach: bool, force: bool) -> bool {
         const CTRL_C_EVENT: u32 = 0;
         const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
 
@@ -1082,7 +1091,11 @@ pub mod mouse_inject {
         // established interrupt behavior (#338 line-cancel, #346 ping).  This
         // process-tree walk does not touch our console, so it is done before
         // the FreeConsole/AttachConsole dance below.
-        let fg_is_shell = crate::platform::process_info::foreground_is_shell(child_pid)
+        //
+        // When `force=true` the caller is an explicit user command (e.g. a
+        // keybinding that runs `send-keys -f C-c` to kill the foreground app);
+        // skip the heuristic and always deliver the signal.
+        let fg_is_shell = force || crate::platform::process_info::foreground_is_shell(child_pid)
             .unwrap_or(true);
 
         unsafe {
@@ -1471,7 +1484,7 @@ pub mod mouse_inject {
     pub fn send_mouse_event(_pid: u32, _col: i16, _row: i16, _btn: u32, _flags: u32, _reattach: bool) -> bool { false }
     pub fn send_vt_sequence(_pid: u32, _sequence: &[u8]) -> bool { false }
     pub fn query_vti_enabled(_pid: u32) -> Option<bool> { None }
-    pub fn send_ctrl_c_event(_pid: u32, _reattach: bool) -> bool { false }
+    pub fn send_ctrl_c_event(_pid: u32, _reattach: bool, _force: bool) -> bool { false }
     pub fn query_mouse_input_enabled(_pid: u32) -> Option<bool> { None }
     pub fn send_bracketed_paste(_pid: u32, _text: &str, _bracket: bool) -> bool { false }
     pub fn send_modified_key_event(_pid: u32, _ch: char, _ctrl: bool, _alt: bool, _shift: bool) -> bool { false }
