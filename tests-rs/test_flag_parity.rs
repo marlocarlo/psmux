@@ -1201,6 +1201,20 @@ fn send_keys_flag_l_literal() {
 }
 
 #[test]
+fn send_keys_flag_f_force_signal_short() {
+    let mut app = mock_app_with_window();
+    execute_command_string(&mut app, "send-keys -f C-c").unwrap();
+    // psmux extension: -f is accepted and only affects Ctrl+C signal delivery.
+}
+
+#[test]
+fn send_keys_flag_force_signal_long() {
+    let mut app = mock_app_with_window();
+    execute_command_string(&mut app, "send-keys --force-signal C-c").unwrap();
+    // Long-form alias should parse the same way as -f.
+}
+
+#[test]
 fn send_keys_flag_t_target() {
     let mut app = mock_app_with_window();
     execute_command_string(&mut app, "send-keys -t 0 Enter").unwrap();

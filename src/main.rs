@@ -1405,14 +1405,16 @@ fn run_main() -> io::Result<()> {
             "send-keys" | "send" | "send-key" => {
                 let mut literal = false;
                 let mut has_x = false;
+                let mut force_signal = false;
                 let mut keys: Vec<String> = Vec::new();
-                // Getopt-style parsing: -t consumes next arg, -l/-R/-X are flags
+                // Getopt-style parsing: -t/-N consume next arg; -l/-R/-X/-f are flags.
                 let mut i = 1;
                 while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
                         "-l" => { literal = true; }
                         "-R" => { keys.push("__RESET__".to_string()); }
                         "-X" => { has_x = true; }
+                        "-f" | "--force-signal" => { force_signal = true; }
                         "-t" => { i += 1; } // consume target value (already handled globally)
                         "-N" => { i += 1; } // repeat count, consume value
                         _ => { keys.push(cmd_args[i].to_string()); }
@@ -1422,6 +1424,7 @@ fn run_main() -> io::Result<()> {
                 let mut cmd = "send-keys".to_string();
                 if literal { cmd.push_str(" -l"); }
                 if has_x { cmd.push_str(" -X"); }
+                if force_signal { cmd.push_str(" -f"); }
                 // Quote arguments that contain spaces to preserve them
                 for k in keys { 
                     if k.contains(' ') || k.contains('\t') || k.contains('"') {
