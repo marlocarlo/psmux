@@ -581,14 +581,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
 
     app.session_key = session_key.clone();
 
-    ensure_session_registry_files(&home, &app);
-
     // TEST-ONLY latency injection — compiled out of release builds entirely
     // (gated on debug_assertions); inert in debug unless the env var is set.
     // Delays the .port file write while the server is otherwise healthy, to
     // deterministically reproduce a SLOW server startup under load. The client's
     // startup gate must wait for the (eventually-reachable) server rather than
     // give up and orphan it. See test_new_session_no_orphan.ps1.
+    //
+    // Must run BEFORE ensure_session_registry_files, which writes .port: the
+    // injected delay has to precede the real .port write for the test to
+    // exercise the slow-.port-write path it targets.
     #[cfg(debug_assertions)]
     {
         if let Ok(ms) = env::var("PSMUX_TEST_PORTFILE_DELAY_MS") {
@@ -597,6 +599,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             }
         }
     }
+
+    ensure_session_registry_files(&home, &app);
 
     let regpath = format!("{}\\{}.port", dir, app.port_file_base());
     let keypath = format!("{}\\{}.key", dir, app.port_file_base());
