@@ -2588,7 +2588,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 // Query ALL sessions (like tmux choose-tree)
                                 let dir = format!("{}\\.psmux", home);
                                 if let Ok(entries) = std::fs::read_dir(&dir) {
-                                    let mut sessions: Vec<(String, Vec<(usize, String, Vec<(usize, String)>)>)> = Vec::new();
+                                    let mut sessions: Vec<(String, Vec<ChooserWin>)> = Vec::new();
                                     for e in entries.flatten() {
                                         if let Some(fname) = e.file_name().to_str().map(|s| s.to_string()) {
                                             if let Some((base, ext)) = fname.rsplit_once('.') {
@@ -2608,10 +2608,10 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                                                 Duration::from_millis(100),
                                                             ) {
                                                                 if let Ok(wins) = serde_json::from_str::<Vec<WinTree>>(tree_line.trim()) {
-                                                                    let mut win_data = Vec::new();
+                                                                    let mut win_data: Vec<ChooserWin> = Vec::new();
                                                                     for w in &wins {
                                                                         let panes: Vec<(usize, String)> = w.panes.iter().map(|p| (p.id, p.title.clone())).collect();
-                                                                        win_data.push((w.id, w.name.clone(), panes));
+                                                                        win_data.push((w.id, w.name.clone(), w.active, panes));
                                                                     }
                                                                     sessions.push((base.to_string(), win_data));
                                                                 }
@@ -2627,41 +2627,14 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                         else if b.0 == current_session { std::cmp::Ordering::Greater }
                                         else { a.0.cmp(&b.0) }
                                     });
-                                    for (sess_name, wins) in &sessions {
-                                        let is_current = sess_name == &current_session;
-                                        let attached = if is_current { " (attached)" } else { "" };
-                                        let nw = wins.len();
-                                        tree_entries.push((true, usize::MAX, 0,
-                                            format!("{}: {} windows{}", sess_name, nw, attached),
-                                            sess_name.clone()));
-                                        if is_current {
-                                            for (wi, (wid, wname, panes)) in wins.iter().enumerate() {
-                                                let flag = if panes.len() > 0 { "" } else { "" };
-                                                tree_entries.push((true, *wid, 0,
-                                                    format!("  {}: {}{} ({} panes)", wi, wname, flag, panes.len()),
-                                                    sess_name.clone()));
-                                                for (pid, ptitle) in panes {
-                                                    tree_entries.push((false, *wid, *pid,
-                                                        format!("    {}", ptitle),
-                                                        sess_name.clone()));
-                                                }
-                                            }
-                                        } else {
-                                            for (wi, (wid, wname, panes)) in wins.iter().enumerate() {
-                                                tree_entries.push((true, *wid, 0,
-                                                    format!("  {}: {} ({} panes)", wi, wname, panes.len()),
-                                                    sess_name.clone()));
-                                            }
-                                        }
-                                    }
+                                    let (built, selected) = build_tree_entries(&sessions, &current_session);
+                                    tree_entries = built;
+                                    tree_selected = selected;
                                 }
                                 if tree_entries.is_empty() {
-                                    for wi in &last_tree {
-                                        tree_entries.push((true, wi.id, 0, wi.name.clone(), current_session.clone()));
-                                        for pi in &wi.panes {
-                                            tree_entries.push((false, wi.id, pi.id, pi.title.clone(), current_session.clone()));
-                                        }
-                                    }
+                                    let (built, selected) = build_fallback_entries(&last_tree, &current_session);
+                                    tree_entries = built;
+                                    tree_selected = selected;
                                 }
                             }
                             if do_choose_session {
@@ -5945,6 +5918,85 @@ fn route_paste_to_overlay(
     }
 }
 
+/// One window as projected into the choose-tree picker:
+/// `(window id, name, active, panes[(pane id, title)])`.
+type ChooserWin = (usize, String, bool, Vec<(usize, String)>);
+
+/// One flat row in the choose-tree list:
+/// `(selectable, window id, pane id, label, session name)`.
+/// Session-header rows use `window id == usize::MAX`; pane rows use
+/// `selectable == false`.
+type TreeRow = (bool, usize, usize, String, String);
+
+/// Build the flat choose-tree entry list across every reachable session and
+/// return `(rows, selected_index)`, where `selected_index` is the row of the
+/// active window in the current session — so the picker opens with the cursor
+/// on the current window, matching tmux. Falls back to `0` when the current
+/// session has no active window. The active window is marked with ` *`.
+///
+/// The caller sorts `sessions` with the current session first, but that order
+/// is display-only — correctness does not depend on it: only the current
+/// session is expanded, and the selected index is captured against
+/// the absolute row position, so interleaved session-header and pane rows are
+/// accounted for. Pure (no I/O) so it is unit-tested directly.
+fn build_tree_entries(sessions: &[(String, Vec<ChooserWin>)], current_session: &str) -> (Vec<TreeRow>, usize) {
+    let mut tree_entries: Vec<TreeRow> = Vec::new();
+    let mut tree_selected = 0usize;
+    for (sess_name, wins) in sessions {
+        let is_current = sess_name == current_session;
+        let attached = if is_current { " (attached)" } else { "" };
+        let nw = wins.len();
+        tree_entries.push((true, usize::MAX, 0,
+            format!("{}: {} windows{}", sess_name, nw, attached),
+            sess_name.clone()));
+        if is_current {
+            for (wi, (wid, wname, wactive, panes)) in wins.iter().enumerate() {
+                let marker = if *wactive { " *" } else { "" };
+                if *wactive { tree_selected = tree_entries.len(); }
+                tree_entries.push((true, *wid, 0,
+                    format!("  {}: {}{} ({} panes)", wi, wname, marker, panes.len()),
+                    sess_name.clone()));
+                for (pid, ptitle) in panes {
+                    tree_entries.push((false, *wid, *pid,
+                        format!("    {}", ptitle),
+                        sess_name.clone()));
+                }
+            }
+        } else {
+            for (wi, (wid, wname, _wactive, panes)) in wins.iter().enumerate() {
+                tree_entries.push((true, *wid, 0,
+                    format!("  {}: {} ({} panes)", wi, wname, panes.len()),
+                    sess_name.clone()));
+            }
+        }
+    }
+    (tree_entries, tree_selected)
+}
+
+/// Fallback choose-tree builder used when no session port files are reachable
+/// and only the current session's cached `last_tree` is available. Preserves
+/// the minimal cached-tree layout (bare window/pane names) but, like
+/// [`build_tree_entries`], marks the active window with ` *` and selects it so
+/// the cursor still opens on the current window. Pure (no I/O) so it is
+/// unit-tested directly.
+fn build_fallback_entries(last_tree: &[WinTree], current_session: &str) -> (Vec<TreeRow>, usize) {
+    let mut tree_entries: Vec<TreeRow> = Vec::new();
+    let mut tree_selected = 0usize;
+    for w in last_tree {
+        if w.active { tree_selected = tree_entries.len(); }
+        let marker = if w.active { " *" } else { "" };
+        tree_entries.push((true, w.id, 0,
+            format!("{}{}", w.name, marker),
+            current_session.to_string()));
+        for p in &w.panes {
+            tree_entries.push((false, w.id, p.id,
+                p.title.clone(),
+                current_session.to_string()));
+        }
+    }
+    (tree_entries, tree_selected)
+}
+
 #[cfg(test)]
 #[path = "../tests-rs/test_client.rs"]
 mod tests;
@@ -5964,3 +6016,7 @@ mod test_issue345_command_prompt_utf8;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue361_osc8_overlay.rs"]
 mod test_issue361_osc8_overlay;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_choose_tree_active_marker.rs"]
+mod test_choose_tree_active_marker;
