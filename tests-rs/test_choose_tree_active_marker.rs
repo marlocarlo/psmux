@@ -32,7 +32,7 @@ fn active_marker_appended_after_name() {
     let sessions = vec![("work".to_string(), vec![win(0, "editor", true, &[(0, "p")])])];
     let (entries, _) = build_tree_entries(&sessions, "work");
     // entries[0] is the session header; entries[1] is the (only) window row.
-    assert_eq!(entries[1].3, "  0: editor * (1 panes)");
+    assert_eq!(entries[1].3, "  0: editor* (1 panes)");
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn active_window_not_first_selects_correct_absolute_row() {
     ])];
     let (entries, selected) = build_tree_entries(&sessions, "work");
     assert_eq!(selected, 3);
-    assert_eq!(entries[selected].3, "  1: b * (1 panes)");
+    assert_eq!(entries[selected].3, "  1: b* (1 panes)");
 }
 
 #[test]
@@ -97,7 +97,7 @@ fn pane_rows_offset_the_selected_index() {
     ])];
     let (entries, selected) = build_tree_entries(&sessions, "work");
     assert_eq!(selected, 4);
-    assert_eq!(entries[4].3, "  1: b * (1 panes)"); // pin row identity, not just the index
+    assert_eq!(entries[4].3, "  1: b* (1 panes)"); // pin row identity, not just the index
 }
 
 // ---- build_tree_entries: cross-session isolation -------------------------
@@ -114,6 +114,10 @@ fn other_session_active_window_is_not_marked_or_selected() {
     let (entries, selected) = build_tree_entries(&sessions, "work");
     assert_eq!(selected, 0);
     assert!(entries.iter().all(|e| !e.3.contains('*')));
+    // The other (non-current) session's window stays collapsed, carries no
+    // marker, and keeps its normal label shape. Rows: work header(0),
+    // work win a(1), work pane(2), play header(3), play win x(4).
+    assert_eq!(entries[4].3, "  0: x (1 panes)");
 }
 
 // ---- build_fallback_entries: cached last_tree path -----------------------
@@ -127,7 +131,7 @@ fn fallback_marks_and_selects_active_window() {
     ];
     let (entries, selected) = build_fallback_entries(&last, "work");
     assert_eq!(selected, 2);
-    assert_eq!(entries[2].3, "b *"); // minimal cached layout: bare name + marker
+    assert_eq!(entries[2].3, "b*"); // minimal cached layout: bare name + marker
     assert_eq!(entries[0].3, "a");   // inactive window: no marker
 }
 

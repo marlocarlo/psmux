@@ -5932,7 +5932,8 @@ type TreeRow = (bool, usize, usize, String, String);
 /// return `(rows, selected_index)`, where `selected_index` is the row of the
 /// active window in the current session — so the picker opens with the cursor
 /// on the current window, matching tmux. Falls back to `0` when the current
-/// session has no active window. The active window is marked with ` *`.
+/// session has no active window. The active window is marked with `*`
+/// (glyph-adjacent, matching `list_windows_tmux`).
 ///
 /// The caller sorts `sessions` with the current session first, but that order
 /// is display-only — correctness does not depend on it: only the current
@@ -5951,7 +5952,7 @@ fn build_tree_entries(sessions: &[(String, Vec<ChooserWin>)], current_session: &
             sess_name.clone()));
         if is_current {
             for (wi, (wid, wname, wactive, panes)) in wins.iter().enumerate() {
-                let marker = if *wactive { " *" } else { "" };
+                let marker = if *wactive { "*" } else { "" };
                 if *wactive { tree_selected = tree_entries.len(); }
                 tree_entries.push((true, *wid, 0,
                     format!("  {}: {}{} ({} panes)", wi, wname, marker, panes.len()),
@@ -5976,7 +5977,7 @@ fn build_tree_entries(sessions: &[(String, Vec<ChooserWin>)], current_session: &
 /// Fallback choose-tree builder used when no session port files are reachable
 /// and only the current session's cached `last_tree` is available. Preserves
 /// the minimal cached-tree layout (bare window/pane names) but, like
-/// [`build_tree_entries`], marks the active window with ` *` and selects it so
+/// [`build_tree_entries`], marks the active window with `*` and selects it so
 /// the cursor still opens on the current window. Pure (no I/O) so it is
 /// unit-tested directly.
 fn build_fallback_entries(last_tree: &[WinTree], current_session: &str) -> (Vec<TreeRow>, usize) {
@@ -5984,7 +5985,7 @@ fn build_fallback_entries(last_tree: &[WinTree], current_session: &str) -> (Vec<
     let mut tree_selected = 0usize;
     for w in last_tree {
         if w.active { tree_selected = tree_entries.len(); }
-        let marker = if w.active { " *" } else { "" };
+        let marker = if w.active { "*" } else { "" };
         tree_entries.push((true, w.id, 0,
             format!("{}{}", w.name, marker),
             current_session.to_string()));
