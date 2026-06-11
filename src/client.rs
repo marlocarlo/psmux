@@ -5923,9 +5923,10 @@ fn route_paste_to_overlay(
 type ChooserWin = (usize, String, bool, Vec<(usize, String)>);
 
 /// One flat row in the choose-tree list:
-/// `(selectable, window id, pane id, label, session name)`.
-/// Session-header rows use `window id == usize::MAX`; pane rows use
-/// `selectable == false`.
+/// `(is_win, window id, pane id, label, session name)`.
+/// `is_win` is true for window rows and session-header rows, false for pane
+/// rows; on Enter it selects `focus-window` vs `focus-pane`. Session-header
+/// rows additionally have `window id == usize::MAX`. Every row is selectable.
 type TreeRow = (bool, usize, usize, String, String);
 
 /// Build the flat choose-tree entry list across every reachable session and
