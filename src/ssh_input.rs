@@ -202,9 +202,38 @@ pub fn is_ssh_session() -> bool {
 /// The fix: use the same VT input parser as SSH sessions to properly decode
 /// X10/SGR mouse sequences from stdin.
 pub fn needs_vt_input() -> bool {
-    is_ssh_session()
-        || std::env::var("TERMINAL_EMULATOR")
-            .map_or(false, |v| v.contains("JetBrains"))
+    if is_ssh_session() {
+        return true;
+    }
+    // JetBrains IDEs (JediTerm) send VT mouse sequences through ConPTY.
+    if std::env::var("TERMINAL_EMULATOR")
+        .map_or(false, |v| v.contains("JetBrains"))
+    {
+        return true;
+    }
+    // Alacritty and WezTerm on Windows route input through ConPTY and send
+    // VT escape sequences (e.g. \x1b[27;5;47~ for Ctrl+/).
+    //
+    // Detection by env vars each terminal sets on Windows:
+    //   Alacritty  → ALACRITTY_LOG (e.g. C:\...\Alacritty-NNNN.log)
+    //   WezTerm    → WEZTERM_LOG   (e.g. "warn")
+    //   TERM_PROGRAM → set by some terminals on other platforms
+    //
+    // Windows Terminal sets WT_SESSION and delivers native Win32 INPUT_RECORDs,
+    // so it does NOT need VT mode.
+    if std::env::var_os("ALACRITTY_LOG").is_some() {
+        return true;
+    }
+    if std::env::var_os("WEZTERM_LOG").is_some() {
+        return true;
+    }
+    if let Ok(term_program) = std::env::var("TERM_PROGRAM") {
+        let tp = term_program.to_lowercase();
+        if tp.contains("alacritty") || tp.contains("wezterm") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Returns the Windows build number (e.g. 19045 for Win10 22H2, 22631 for
@@ -818,6 +847,19 @@ impl VtParser {
     /// Dispatch CSI `~` (tilde) sequences: `\x1b[N~` or `\x1b[N;mod~`.
     fn dispatch_tilde<F: FnMut(Event)>(&self, mods: KeyModifiers, emit: &mut F) {
         let n = self.params[0];
+
+        // modifyOtherKeys format 1: \x1b[27;mod;unicode~
+        // params[0]=27, params[1]=modifier, params[2]=Unicode codepoint.
+        // Sent by Alacritty, XTerm with modifyOtherKeys=1, etc.
+        // Example: Ctrl+/ → \x1b[27;5;47~
+        if n == 27 && self.pidx >= 3 {
+            let key_mods = decode_modifiers(self.params[1]);
+            if let Some(c) = char::from_u32(self.params[2] as u32) {
+                emit(make_key(KeyCode::Char(c), key_mods));
+            }
+            return;
+        }
+
         let code = match n {
             1 | 7 => KeyCode::Home,
             2 => KeyCode::Insert,
