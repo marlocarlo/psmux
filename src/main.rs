@@ -671,17 +671,16 @@ fn run_main() -> io::Result<()> {
                 // otherwise argv[0] (the exe path or subcommand name) gets
                 // picked up as the target session name.
                 let sub_args: Vec<&String> = cmd_args.iter().skip(1).copied().collect();
-                let name = sub_args
-                    .iter()
-                    .position(|a| *a == "-t")
-                    .and_then(|i| sub_args.get(i + 1))
-                    .map(|s| {
-                        if let Some(ref l) = l_socket_name {
-                            format!("{}__{}", l, s)
-                        } else {
-                            (*s).clone()
-                        }
-                    })
+                // Resolve the target session for `-t NAME`. IMPORTANT: this reads
+                // `-t` from the RAW `args`, not from `sub_args`/`cmd_args` — the
+                // cmd_args builder above strips `-t <value>` for every subcommand
+                // (see "After subcommand: strip only -t"). Scanning the stripped
+                // args never finds `-t`, so attach falls through to
+                // `resolve_last_session_name_ns` and connects to the most-recent
+                // session instead of the one the user asked for (the
+                // attach-wrong-session bug). The positional fallback below still
+                // uses sub_args, since positional args are not stripped.
+                let name = crate::cli::attach_target_session(&args, l_socket_name.as_deref())
                     .or_else(|| {
                         // Accept positional argument as target session name
                         // (e.g. "psmux attach work" without -t flag)

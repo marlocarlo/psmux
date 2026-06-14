@@ -629,6 +629,29 @@ pub fn extract_session_from_target(target: &str) -> String {
     parsed.session.unwrap_or_else(|| "default".to_string())
 }
 
+/// Resolve the explicit `-t <session>` target for attach-session from the full
+/// argv, applying the `-L` socket-namespace prefix when present.
+///
+/// This MUST read from the raw `args`, not from the post-subcommand filtered
+/// command args: the arg pre-filter in `main` strips `-t <value>` for every
+/// subcommand (it assumes downstream reads the resolved env var). The attach
+/// handler re-derives the target from argv, so if it scans the *stripped* args
+/// it never finds `-t`, falls through to "most recent session", and attaches to
+/// the wrong session — `psmux attach -t A` opening B. Reading raw argv here (the
+/// same way the global `-t` handler does) keeps the explicit target intact.
+///
+/// Returns `None` when no `-t` flag is present (the caller then tries a
+/// positional name, then the default/last-session fallbacks).
+pub fn attach_target_session(args: &[String], l_socket_name: Option<&str>) -> Option<String> {
+    args.iter()
+        .position(|a| a == "-t")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| match l_socket_name {
+            Some(l) => format!("{}__{}", l, s),
+            None => s.clone(),
+        })
+}
+
 /// Extract a flag value from args, supporting tmux short-flag CLI forms:
 ///   * Two-token form: `-F value`
 ///   * Concatenated form: `-Fvalue`
@@ -745,3 +768,7 @@ mod tests {
 #[cfg(test)]
 #[path = "../tests-rs/test_issue196_flag_equals.rs"]
 mod tests_issue196_flag_equals;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_attach_target_session.rs"]
+mod tests_attach_target_session;
