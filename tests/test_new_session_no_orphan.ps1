@@ -16,42 +16,16 @@
 # removed from server/mod.rs.
 
 $ErrorActionPreference = "Stop"
-$PSMUX = $env:PSMUX_EXE
-if (-not $PSMUX -or -not (Test-Path $PSMUX)) { $PSMUX = "$PSScriptRoot\..\target\debug\psmux.exe" }
-if (-not (Test-Path $PSMUX)) {
-    Write-Host "FATAL: could not resolve psmux executable ($PSMUX)" -ForegroundColor Red
-    exit 1
-}
+. "$PSScriptRoot\psmux_test_helpers.ps1"
 
-$tmpHome = Join-Path $env:TEMP ("psmux_noorphan_" + [guid]::NewGuid().ToString("N").Substring(0,8))
-New-Item -ItemType Directory $tmpHome -Force | Out-Null
-$psmuxDir = Join-Path $tmpHome ".psmux"; New-Item -ItemType Directory $psmuxDir -Force | Out-Null
-$env:USERPROFILE = $tmpHome; $env:HOME = $tmpHome
-$ns = "noorphan"; $session = "noorphan"; $base = "${ns}__${session}"
+$ctx = New-PsmuxTestEnv -Tag 'noorphan'
+$PSMUX = $ctx.PsmuxExe
+$ns = Register-PsmuxNamespace -Ctx $ctx -Namespace "noorphan"
+$session = "noorphan"; $base = "${ns}__${session}"
 $pass = 0; $fail = 0
 function Write-Result($name, $ok, $msg) {
     if ($ok) { Write-Host "  [PASS] $name" -ForegroundColor Green; $script:pass++ }
     else     { Write-Host "  [FAIL] $name : $msg" -ForegroundColor Red; $script:fail++ }
-}
-
-function Get-ListWindows($portBase) {
-    $portFile = Join-Path $psmuxDir "$portBase.port"
-    $keyFile  = Join-Path $psmuxDir "$portBase.key"
-    if (-not (Test-Path $portFile)) { return $null }
-    $port = (Get-Content $portFile -Raw).Trim()
-    $key  = if (Test-Path $keyFile) { (Get-Content $keyFile -Raw).Trim() } else { "" }
-    try {
-        $tcp = [System.Net.Sockets.TcpClient]::new()
-        $tcp.Connect("127.0.0.1", [int]$port); $tcp.NoDelay = $true
-        $stream = $tcp.GetStream(); $stream.ReadTimeout = 2000
-        $w = [System.IO.StreamWriter]::new($stream); $w.AutoFlush = $true
-        $r = [System.IO.StreamReader]::new($stream)
-        $w.WriteLine("AUTH $key"); $r.ReadLine() | Out-Null
-        $w.WriteLine("list-windows")
-        $sb = [System.Text.StringBuilder]::new()
-        try { while ($null -ne ($l = $r.ReadLine())) { [void]$sb.AppendLine($l) } } catch {}
-        $tcp.Close(); return $sb.ToString().Trim()
-    } catch { return $null }
 }
 
 Write-Host ""
@@ -74,7 +48,7 @@ try {
     Write-Result "new-session -d waited for the slow server (rc=0)" ($code -eq 0) `
         "rc=$code - client gave up on a slow-but-healthy server"
 
-    $windows = Get-ListWindows $base
+    $windows = Invoke-PsmuxListWindows -Ctx $ctx -Base $base
     $hasWindow = ($null -ne $windows -and $windows.Length -gt 0)
     Write-Result "initial window listable after new-session returns" $hasWindow `
         "list-windows empty/null (got: '$windows')"
@@ -82,12 +56,7 @@ try {
 finally {
     Remove-Item Env:\PSMUX_TEST_PORTFILE_DELAY_MS -EA SilentlyContinue
     Remove-Item Env:\PSMUX_NO_WARM -EA SilentlyContinue
-    & $PSMUX -L $ns kill-server 2>&1 | Out-Null
-    Get-CimInstance Win32_Process -Filter "Name='psmux.exe'" -EA SilentlyContinue |
-      Where-Object { $_.CommandLine -match [regex]::Escape($ns) } |
-      ForEach-Object { Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue }
-    Start-Sleep -Milliseconds 300
-    Remove-Item -Recurse -Force $tmpHome -EA SilentlyContinue
+    Remove-PsmuxTestEnv -Ctx $ctx
 }
 
 Write-Host ""

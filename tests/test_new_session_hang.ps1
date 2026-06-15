@@ -21,13 +21,9 @@
 # hooks are deleted from server/mod.rs, delete this test.
 
 $ErrorActionPreference = "Stop"
-$PSMUX = $env:PSMUX_EXE
-if (-not $PSMUX -or -not (Test-Path $PSMUX)) { $PSMUX = "$PSScriptRoot\..\target\debug\psmux.exe" }
-if (-not (Test-Path $PSMUX)) {
-    Write-Host "FATAL: could not resolve psmux executable ($PSMUX)" -ForegroundColor Red
-    exit 1
-}
+. "$PSScriptRoot\psmux_test_helpers.ps1"
 
+$PSMUX = Get-PsmuxExe
 $pass = 0; $fail = 0
 function Write-Result($name, $ok, $msg) {
     if ($ok) { Write-Host "  [PASS] $name" -ForegroundColor Green; $script:pass++ }
@@ -36,25 +32,21 @@ function Write-Result($name, $ok, $msg) {
 
 function Run-Scenario {
     param([string]$Tag, [hashtable]$EnvVars)
-    $tmpHome = Join-Path $env:TEMP ("psmux_hang_" + [guid]::NewGuid().ToString("N").Substring(0,8))
-    New-Item -ItemType Directory $tmpHome -Force | Out-Null
-    $ns = "hang_$Tag"; $sn = "hang_$Tag"
-    $env:USERPROFILE = $tmpHome; $env:HOME = $tmpHome
+    $ctx = New-PsmuxTestEnv -Tag "hang_$Tag" -Exe $PSMUX
+    $ns = Register-PsmuxNamespace -Ctx $ctx -Namespace "hang_$Tag"; $sn = $ns
     $env:PSMUX_NO_WARM = "1"
     foreach ($k in $EnvVars.Keys) { Set-Item -Path "Env:\$k" -Value $EnvVars[$k] }
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    & $PSMUX -L $ns new-session -d -s $sn 2>&1 | Out-Null
-    $rc = $LASTEXITCODE
-    $sw.Stop()
-    foreach ($k in $EnvVars.Keys) { Remove-Item -Path "Env:\$k" -EA SilentlyContinue }
-    Remove-Item Env:\PSMUX_NO_WARM -EA SilentlyContinue
-    # Clean up any server left bound to this isolated home.
-    & $PSMUX -L $ns kill-server 2>&1 | Out-Null
-    Get-CimInstance Win32_Process -Filter "Name='psmux.exe'" -EA SilentlyContinue |
-      Where-Object { $_.CommandLine -match [regex]::Escape($ns) } |
-      ForEach-Object { Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue }
-    Start-Sleep -Milliseconds 300
-    Remove-Item -Recurse -Force $tmpHome -EA SilentlyContinue
+    try {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        & $PSMUX -L $ns new-session -d -s $sn 2>&1 | Out-Null
+        $rc = $LASTEXITCODE
+        $sw.Stop()
+    }
+    finally {
+        foreach ($k in $EnvVars.Keys) { Remove-Item -Path "Env:\$k" -EA SilentlyContinue }
+        Remove-Item Env:\PSMUX_NO_WARM -EA SilentlyContinue
+        Remove-PsmuxTestEnv -Ctx $ctx
+    }
     return @{ rc = $rc; ms = $sw.ElapsedMilliseconds }
 }
 
