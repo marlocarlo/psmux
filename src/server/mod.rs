@@ -1090,9 +1090,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             .map(|g| g.screen().cursor_position())
                             .unwrap_or((0, 0));
                         let response = format!("\x1b[{};{}R", r + 1, c + 1);
-                        use std::io::Write as _;
-                        let _ = wp.writer.write_all(response.as_bytes());
-                        let _ = wp.writer.flush();
+                        helpers::deliver_cpr_reply(wp.child_pid, &mut wp.writer, &response);
                     }
                 }
                 // Also answer CPR queries for an active popup PTY pane. Like the
@@ -1105,9 +1103,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             .map(|g| g.screen().cursor_position())
                             .unwrap_or((0, 0));
                         let response = format!("\x1b[{};{}R", r + 1, c + 1);
-                        use std::io::Write as _;
-                        let _ = pane.writer.write_all(response.as_bytes());
-                        let _ = pane.writer.flush();
+                        helpers::deliver_cpr_reply(pane.child_pid, &mut pane.writer, &response);
                     }
                 }
             }

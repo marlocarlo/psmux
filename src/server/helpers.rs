@@ -386,8 +386,32 @@ fn check_pane_bells(node: &Node) -> bool {
 /// Injects ESC[row;colR into any pane whose reader thread detected ESC[6n.
 /// pwsh re-issues the CPR query after lock/unlock; without this response it
 /// blocks indefinitely since the preemptive write at spawn time is long gone.
+/// Deliver a CPR (cursor-position-report) reply to a child process.
+///
+/// The child ConPTY is created with `PSEUDOCONSOLE_WIN32_INPUT_MODE`, whose
+/// input parser only accepts win32 key sequences terminated with `_`.  Writing
+/// a raw VT CPR reply (terminated with `R`) to the PTY pipe leaves that parser
+/// in a half-state that swallows the next keystroke -- notably a lone <Esc>,
+/// which is why <Esc> stops working a few seconds after an app such as Neovim
+/// issues its `ESC[6n` probe.  This is the reactive twin of the spawn-time DSR
+/// bug fixed in #313.  Inject the reply straight into the child's console input
+/// buffer (bypassing ConPTY's VT input parser); only fall back to the PTY pipe
+/// when no child pid is known or on non-Windows, where the issue does not apply.
+pub(crate) fn deliver_cpr_reply<W: std::io::Write>(
+    child_pid: Option<u32>,
+    writer: &mut W,
+    response: &str,
+) {
+    let injected = child_pid
+        .map(|pid| crate::platform::mouse_inject::send_vt_sequence(pid, response.as_bytes()))
+        .unwrap_or(false);
+    if !injected {
+        let _ = writer.write_all(response.as_bytes());
+        let _ = writer.flush();
+    }
+}
+
 pub(crate) fn drain_cpr_pending(node: &mut crate::types::Node) {
-    use std::io::Write as _;
     match node {
         crate::types::Node::Leaf(p) => {
             if p.cpr_pending
@@ -399,8 +423,7 @@ pub(crate) fn drain_cpr_pending(node: &mut crate::types::Node) {
                     .map(|g| g.screen().cursor_position())
                     .unwrap_or((0, 0));
                 let response = format!("\x1b[{};{}R", r + 1, c + 1);
-                let _ = p.writer.write_all(response.as_bytes());
-                let _ = p.writer.flush();
+                deliver_cpr_reply(p.child_pid, &mut p.writer, &response);
             }
         }
         crate::types::Node::Split { children, .. } => {
