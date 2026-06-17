@@ -2102,6 +2102,42 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
                 return Ok(());
             }
         }
+
+        // Bare <Esc>: deliver it as a VK_ESCAPE key event via WriteConsoleInputW
+        // instead of writing a lone \x1b to the PTY pipe.  Once the child app
+        // (Neovim, Claude Code, ...) turns on VT / Win32 input mode a moment
+        // after launch, ConPTY treats a piped \x1b as the start of a CSI
+        // sequence and buffers it, so the keypress never reaches the child and
+        // <Esc> appears dead.  Direct console-input injection bypasses that
+        // parser, mirroring the Ctrl+letter path above (#305).  Fall back to the
+        // pipe only when no child pid is known.
+        if matches!(key.code, KeyCode::Esc) && key.modifiers.is_empty() {
+            fn deliver_esc(p: &mut Pane) {
+                let injected = p.child_pid
+                    .map(|pid| crate::platform::mouse_inject::send_modified_key_event(pid, '\u{1b}', false, false, false))
+                    .unwrap_or(false);
+                if !injected {
+                    let _ = p.writer.write_all(b"\x1b");
+                    let _ = p.writer.flush();
+                }
+                crate::debug_log::input_log("esc",
+                    &format!("deliver_esc injected={} pid={:?}", injected, p.child_pid));
+            }
+            let win = &mut app.windows[app.active_idx];
+            if app.sync_input {
+                fn esc_all(node: &mut Node) {
+                    match node {
+                        Node::Leaf(p) if !p.dead => deliver_esc(p),
+                        Node::Leaf(_) => {}
+                        Node::Split { children, .. } => { for c in children { esc_all(c); } }
+                    }
+                }
+                esc_all(&mut win.root);
+            } else if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                if !active.dead { deliver_esc(active); }
+            }
+            return Ok(());
+        }
     }
 
     let encoded = match encode_key_event(&key) {
