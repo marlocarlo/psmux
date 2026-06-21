@@ -1810,6 +1810,18 @@ pub fn encode_key_event(key: &KeyEvent) -> Option<Vec<u8>> {
             let m = modifier_param(key.modifiers);
             if m > 1 {
                 // On Windows, CSI 13;mod~ is non-standard and dropped by ConPTY.
+                // Windows Terminal reports Ctrl+Enter to raw/Node-style readers
+                // as LF (0x0A). The live Windows path injects VK_RETURN with the
+                // same LF payload; this is the fallback byte encoding.
+                #[cfg(windows)]
+                {
+                    let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                    let has_alt = key.modifiers.contains(KeyModifiers::ALT);
+                    if has_ctrl && !has_shift && !has_alt {
+                        return Some(b"\n".to_vec());
+                    }
+                }
                 // Send ESC+CR (\x1b\r) for Shift/Alt+Enter — the same bytes VS Code's
                 // xterm.js sends.  libuv preserves ESC as Alt prefix, so Node.js apps
                 // (Claude Code) receive \x1b\r and interpret it as Shift+Enter.
@@ -1958,70 +1970,52 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
         for_each_receiving_pane(app, |p| p.last_special_key = Some((now, name.clone())));
     }
 
-    // On Windows, modified Enter delivery depends on the modifier:
-    //
-    // Shift/Alt+Enter (no Ctrl): Use VT encoding ONLY (\x1b\r).  Native
-    //   WriteConsoleInputW injection would cause ConPTY to translate the
-    //   KEY_EVENT back to plain \r, so VT-native apps (Claude Code) see a
-    //   double Enter.
-    //
-    // Ctrl+Enter / Ctrl+Shift+Enter: Use native injection ONLY.  ConPTY
-    //   cannot encode Ctrl+Enter in VT, so injection is the only reliable
-    //   path for console apps (PSReadLine).  Falls back to xterm CSI
-    //   encoding (\x1b[13;N~) if injection fails (for non-console apps).
     #[cfg(windows)]
     {
-        if matches!(key.code, KeyCode::Enter) && !key.modifiers.is_empty() {
-            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-            let alt = key.modifiers.contains(KeyModifiers::ALT);
-            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
-
-            // Only use native injection when Ctrl is involved.
-            if ctrl {
-                let try_inject = |pane: &mut Pane| -> bool {
-                    if let Some(pid) = pane.child_pid {
-                        crate::platform::mouse_inject::send_modified_key_event(pid, '\r', ctrl, alt, shift)
-                    } else {
-                        false
-                    }
-                };
-
-                if app.sync_input {
-                    let win = &mut app.windows[app.active_idx];
-                    fn inject_all(node: &mut Node, ctrl: bool, alt: bool, shift: bool) {
-                        match node {
-                            Node::Leaf(p) if !p.dead => {
-                                if let Some(pid) = p.child_pid {
-                                    if !crate::platform::mouse_inject::send_modified_key_event(pid, '\r', ctrl, alt, shift) {
-                                        // Fallback: xterm CSI encoding for non-console apps
-                                        let m: u8 = 1 + (shift as u8) + (alt as u8) * 2 + (ctrl as u8) * 4;
-                                        let bytes = if m > 1 { format!("\x1b[13;{}~", m).into_bytes() } else { b"\r".to_vec() };
-                                        let _ = p.writer.write_all(&bytes);
-                                        let _ = p.writer.flush();
-                                    }
-                                }
-                            }
-                            Node::Leaf(_) => {}
-                            Node::Split { children, .. } => {
-                                for c in children { inject_all(c, ctrl, alt, shift); }
+        // Plain Ctrl+Enter uses a native VK_RETURN event with an LF payload,
+        // matching Windows Terminal: Console API readers keep the Ctrl+Enter
+        // key metadata, while VT/raw readers see 0x0A. If native injection is
+        // unavailable, fall back to the same byte payload.
+        if matches!(key.code, KeyCode::Enter)
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            if app.sync_input {
+                let win = &mut app.windows[app.active_idx];
+                fn inject_ctrl_enter_all(node: &mut Node) {
+                    match node {
+                        Node::Leaf(p) if !p.dead => {
+                            let injected = p.child_pid.map_or(false, |pid| {
+                                crate::platform::mouse_inject::send_modified_enter_event(pid, true, false, false)
+                            });
+                            if !injected {
+                                let _ = p.writer.write_all(b"\n");
+                                let _ = p.writer.flush();
                             }
                         }
+                        Node::Leaf(_) => {}
+                        Node::Split { children, .. } => {
+                            for child in children { inject_ctrl_enter_all(child); }
+                        }
                     }
-                    inject_all(&mut win.root, ctrl, alt, shift);
-                    return Ok(());
-                } else {
-                    let win = &mut app.windows[app.active_idx];
-                    if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
-                        if !active.dead {
-                            if try_inject(active) {
-                                return Ok(());
-                            }
-                            // Fallback: VT encoding (falls through below)
+                }
+                inject_ctrl_enter_all(&mut win.root);
+            } else {
+                let win = &mut app.windows[app.active_idx];
+                if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
+                    if !active.dead {
+                        let injected = active.child_pid.map_or(false, |pid| {
+                            crate::platform::mouse_inject::send_modified_enter_event(pid, true, false, false)
+                        });
+                        if !injected {
+                            let _ = active.writer.write_all(b"\n");
+                            let _ = active.writer.flush();
                         }
                     }
                 }
             }
-            // Shift/Alt+Enter (no Ctrl): fall through to VT encoding below.
+            return Ok(());
         }
 
         // Ctrl+letter: inject via WriteConsoleInputW so ConPTY's VT parser
@@ -3382,10 +3376,10 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                     let _ = p.writer.write_all(&[0x1b, ctrl_char]);
                 }
             }
-            // Modified Enter: for Ctrl combos, try native console injection
-            // (WriteConsoleInputW) so PSReadLine sees the correct modifier flags.
-            // For Shift/Alt-only combos, use VT encoding to avoid ConPTY
-            // translating the injected KEY_EVENT back to plain \r (double Enter).
+            // Modified Enter: plain Ctrl+Enter uses native VK_RETURN with an LF
+            // payload, matching Windows Terminal for both Console API and raw
+            // byte readers. Other Ctrl combos keep the CSI form.
+            // Shift/Alt-only combos keep using ESC+CR for ConPTY compatibility.
             #[cfg(windows)]
             s if {
                 let u = s.to_uppercase();
@@ -3396,26 +3390,17 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 let has_shift = upper.contains("S-");
                 let has_ctrl = upper.contains("C-");
                 let has_alt = upper.contains("M-");
-                let injected = if has_ctrl {
-                    // Only use native injection for Ctrl combos.
-                    if let Some(pid) = p.child_pid {
-                        crate::platform::mouse_inject::send_modified_key_event(pid, '\r', has_ctrl, has_alt, has_shift)
-                    } else {
-                        false
+                if has_ctrl && !has_shift && !has_alt {
+                    let injected = p.child_pid.map_or(false, |pid| {
+                        crate::platform::mouse_inject::send_modified_enter_event(pid, true, false, false)
+                    });
+                    if !injected {
+                        let _ = p.writer.write_all(b"\n");
                     }
-                } else {
-                    false
-                };
-                if !injected {
-                    if (has_shift || has_alt) && !has_ctrl {
-                        // Fallback: ESC + CR for VT-native apps (Claude Code, etc.)
-                        let _ = p.writer.write_all(b"\x1b\r");
-                    } else {
-                        // Ctrl+Enter and other combos: CSI encoding
-                        if let Some(seq) = parse_modified_special_key(s) {
-                            let _ = p.writer.write_all(seq.as_bytes());
-                        }
-                    }
+                } else if (has_shift || has_alt) && !has_ctrl {
+                    let _ = p.writer.write_all(b"\x1b\r");
+                } else if let Some(seq) = parse_modified_special_key(s) {
+                    let _ = p.writer.write_all(seq.as_bytes());
                 }
             }
             // Modifier + special key combos: C-Left, S-Right, C-S-Up, C-M-Home, etc.

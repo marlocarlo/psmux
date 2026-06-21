@@ -1438,6 +1438,8 @@ pub mod mouse_inject {
     /// misinterpreted as Alt+Enter).  Native injection delivers the exact
     /// KEY_EVENT_RECORD with the correct modifier flags, so PSReadLine and
     /// other console-API-based readers see the true Shift/Ctrl/Alt+Enter.
+    /// Plain Ctrl+Enter uses LF as the character payload, matching Windows
+    /// Terminal's regular input encoder; other Enter variants keep CR.
     pub fn send_modified_enter_event(child_pid: u32, ctrl: bool, alt: bool, shift: bool) -> bool {
         unsafe {
             let had_console = GetConsoleWindow() != 0;
@@ -1506,6 +1508,7 @@ pub mod mouse_inject {
 
             // MAPVK_VK_TO_VSC = 0
             let scan = MapVirtualKeyW(VK_RETURN as u32, 0) as u16;
+            let u_char = if ctrl && !alt && !shift { '\n' as u16 } else { '\r' as u16 };
 
             let records = [
                 KEY_INPUT_RECORD {
@@ -1516,7 +1519,7 @@ pub mod mouse_inject {
                         repeat_count: 1,
                         virtual_key_code: VK_RETURN,
                         virtual_scan_code: scan,
-                        u_char: '\r' as u16,
+                        u_char,
                         control_key_state: flags,
                     },
                 },
@@ -1528,7 +1531,7 @@ pub mod mouse_inject {
                         repeat_count: 1,
                         virtual_key_code: VK_RETURN,
                         virtual_scan_code: scan,
-                        u_char: '\r' as u16,
+                        u_char,
                         control_key_state: flags,
                     },
                 },
@@ -1542,8 +1545,8 @@ pub mod mouse_inject {
                 &mut written,
             );
 
-            debug_log(&format!("send_modified_enter_event: pid={} ctrl={} alt={} shift={} scan=0x{:02X} flags=0x{:04X} => ok={} written={}",
-                child_pid, ctrl, alt, shift, scan, flags, result != 0, written));
+            debug_log(&format!("send_modified_enter_event: pid={} ctrl={} alt={} shift={} scan=0x{:02X} u_char=0x{:04X} flags=0x{:04X} => ok={} written={}",
+                child_pid, ctrl, alt, shift, scan, u_char, flags, result != 0, written));
 
             CloseHandle(handle);
             FreeConsole();

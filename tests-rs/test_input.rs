@@ -187,6 +187,9 @@ fn shift_enter_produces_correct_encoding() {
 fn ctrl_enter_produces_csi_13_5() {
     let ev = key(KeyCode::Enter, KeyModifiers::CONTROL);
     let bytes = encode_key_event(&ev).unwrap();
+    #[cfg(windows)]
+    assert_eq!(bytes, b"\n", "Ctrl+Enter on Windows Terminal must produce LF");
+    #[cfg(not(windows))]
     assert_eq!(bytes, b"\x1b[13;5~", "Ctrl+Enter must produce CSI 13;5~");
 }
 
@@ -371,10 +374,13 @@ fn alt_enter_no_ctrl_uses_vt_not_csi() {
 }
 
 #[test]
-fn ctrl_enter_uses_csi_encoding() {
-    // Ctrl+Enter → CSI 13;5~ (must use CSI, not ESC+CR)
+fn ctrl_enter_uses_platform_encoding() {
+    // Ctrl+Enter on Windows Terminal is LF; other platforms use CSI 13;5~.
     let ev = key(KeyCode::Enter, KeyModifiers::CONTROL);
     let bytes = encode_key_event(&ev).unwrap();
+    #[cfg(windows)]
+    assert_eq!(bytes, b"\n", "Ctrl+Enter must use LF on Windows; got {:?}", bytes);
+    #[cfg(not(windows))]
     assert_eq!(bytes, b"\x1b[13;5~",
         "Ctrl+Enter must use CSI encoding; got {:?}", bytes);
 }
@@ -407,13 +413,10 @@ fn shift_alt_enter_on_non_windows_produces_csi() {
     assert_eq!(bytes, b"\x1b[13;4~", "Shift+Alt+Enter on non-Windows → CSI 13;4~");
 }
 
-/// Issue #121 Bug #3 double-delivery proof: verify that VT-encoded Shift+Enter
-/// is distinct from plain CR (which is what native WriteConsoleInputW injection
-/// produces after ConPTY translation).  Before the fix, forward_key_to_active
-/// sent BOTH \x1b\r (VT) and a native VK_RETURN injection for Shift+Enter,
-/// causing the child process to receive two Enter events.  After the fix,
-/// only VT encoding is used for Shift/Alt+Enter (no Ctrl), preventing double
-/// delivery.  Ctrl+Enter still uses native injection (with CSI fallback).
+/// Issue #121 Bug #3 / Ctrl+Enter regression proof: verify that modified Enter
+/// encodings stay distinct from plain CR. Shift/Alt use ESC+CR for ConPTY
+/// compatibility; plain Ctrl+Enter uses LF as the character payload so VT/raw
+/// readers such as Node/libuv do not see a plain Enter.
 #[cfg(windows)]
 #[test]
 fn bug3_double_delivery_prevention() {
@@ -434,22 +437,17 @@ fn bug3_double_delivery_prevention() {
     assert_eq!(shift_bytes, b"\x1b\r");
     assert_eq!(alt_bytes, b"\x1b\r");
 
-    // Native injection path (Ctrl+Enter): produces CSI sequence
-    // In the live code, forward_key_to_active only calls
-    // send_modified_enter_event when ctrl==true.  This CSI encoding
-    // is the FALLBACK when native injection fails.
-    assert_eq!(ctrl_bytes, b"\x1b[13;5~");
+    // Plain Ctrl+Enter uses LF. The live Windows path injects VK_RETURN with
+    // this LF payload; encode_key_event is the fallback byte path.
+    assert_eq!(ctrl_bytes, b"\n");
 
-    // The critical guard in forward_key_to_active:
-    //   let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    //   if ctrl { /* native injection */ }
-    //   // else: fall through to encode_key_event (VT)
+    // Shift/Alt-only Enter must not use Ctrl+Enter's native LF path.
     assert!(!shift_enter.modifiers.contains(KeyModifiers::CONTROL),
         "Shift+Enter must NOT trigger the ctrl guard (no native injection)");
     assert!(!alt_enter.modifiers.contains(KeyModifiers::CONTROL),
         "Alt+Enter must NOT trigger the ctrl guard (no native injection)");
     assert!(ctrl_enter.modifiers.contains(KeyModifiers::CONTROL),
-        "Ctrl+Enter MUST trigger the ctrl guard (native injection allowed)");
+        "Ctrl+Enter keeps distinct LF semantics on Windows");
 }
 
 // ── Issue #134: wrapped directional navigation geometry tests ──
