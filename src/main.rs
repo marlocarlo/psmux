@@ -671,15 +671,20 @@ fn run_main() -> io::Result<()> {
                 // otherwise argv[0] (the exe path or subcommand name) gets
                 // picked up as the target session name.
                 let sub_args: Vec<&String> = cmd_args.iter().skip(1).copied().collect();
-                let name = sub_args
+                // `-t` and its value are stripped from cmd_args (and therefore
+                // sub_args) by the global flag handling above, so resolve the
+                // target from the original argv. Without this, `attach -t NAME`
+                // fell through to the last_session fallback and ignored the
+                // requested target (#408).
+                let name = args
                     .iter()
-                    .position(|a| *a == "-t")
-                    .and_then(|i| sub_args.get(i + 1))
+                    .position(|a| a == "-t")
+                    .and_then(|i| args.get(i + 1))
                     .map(|s| {
                         if let Some(ref l) = l_socket_name {
                             format!("{}__{}", l, s)
                         } else {
-                            (*s).clone()
+                            s.clone()
                         }
                     })
                     .or_else(|| {

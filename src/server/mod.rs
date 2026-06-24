@@ -5228,6 +5228,10 @@ mod test_pane_title;
 mod test_issue202;
 
 #[cfg(test)]
+#[path = "../../tests-rs/test_issue408_attach_target.rs"]
+mod test_issue408_attach_target;
+
+#[cfg(test)]
 #[path = "../../tests-rs/test_new_session_env.rs"]
 mod test_new_session_env;
 
