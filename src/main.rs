@@ -672,21 +672,19 @@ fn run_main() -> io::Result<()> {
                 // picked up as the target session name.
                 let sub_args: Vec<&String> = cmd_args.iter().skip(1).copied().collect();
                 // `-t` and its value are stripped from cmd_args (and therefore
-                // sub_args) by the global flag handling above, so resolve the
-                // target from the original argv. Without this, `attach -t NAME`
-                // fell through to the last_session fallback and ignored the
-                // requested target (#408).
-                let name = args
-                    .iter()
-                    .position(|a| a == "-t")
-                    .and_then(|i| args.get(i + 1))
-                    .map(|s| {
-                        if let Some(ref l) = l_socket_name {
-                            format!("{}__{}", l, s)
-                        } else {
-                            s.clone()
-                        }
-                    })
+                // sub_args) by the global flag handling above, so the lookup
+                // below never saw it and `attach -t NAME` fell through to the
+                // last_session fallback (#408). When `-t` is present, prefer the
+                // target the global parser already resolved into
+                // PSMUX_TARGET_SESSION: it ran the value through parse_target,
+                // so `session:window`, `$id`, `=exact`, and the `-L` namespace
+                // prefix are all handled (a raw argv value would keep a
+                // `:window` suffix and fail the port-file lookup).
+                let name = (if args.iter().any(|a| a == "-t") {
+                    env::var("PSMUX_TARGET_SESSION").ok().filter(|s| !s.is_empty())
+                } else {
+                    None
+                })
                     .or_else(|| {
                         // Accept positional argument as target session name
                         // (e.g. "psmux attach work" without -t flag)

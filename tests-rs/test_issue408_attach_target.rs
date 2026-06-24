@@ -6,39 +6,40 @@
 // looked for `-t` in those stripped args, never found it, and fell through
 // to the last_session fallback.
 //
-// Fix: resolve `-t` from the original argv. These tests replicate the
-// attach-target resolution logic from main.rs (same approach as
-// test_issue202_switch_client.rs) and prove the old code was buggy.
+// Fix: when `-t` is present, use the target the global parser already
+// resolved into PSMUX_TARGET_SESSION (it ran the value through parse_target,
+// so `session:window`, `$id`, `=exact`, and the `-L` namespace prefix are
+// handled). These tests replicate the resolution decision from main.rs
+// (same approach as test_issue202_switch_client.rs) and prove the old code
+// was buggy.
 
 /// Mirrors the post-fix attach-target resolution in main.rs:
-///   `-t` from the full argv  ->  positional name  ->  last_session  ->  "0"
+///   if `-t` present -> PSMUX_TARGET_SESSION  (parse_target result)
+///   else            -> positional name  ->  last_session  ->  "0"
+///
+/// `target_session` models PSMUX_TARGET_SESSION, which already holds the
+/// parse_target-resolved, `-L`-prefixed session base name.
 fn resolve_attach_target(
-    full_args: &[&str],
+    has_t_flag: bool,
+    target_session: Option<&str>,
     sub_args: &[&str],
-    l_socket: Option<&str>,
     last_session: Option<&str>,
 ) -> String {
-    let pref = |s: &str| match l_socket {
-        Some(l) => format!("{}__{}", l, s),
-        None => s.to_string(),
-    };
-    full_args
-        .iter()
-        .position(|a| *a == "-t")
-        .and_then(|i| full_args.get(i + 1))
-        .map(|s| pref(s))
-        // Positional target comes from the post-subcommand args.
-        .or_else(|| sub_args.iter().find(|a| !a.starts_with('-')).map(|a| pref(a)))
-        .or_else(|| last_session.map(|s| s.to_string()))
-        .unwrap_or_else(|| "0".to_string())
+    (if has_t_flag {
+        target_session.map(|s| s.to_string()).filter(|s| !s.is_empty())
+    } else {
+        None
+    })
+    // Positional target comes from the post-subcommand args.
+    .or_else(|| sub_args.iter().find(|a| !a.starts_with('-')).map(|a| a.to_string()))
+    .or_else(|| last_session.map(|s| s.to_string()))
+    .unwrap_or_else(|| "0".to_string())
 }
 
 /// The OLD (buggy) logic looked for `-t` in the post-subcommand args, where
-/// it had already been stripped — so an explicit `-t` was lost.
-fn resolve_attach_target_old(
-    sub_args: &[&str],
-    last_session: Option<&str>,
-) -> String {
+/// it had already been stripped — so an explicit `-t` was lost and it fell
+/// through to last_session.
+fn resolve_attach_target_old(sub_args: &[&str], last_session: Option<&str>) -> String {
     sub_args
         .iter()
         .position(|a| *a == "-t")
@@ -52,41 +53,55 @@ fn resolve_attach_target_old(
 #[test]
 fn attach_t_honours_target_over_last_session() {
     // `psmux attach -t A` with last_session = B must attach to A.
-    // The global handler strips `-t A`, so sub_args is empty here.
-    let result = resolve_attach_target(&["psmux", "attach", "-t", "A"], &[], None, Some("B"));
+    let result = resolve_attach_target(true, Some("A"), &[], Some("B"));
     assert_eq!(result, "A", "attach -t A must honour the target, not last_session");
+}
+
+#[test]
+fn attach_t_session_window_resolves_to_session_only() {
+    // `psmux attach -t A:1` — the global parser's parse_target extracts the
+    // session ("A") into PSMUX_TARGET_SESSION; the `:1` window suffix must NOT
+    // leak into the session name (a raw argv value would, breaking the port
+    // lookup).
+    let result = resolve_attach_target(true, Some("A"), &[], Some("B"));
+    assert_eq!(result, "A", "attach -t A:1 must resolve to session A");
 }
 
 #[test]
 fn attach_positional_target_still_works() {
     // `psmux attach A` (no -t): A is a positional in sub_args.
-    let result = resolve_attach_target(&["psmux", "attach", "A"], &["A"], None, Some("B"));
+    let result = resolve_attach_target(false, None, &["A"], Some("B"));
     assert_eq!(result, "A");
 }
 
 #[test]
 fn attach_bare_falls_back_to_last_session() {
     // `psmux attach` with no target uses last_session (unchanged behaviour).
-    let result = resolve_attach_target(&["psmux", "attach"], &[], None, Some("B"));
+    let result = resolve_attach_target(false, None, &[], Some("B"));
     assert_eq!(result, "B");
 }
 
 #[test]
 fn attach_bare_no_last_session_uses_default_index() {
-    let result = resolve_attach_target(&["psmux", "attach"], &[], None, None);
+    let result = resolve_attach_target(false, None, &[], None);
     assert_eq!(result, "0");
 }
 
 #[test]
 fn attach_t_applies_socket_namespace_prefix() {
-    // `psmux -L work attach -t A` resolves to the namespaced base name.
-    let result = resolve_attach_target(
-        &["psmux", "-L", "work", "attach", "-t", "A"],
-        &[],
-        Some("work"),
-        Some("B"),
-    );
+    // `psmux -L work attach -t A`: PSMUX_TARGET_SESSION is already the
+    // namespaced base name "work__A".
+    let result = resolve_attach_target(true, Some("work__A"), &[], Some("B"));
     assert_eq!(result, "work__A");
+}
+
+#[test]
+fn attach_t_pane_only_target_falls_through() {
+    // `psmux attach -t %2` has no explicit session, so PSMUX_TARGET_SESSION is
+    // never set — resolution falls through to last_session (unchanged, not a
+    // regression).
+    let result = resolve_attach_target(true, None, &[], Some("B"));
+    assert_eq!(result, "B");
 }
 
 #[test]
@@ -97,7 +112,7 @@ fn regression_old_code_attached_to_last_session() {
     assert_eq!(old, "B", "old code ignored -t and used last_session");
 
     // The fixed logic returns A for the same invocation.
-    let new = resolve_attach_target(&["psmux", "attach", "-t", "A"], &[], None, Some("B"));
+    let new = resolve_attach_target(true, Some("A"), &[], Some("B"));
     assert_eq!(new, "A");
     assert_ne!(old, new, "fix must change the resolved target");
 }
