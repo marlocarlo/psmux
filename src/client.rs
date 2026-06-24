@@ -3032,6 +3032,32 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 KeyCode::Char('p') if tree_chooser => {
                                     preview_enabled = !preview_enabled;
                                 }
+                                // 'x' kills the highlighted window, mirroring the
+                                // session chooser's 'x' (issue #410). The window is
+                                // focused first so the kill targets it. Scoped to a
+                                // window row in the current session — session headers
+                                // (wid == usize::MAX), pane rows, and rows from other
+                                // sessions fall through to the catch-all below.
+                                KeyCode::Char('x') if tree_chooser => {
+                                    let sel_idx: Option<usize> = if tree_num_buffer.is_empty() {
+                                        Some(tree_selected)
+                                    } else {
+                                        match tree_num_buffer.parse::<usize>() {
+                                            Ok(n) if n >= 1 && n <= tree_entries.len() => Some(n - 1),
+                                            _ => None,
+                                        }
+                                    };
+                                    if let Some((is_win, wid, _pid, _label, sess_name)) =
+                                        sel_idx.and_then(|i| tree_entries.get(i))
+                                    {
+                                        if *is_win && *wid != usize::MAX && *sess_name == current_session {
+                                            cmd_batch.push(format!("focus-window {}\n", wid));
+                                            cmd_batch.push("kill-window\n".into());
+                                            tree_chooser = false;
+                                            tree_num_buffer.clear();
+                                        }
+                                    }
+                                }
                                 KeyCode::Char(c) if tree_chooser && c.is_ascii_digit() => {
                                     // Append to the digit-jump buffer; Enter consumes it.
                                     if tree_num_buffer.len() < 6 {
