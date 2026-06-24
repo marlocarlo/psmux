@@ -598,10 +598,58 @@ pub(crate) fn is_known_command(app: &AppState, name: &str) -> bool {
     })
 }
 
+/// Strip a trailing `# comment` from a single config line.
+///
+/// In tmux a `#` begins a comment only when it is unquoted and appears at the
+/// start of the line or immediately after whitespace. A `#` inside single or
+/// double quotes (e.g. a `"#{...}"` format or `'#H'`), one escaped with a
+/// backslash, or one in the middle of a word (e.g. `colour#aabbcc`) is left
+/// untouched. This lets configs use trailing comments such as:
+///
+/// ```text
+/// set -g base-index 1   # start windows at 1
+/// ```
+///
+/// Issue #416.
+fn strip_inline_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut prev_ws = true; // start of line behaves like a word boundary
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            // Backslash escapes the next byte (outside single quotes), matching
+            // tmux's tokeniser. Skip both bytes so an escaped `#` stays literal.
+            b'\\' if !in_single => {
+                i += 2;
+                prev_ws = false;
+                continue;
+            }
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'#' if !in_single && !in_double && prev_ws => {
+                return line[..i].trim_end();
+            }
+            _ => {}
+        }
+        prev_ws = matches!(bytes[i], b' ' | b'\t');
+        i += 1;
+    }
+    line
+}
+
 pub fn parse_config_line(app: &mut AppState, line: &str) {
     let l = line.trim();
     if l.is_empty() || l.starts_with('#') { return; }
-    
+
+    // Strip a trailing inline `# comment` (issue #416). Done after the
+    // leading-`#` check above so whole-line comments are still skipped, and
+    // before any directive dispatch so trailing comments don't leak into
+    // command arguments.
+    let l = strip_inline_comment(l).trim_end();
+    if l.is_empty() { return; }
+
     let l = if l.ends_with('\\') {
         l.trim_end_matches('\\').trim()
     } else {
@@ -2077,3 +2125,7 @@ mod tests_issue362_config_new_session;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue370_config_warnings.rs"]
 mod tests_issue370_config_warnings;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue416_inline_comments.rs"]
+mod tests_issue416_inline_comments;
