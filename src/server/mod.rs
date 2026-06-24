@@ -3730,6 +3730,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let _ = resp.send(output);
                 }
                 CtrlReq::ForceDetachClient(target_cid) => {
+                    // Send a clean DETACH so the client exits instead of treating
+                    // the dropped stream as a transient disconnect and reconnecting
+                    // (#389). The brief pause lets it act on the directive before we
+                    // tear the stream down. (For `-P` the connection handler already
+                    // sent DETACH-KILL-PARENT; this extra DETACH is harmless — the
+                    // client is already exiting and the kill-parent flag is set.)
+                    crate::types::send_directive_to_client(target_cid, "DETACH");
+                    std::thread::sleep(Duration::from_millis(50));
                     // Force-detach a specific client by shutting down its TCP stream
                     app.client_sizes.remove(&target_cid);
                     let was_present = app.client_registry.remove(&target_cid).is_some();
@@ -3773,10 +3781,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         .find(|(_, ci)| ci.tty_name == tty)
                         .map(|(cid, _)| *cid);
                     if let Some(cid) = target_cid {
-                        if kill_parent {
-                            crate::types::send_directive_to_client(cid, "DETACH-KILL-PARENT");
-                            std::thread::sleep(Duration::from_millis(50));
-                        }
+                        // Send a clean detach directive before tearing down the
+                        // stream so the client exits instead of reconnecting (#389).
+                        // `-P` additionally kills the client's parent shell.
+                        crate::types::send_directive_to_client(
+                            cid,
+                            if kill_parent { "DETACH-KILL-PARENT" } else { "DETACH" },
+                        );
+                        std::thread::sleep(Duration::from_millis(50));
                         app.client_sizes.remove(&cid);
                         let was_present = app.client_registry.remove(&cid).is_some();
                         if was_present {
@@ -3803,12 +3815,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         .filter(|(cid, _)| **cid != except_cid)
                         .map(|(cid, ci)| (*cid, ci.tty_name.clone()))
                         .collect();
+                    // Send a clean detach directive to each target before tearing
+                    // down its stream so it exits instead of reconnecting (#389).
+                    // `-P` additionally kills each client's parent shell.
                     for (cid, _tty) in &targets {
-                        if kill_parent {
-                            crate::types::send_directive_to_client(*cid, "DETACH-KILL-PARENT");
-                        }
+                        crate::types::send_directive_to_client(
+                            *cid,
+                            if kill_parent { "DETACH-KILL-PARENT" } else { "DETACH" },
+                        );
                     }
-                    if kill_parent && !targets.is_empty() {
+                    if !targets.is_empty() {
                         std::thread::sleep(Duration::from_millis(50));
                     }
                     for (cid, tty) in &targets {
@@ -3852,12 +3868,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let targets: Vec<(u64, String)> = app.client_registry.iter()
                         .map(|(cid, ci)| (*cid, ci.tty_name.clone()))
                         .collect();
+                    // Send a clean detach directive to each client before tearing
+                    // down its stream so it exits instead of reconnecting (#389).
+                    // `-P` additionally kills each client's parent shell.
                     for (cid, _) in &targets {
-                        if kill_parent {
-                            crate::types::send_directive_to_client(*cid, "DETACH-KILL-PARENT");
-                        }
+                        crate::types::send_directive_to_client(
+                            *cid,
+                            if kill_parent { "DETACH-KILL-PARENT" } else { "DETACH" },
+                        );
                     }
-                    if kill_parent && !targets.is_empty() {
+                    if !targets.is_empty() {
                         std::thread::sleep(Duration::from_millis(50));
                     }
                     for (cid, tty) in &targets {
