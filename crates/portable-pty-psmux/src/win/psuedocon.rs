@@ -24,6 +24,7 @@ use winapi::um::winnt::HANDLE;
 
 pub type HPCON = HANDLE;
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub const PSUEDOCONSOLE_INHERIT_CURSOR: DWORD = 0x1;
 pub const PSEUDOCONSOLE_RESIZE_QUIRK: DWORD = 0x2;
 pub const PSEUDOCONSOLE_WIN32_INPUT_MODE: DWORD = 0x4;
