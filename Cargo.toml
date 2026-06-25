@@ -63,17 +63,23 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_DataExchange",
 ] }
 
+# All program logic lives in the library; the three binaries below are thin
+# shims (identical aliases) so each bin target has a distinct source path.
+[lib]
+name = "psmux"
+path = "src/lib.rs"
+
 [[bin]]
 name = "psmux"
 path = "src/main.rs"
 
 [[bin]]
 name = "pmux"
-path = "src/main.rs"
+path = "src/bin/pmux.rs"
 
 [[bin]]
 name = "tmux"
-path = "src/main.rs"
+path = "src/bin/tmux.rs"
 
 [dependencies]
 ratatui = "0.30"
