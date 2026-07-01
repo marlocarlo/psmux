@@ -1604,33 +1604,33 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                 }
                 CtrlReq::ClientDetach(cid) => {
-                    app.attached_clients = app.attached_clients.saturating_sub(1);
-                    app.client_sizes.remove(&cid);
-                    app.client_registry.remove(&cid);
-                    app.client_prefix_active = false;
-                    if app.latest_client_id == Some(cid) {
-                        app.latest_client_id = None;
-                    }
-                    // Recompute effective size from remaining clients
-                    if let Some((w, h)) = compute_effective_client_size(&app) {
-                        app.last_window_area = Rect { x: 0, y: 0, width: w, height: h };
-                        resize_all_panes(&mut app);
-                    }
-                    hook_event = Some("client-detached");
-                    if app.attached_clients == 0 && app.destroy_unattached {
-                        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                        let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                        let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                        let _ = std::fs::remove_file(&regpath);
-                        let _ = std::fs::remove_file(&keypath);
-                        crate::session::remove_session_id_file(&app.port_file_base());
-                        crate::types::shutdown_persistent_streams();
-                        tree::kill_all_children_batch(&mut app.windows);
-                        if let Some(mut wp) = app.warm_pane.take() {
-                            wp.child.kill().ok();
+                    // Idempotent reap (see AppState::reap_client): only run the
+                    // detach side effects when this client was actually present,
+                    // so a duplicate detach (reader EOF + writer Guard teardown,
+                    // or a detach-client racing the socket close) can't
+                    // over-decrement attached_clients or fire destroy twice.
+                    if app.reap_client(cid) {
+                        // Recompute effective size from remaining clients
+                        if let Some((w, h)) = compute_effective_client_size(&app) {
+                            app.last_window_area = Rect { x: 0, y: 0, width: w, height: h };
+                            resize_all_panes(&mut app);
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        std::process::exit(0);
+                        hook_event = Some("client-detached");
+                        if app.attached_clients == 0 && app.destroy_unattached {
+                            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                            let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
+                            let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
+                            let _ = std::fs::remove_file(&regpath);
+                            let _ = std::fs::remove_file(&keypath);
+                            crate::session::remove_session_id_file(&app.port_file_base());
+                            crate::types::shutdown_persistent_streams();
+                            tree::kill_all_children_batch(&mut app.windows);
+                            if let Some(mut wp) = app.warm_pane.take() {
+                                wp.child.kill().ok();
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            std::process::exit(0);
+                        }
                     }
                 }
                 CtrlReq::DumpLayout(resp) => {

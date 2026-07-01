@@ -702,6 +702,36 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Idempotently reap a client from the registry.
+    ///
+    /// Returns `true` iff the client was present (and thus `attached_clients`
+    /// and the prefix/latest-client bookkeeping were updated). A client's
+    /// connection is torn down by whichever of its two server-side threads
+    /// notices the disconnect first — the reader loop (socket EOF) OR the
+    /// writer thread's `Guard` — and a `detach-client` command can race the
+    /// socket close as well. Because this only mutates state when the entry is
+    /// actually removed, calling it more than once for the same `cid` is a safe
+    /// no-op: `attached_clients` can never be over-decremented (which used to
+    /// leave `attached=0` while real clients remained) and the caller's
+    /// destroy-unattached path can never fire twice. Conversely, a dropped
+    /// reap used to orphan a `ClientInfo` forever — the ghost-client leak —
+    /// which routing the reap through the always-firing `Guard` now prevents.
+    pub fn reap_client(&mut self, cid: u64) -> bool {
+        // client_sizes is always cleared (a stale size entry must never linger);
+        // the registry entry + counter bookkeeping only change when present.
+        self.client_sizes.remove(&cid);
+        if self.client_registry.remove(&cid).is_some() {
+            self.attached_clients = self.attached_clients.saturating_sub(1);
+            self.client_prefix_active = false;
+            if self.latest_client_id == Some(cid) {
+                self.latest_client_id = None;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// Create a new AppState with sensible defaults.
     /// Caller should set `session_name` and call `load_config()` after construction.
     pub fn new(session_name: String) -> Self {

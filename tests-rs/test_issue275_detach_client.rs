@@ -194,6 +194,154 @@ fn detach_last_client_without_destroy_unattached_does_not_signal_shutdown() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+//  Idempotent reap (ghost-client leak fix) — exercises the REAL AppState method
+//  that the ClientDetach handler and the writer-thread Guard both call.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// A first reap removes the client and decrements the counter, returning true.
+#[test]
+fn reap_client_first_call_removes_and_reports_present() {
+    let mut app = mock_app();
+    add_client(&mut app, 1, "/dev/pts/1");
+    add_client(&mut app, 2, "/dev/pts/2");
+
+    assert!(app.reap_client(2), "present client → reap reports true");
+    assert!(!app.client_registry.contains_key(&2));
+    assert_eq!(app.attached_clients, 1, "exactly one decrement");
+}
+
+/// Reaping the SAME client twice must be a safe no-op the second time — the
+/// core of the fix. A connection is torn down by whichever of its two threads
+/// (reader loop / writer Guard) notices death first; both call this. Without
+/// idempotency the second call would over-decrement attached_clients.
+#[test]
+fn reap_client_is_idempotent_no_double_decrement() {
+    let mut app = mock_app();
+    add_client(&mut app, 1, "/dev/pts/1");
+    add_client(&mut app, 2, "/dev/pts/2");
+
+    assert!(app.reap_client(1), "first reap of client 1 → true");
+    assert!(!app.reap_client(1), "second reap of client 1 → false (already gone)");
+
+    // client 2 must still be counted; attached_clients must not underflow past it.
+    assert_eq!(app.attached_clients, 1, "double reap must not over-decrement");
+    assert!(app.client_registry.contains_key(&2), "unrelated client untouched");
+}
+
+/// Regression for the counter/registry desync: a duplicate detach used to drop
+/// attached_clients to 0 while real client entries remained, so `list-clients`
+/// showed clients while `session_attached` read 0. With the guard, the count
+/// always matches the registry size.
+#[test]
+fn reap_client_keeps_counter_consistent_with_registry() {
+    let mut app = mock_app();
+    add_client(&mut app, 1, "/dev/pts/1");
+    add_client(&mut app, 2, "/dev/pts/2");
+    add_client(&mut app, 3, "/dev/pts/3");
+
+    // Client 2 dies; both of its threads fire a reap for the same cid.
+    let _ = app.reap_client(2);
+    let _ = app.reap_client(2);
+
+    assert_eq!(app.client_registry.len(), 2, "two real clients remain");
+    assert_eq!(app.attached_clients, app.client_registry.len(),
+        "attached_clients must equal registry size (never 0-while-clients-remain)");
+}
+
+/// Reaping a client that was never registered is a safe no-op that reports
+/// false and leaves all counters intact (e.g. a persistent connection whose
+/// writer Guard fires though the client never sent attach-session).
+#[test]
+fn reap_client_unknown_id_is_noop() {
+    let mut app = mock_app();
+    add_client(&mut app, 1, "/dev/pts/1");
+
+    assert!(!app.reap_client(999), "unknown client → reap reports false");
+    assert_eq!(app.client_registry.len(), 1);
+    assert_eq!(app.attached_clients, 1);
+}
+
+/// Reaping the latest_client_id clears it; reaping a different client leaves it.
+#[test]
+fn reap_client_clears_latest_client_id_only_for_that_client() {
+    let mut app = mock_app();
+    add_client(&mut app, 1, "/dev/pts/1");
+    add_client(&mut app, 2, "/dev/pts/2");
+    app.latest_client_id = Some(2);
+
+    assert!(app.reap_client(1));
+    assert_eq!(app.latest_client_id, Some(2), "reaping a different client keeps latest");
+
+    assert!(app.reap_client(2));
+    assert_eq!(app.latest_client_id, None, "reaping the latest client clears it");
+}
+
+/// A real reap clears the shared client_prefix_active flag; a no-op reap of an
+/// absent client leaves it untouched (documents the flag's guarded semantics).
+#[test]
+fn reap_client_clears_prefix_flag_only_on_real_reap() {
+    let mut app = mock_app();
+    add_client(&mut app, 1, "/dev/pts/1");
+    app.client_prefix_active = true;
+    assert!(!app.reap_client(99), "absent client -> no-op");
+    assert!(app.client_prefix_active, "no-op reap must not touch the prefix flag");
+    assert!(app.reap_client(1), "present client -> real reap");
+    assert!(!app.client_prefix_active, "real reap clears the prefix flag");
+}
+
+/// The fix's core promise via reap_client's return value: the destroy-unattached
+/// exit is gated on a REAL reap, so a duplicate detach of the last client cannot
+/// re-satisfy the `attached_clients == 0 && destroy_unattached` condition twice.
+#[test]
+fn reap_client_gates_destroy_unattached_to_a_single_real_reap() {
+    let mut app = mock_app();
+    app.destroy_unattached = true;
+    add_client(&mut app, 1, "/dev/pts/1");
+
+    // First reap is real -> the caller would run the destroy path here.
+    assert!(app.reap_client(1));
+    assert_eq!(app.attached_clients, 0);
+    // The handler's exit gate: attached_clients == 0 && destroy_unattached.
+    assert!(app.attached_clients == 0 && app.destroy_unattached,
+        "first (real) reap leaves the session destroy-eligible");
+
+    // Second reap of the same cid is a no-op -> the caller must NOT re-run destroy.
+    assert!(!app.reap_client(1), "duplicate reap is a no-op (gate not re-triggered by a real reap)");
+    assert_eq!(app.attached_clients, 0, "counter stays at 0, not underflowed");
+}
+
+/// Models the actual connection-teardown path this fix targets: BOTH the reader
+/// loop (socket EOF) and the writer thread's Guard now enqueue `ClientDetach`
+/// for the SAME registered client. The server processes them as two
+/// `reap_client` calls in sequence. This asserts the whole contract the handler
+/// relies on: exactly one registry removal, exactly one `attached_clients`
+/// decrement, and — because the destroy-unattached / `client-detached` hook side
+/// effects run only on a `true` return — those fire exactly once, never twice.
+/// (A full server-loop integration test of the Guard is impractical because the
+/// missed-reap race is timing-dependent; this pins the invariant the fix rests on.)
+#[test]
+fn reap_client_reader_and_writer_duplicate_detach_reaps_once() {
+    let mut app = mock_app();
+    app.destroy_unattached = true;
+    add_client(&mut app, 1, "/dev/pts/1"); // survivor
+    add_client(&mut app, 2, "/dev/pts/2"); // the client whose connection tears down
+    assert_eq!(app.attached_clients, 2);
+
+    // Reader loop observes EOF and enqueues ClientDetach(2).
+    let reader_side_effects = app.reap_client(2);
+    // Writer Guard also enqueues ClientDetach(2) for the same connection.
+    let writer_side_effects = app.reap_client(2);
+
+    assert!(reader_side_effects, "first (reader) reap is real -> side effects run once");
+    assert!(!writer_side_effects, "second (writer Guard) reap is a no-op -> side effects do NOT run again");
+    assert_eq!(app.client_registry.len(), 1, "exactly one registry removal");
+    assert!(app.client_registry.contains_key(&1), "survivor untouched");
+    assert_eq!(app.attached_clients, 1, "exactly one decrement; survivor still counted (not 0, no destroy)");
+    assert!(!(app.attached_clients == 0 && app.destroy_unattached),
+        "survivor remains -> destroy-unattached gate is NOT satisfied");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 //  CLI flag-parsing tests (mirror the parser in main.rs detach-client branch)
 // ════════════════════════════════════════════════════════════════════════════
 
