@@ -423,6 +423,12 @@ pub fn prune_exited(n: Node, remain_on_exit: bool) -> (Option<Node>, usize) {
                         p.dead = true;
                         (Some(Node::Leaf(p)), 1)
                     } else {
+                        // Shell exited on its own: sweep any orphaned descendants
+                        // (backgrounded child processes) before dropping the pane.
+                        // Closing the ConPTY alone does NOT terminate grandchildren,
+                        // so without this they leak. Mirrors the explicit kill-pane
+                        // path and the reaper case kill_process_tree documents.
+                        crate::platform::process_kill::kill_process_tree(&mut p.child);
                         (None, 0)
                     }
                 }
