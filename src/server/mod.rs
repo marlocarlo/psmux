@@ -147,6 +147,48 @@ fn is_active_pane_squelched(app: &AppState) -> bool {
     } else { false }
 }
 
+/// RAII guard for the warm-spawn lock file. Removing the file on drop lets a
+/// later warm spawn proceed.
+struct WarmSpawnLock(std::path::PathBuf);
+impl Drop for WarmSpawnLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Acquire the warm-spawn lock guarding the check->spawn window in
+/// `spawn_warm_server`. Returns `Some(guard)` when this caller owns the lock and
+/// may proceed to spawn, or `None` when another spawn is already in progress (in
+/// which case the caller must NOT spawn). A lock file older than 20s is treated
+/// as abandoned (its owner died mid-spawn) and stolen.
+fn acquire_warm_spawn_lock(lock_path: &str) -> Option<WarmSpawnLock> {
+    use std::io::Write as _;
+    let path = std::path::PathBuf::from(lock_path);
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut f) => {
+                let _ = write!(f, "{}", std::process::id());
+                return Some(WarmSpawnLock(path));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+                    .map(|age| age > std::time::Duration::from_secs(20))
+                    .unwrap_or(false);
+                if stale {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
 /// Spawn a standby "warm server" process that pre-loads config + shell.
 /// When `psmux new-session` is run later, the CLI claims this warm server
 /// via `claim-session` instead of cold-spawning, making session creation
@@ -167,6 +209,14 @@ fn spawn_warm_server(app: &AppState) {
     };
     let warm_port_path = format!("{}\\.psmux\\{}.port", home, warm_base);
     warm_debug(&format!("spawn_warm_server entry base={} port_exists={}", warm_base, std::path::Path::new(&warm_port_path).exists()));
+    // Serialize the check->spawn window: without this, two callers can both see
+    // "no warm" (a freshly-spawned warm hasn't written its port yet) and each
+    // spawn one, orphaning all but the last. This is the primary process-leak source.
+    let warm_lock_path = format!("{}\\.psmux\\{}.spawnlock", home, warm_base);
+    let spawn_lock = match acquire_warm_spawn_lock(&warm_lock_path) {
+        Some(g) => g,
+        None => { warm_debug("another warm spawn in progress -- skipping"); return; }
+    };
     if std::path::Path::new(&warm_port_path).exists() {
         // Check if it's actually a live, unclaimed warm server.
         // TCP reachability alone is not sufficient: OS ephemeral-port reuse or
@@ -241,7 +291,24 @@ fn spawn_warm_server(app: &AppState) {
         args.push(area.height.to_string());
     }
     #[cfg(windows)]
-    { let _ = crate::platform::spawn_server_hidden(&exe, &args); }
+    {
+        let spawned = crate::platform::spawn_server_hidden(&exe, &args);
+        warm_debug(&format!("spawned warm server pid={:?}", spawned.as_ref().ok()));
+        // Hold the spawn lock until the new warm server registers its port, so a
+        // concurrent caller observes the genuine warm instead of racing another
+        // spawn. Done off-thread to avoid blocking the caller.
+        let port_path = warm_port_path.clone();
+        std::thread::spawn(move || {
+            let _lock = spawn_lock; // released on drop
+            for _ in 0..30 {
+                std::thread::sleep(Duration::from_millis(100));
+                if std::path::Path::new(&port_path).exists() {
+                    std::thread::sleep(Duration::from_millis(150));
+                    break;
+                }
+            }
+        });
+    }
     #[cfg(not(windows))]
     {
         let mut cmd = std::process::Command::new(&exe);
@@ -250,6 +317,7 @@ fn spawn_warm_server(app: &AppState) {
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
         let _ = cmd.spawn();
+        drop(spawn_lock);
     }
 }
 
