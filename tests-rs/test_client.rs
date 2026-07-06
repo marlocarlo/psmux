@@ -317,6 +317,7 @@ fn make_leaf(id: usize, rows: &[&str]) -> crate::layout::LayoutJson {
             .map(|row| make_row(vec![make_run(row, cols)]))
             .collect(),
         title: None,
+        images: vec![],
     }
 }
 
@@ -418,6 +419,7 @@ fn extract_selection_text_block_mode() {
             make_row(vec![make_run("ABCDEFGHIJ", 10)]),
         ],
         title: None,
+        images: vec![],
     };
 
     // Block select cols 2..5, rows 0..2
@@ -492,6 +494,7 @@ fn word_bounds_at_finds_word() {
             make_row(vec![make_run("hello world_test   ", 19), make_run(" ", 1)]),
         ],
         title: None,
+        images: vec![],
     };
 
     let pane_rect = ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 1 };
@@ -656,4 +659,63 @@ fn paste_command_prompt_takes_precedence_over_other_overlays() {
     assert!(rename_buf.is_empty());
     assert!(pane_title_buf.is_empty());
     assert!(window_idx_buf.is_empty());
+}
+
+// ── Sixel overlay builder (#431, M6) ─────────────────────────────────
+#[test]
+fn build_sixel_overlay_emits_decsc_cup_blob_decrc_for_cached_id() {
+    use std::collections::HashMap;
+    let blob = b"\x1bP0;0;0q#0;2;0;0;0!100~-\x1b\\".to_vec();
+    let mut cache: HashMap<u64, Vec<u8>> = HashMap::new();
+    cache.insert(7, blob.clone());
+    let emits = vec![super::SixelEmit { x: 4, y: 2, id: 7, cw: 10, ch: 6 }];
+    let out = super::build_sixel_overlay(&emits, &cache);
+    // DECSC, then CUP to 1-based (y+1=3 ; x+1=5), then the raw blob, then DECRC.
+    let mut expected: Vec<u8> = Vec::new();
+    expected.extend_from_slice(b"\x1b7");
+    expected.extend_from_slice(b"\x1b[3;5H");
+    expected.extend_from_slice(&blob);
+    expected.extend_from_slice(b"\x1b8");
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn build_sixel_overlay_skips_uncached_id() {
+    use std::collections::HashMap;
+    let cache: HashMap<u64, Vec<u8>> = HashMap::new(); // id 7 not present
+    let emits = vec![super::SixelEmit { x: 0, y: 0, id: 7, cw: 1, ch: 1 }];
+    let out = super::build_sixel_overlay(&emits, &cache);
+    assert!(out.is_empty(), "uncached id must produce no bytes");
+}
+
+#[test]
+fn build_sixel_overlay_empty_emits_is_empty() {
+    use std::collections::HashMap;
+    let mut cache: HashMap<u64, Vec<u8>> = HashMap::new();
+    cache.insert(7, b"\x1bPq\x1b\\".to_vec());
+    let out = super::build_sixel_overlay(&[], &cache);
+    assert!(out.is_empty(), "no emits must produce no bytes");
+}
+
+#[test]
+fn build_sixel_overlay_concatenates_multiple_emits() {
+    use std::collections::HashMap;
+    let a = b"\x1bPqAAA\x1b\\".to_vec();
+    let b = b"\x1bPqBBB\x1b\\".to_vec();
+    let mut cache: HashMap<u64, Vec<u8>> = HashMap::new();
+    cache.insert(1, a.clone());
+    cache.insert(2, b.clone());
+    let emits = vec![
+        super::SixelEmit { x: 0, y: 0, id: 1, cw: 1, ch: 1 },
+        super::SixelEmit { x: 9, y: 3, id: 2, cw: 1, ch: 1 },
+    ];
+    let out = super::build_sixel_overlay(&emits, &cache);
+    let mut expected: Vec<u8> = Vec::new();
+    expected.extend_from_slice(b"\x1b7\x1b[1;1H");
+    expected.extend_from_slice(&a);
+    expected.extend_from_slice(b"\x1b8");
+    expected.extend_from_slice(b"\x1b7\x1b[4;10H");
+    expected.extend_from_slice(&b);
+    expected.extend_from_slice(b"\x1b8");
+    assert_eq!(out, expected);
 }

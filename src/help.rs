@@ -381,6 +381,7 @@ const OPTIONS_REF: &[(&str, &str)] = &[
     ("synchronize-panes",          "off"),
     ("set-titles",                 "off"),
     ("allow-passthrough",          "off"),
+    ("sixel",                      "on"),
     ("default-command",            "(system shell)"),
     ("word-separators",            "\" -_@\""),
     // Display timing

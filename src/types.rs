@@ -394,6 +394,16 @@ pub struct AppState {
     /// which keeps explicit 256-indexed low colors byte-accurate at the cost of
     /// losing bold-is-bright on basic colors.
     pub bold_is_bright: bool,
+    /// sixel: when on (default), render sixel graphics emitted by panes on the
+    /// outer terminal.  Server always parses and stores sixel images; this flag
+    /// only gates the client-side emission (issue #431).
+    pub sixel: bool,
+    /// Ids of sixel image blobs already shipped to attached clients this
+    /// session.  The dump-state builder ships each blob's base64 bytes exactly
+    /// once (in `image_blobs`) and records the id here; later frames carry only
+    /// the tiny descriptor.  Cleared on client attach / refresh-client so a new
+    /// (or re-attaching) client re-receives every currently-visible blob (M4).
+    pub shipped_image_ids: std::collections::HashSet<u64>,
     /// scroll-enter-copy-mode: when off, mouse scroll at a shell prompt does NOT
     /// auto-enter copy mode.  Default: on (tmux parity).
     pub scroll_enter_copy_mode: bool,
@@ -729,6 +739,8 @@ impl AppState {
             last_window_area: Rect { x: 0, y: 0, width: 120, height: 30 },
             mouse_enabled: true,
             bold_is_bright: true,
+            sixel: true,
+            shipped_image_ids: std::collections::HashSet::new(),
             scroll_enter_copy_mode: true,
             pwsh_mouse_selection: false,
             mouse_selection: true,

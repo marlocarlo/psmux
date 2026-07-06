@@ -31,6 +31,7 @@ pub(crate) fn get_option_value(app: &AppState, name: &str) -> String {
         "escape-time" => app.escape_time_ms.to_string(),
         "mouse" => if app.mouse_enabled { "on".into() } else { "off".into() },
         "bold-is-bright" => if app.bold_is_bright { "on".into() } else { "off".into() },
+        "sixel" => if app.sixel { "on".into() } else { "off".into() },
         "scroll-enter-copy-mode" => if app.scroll_enter_copy_mode { "on".into() } else { "off".into() },
         "pwsh-mouse-selection" => if app.pwsh_mouse_selection { "on".into() } else { "off".into() },
         "mouse-selection" => if app.mouse_selection { "on".into() } else { "off".into() },
@@ -269,6 +270,7 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
             app.bold_is_bright = matches!(value, "on" | "true" | "1");
             crate::platform::set_bold_is_bright(app.bold_is_bright);
         }
+        "sixel" => { app.sixel = matches!(value, "on" | "true" | "1"); }
         "scroll-enter-copy-mode" => { app.scroll_enter_copy_mode = matches!(value, "on" | "true" | "1"); }
         "pwsh-mouse-selection" => { app.pwsh_mouse_selection = matches!(value, "on" | "true" | "1"); }
         "mouse-selection" => { app.mouse_selection = matches!(value, "on" | "true" | "1"); }

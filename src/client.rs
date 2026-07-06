@@ -107,6 +107,41 @@ pub(crate) fn frame_hyperlinks_take() -> Vec<HyperlinkRun> {
     FRAME_HYPERLINKS.with(|h| std::mem::take(&mut *h.borrow_mut()))
 }
 
+/// A single sixel image to re-emit after the frame is drawn (#431). `x`/`y`
+/// are OUTER-terminal 0-based cell coordinates of the image's top-left corner;
+/// `id` keys into the session-lifetime blob cache; `cw`/`ch` are the cell
+/// footprint (kept for future diffing, not needed to emit).
+#[derive(Clone)]
+pub(crate) struct SixelEmit {
+    pub x: u16,
+    pub y: u16,
+    pub id: u64,
+    pub cw: u16,
+    pub ch: u16,
+}
+
+thread_local! {
+    /// Sixel image emits collected during the current frame's render, drained
+    /// and emitted (gated) after `terminal.draw()`. Mirrors `FRAME_HYPERLINKS`:
+    /// thread-local so the recursive `render_layout_json` need not thread a
+    /// collector, and so no outer state (the blob cache) is required at render
+    /// time — the cache-presence check happens at emit time where it is in scope.
+    static FRAME_SIXELS: std::cell::RefCell<Vec<SixelEmit>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn frame_sixels_clear() {
+    FRAME_SIXELS.with(|h| h.borrow_mut().clear());
+}
+
+pub(crate) fn frame_sixels_push(emit: SixelEmit) {
+    FRAME_SIXELS.with(|h| h.borrow_mut().push(emit));
+}
+
+pub(crate) fn frame_sixels_take() -> Vec<SixelEmit> {
+    FRAME_SIXELS.with(|h| std::mem::take(&mut *h.borrow_mut()))
+}
+
 /// SGR parameters for a ratatui color as a foreground (`base` 38/foreground)
 /// or background (`base` 48). Returns the numeric params without the leading
 /// `\x1b[` or trailing `m`.
@@ -170,6 +205,31 @@ pub(crate) fn build_osc8_overlay(runs: &[HyperlinkRun]) -> String {
     }
     out.push_str("\x1b[0m"); // reset SGR
     out.push_str("\x1b8"); // DECRC: restore cursor
+    out
+}
+
+/// Build the raw byte stream that overlays the collected sixel images on top of
+/// an already-drawn frame (#431). For each emit whose blob id is present in the
+/// cache: DECSC (save cursor); CUP to 1-based (y+1, x+1); the raw ESC P … ST
+/// sixel bytes verbatim; DECRC (restore cursor). Returns EMPTY when there is
+/// nothing to draw or no emit's id is cached — the caller gates emission on the
+/// `sixel` option separately. Bytes (not String) because the blob is arbitrary
+/// binary. Pure function so it can be unit-tested.
+pub(crate) fn build_sixel_overlay(
+    emits: &[SixelEmit],
+    cache: &std::collections::HashMap<u64, Vec<u8>>,
+) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    for emit in emits {
+        let Some(blob) = cache.get(&emit.id) else {
+            continue; // blob not shipped/decoded yet; skip this frame
+        };
+        out.extend_from_slice(b"\x1b7"); // DECSC: save cursor
+        // CUP to 1-based (row;col).
+        out.extend_from_slice(format!("\x1b[{};{}H", emit.y as u32 + 1, emit.x as u32 + 1).as_bytes());
+        out.extend_from_slice(blob); // raw ESC P … ST sixel bytes verbatim
+        out.extend_from_slice(b"\x1b8"); // DECRC: restore cursor
+    }
     out
 }
 
@@ -717,6 +777,9 @@ pub fn render_layout_json(
             content,
             rows_v2,
             title,
+            // Sixel image descriptors (#431): positioned here and collected
+            // into FRAME_SIXELS for the post-draw emit path (M6).
+            images,
         } => {
             // When pane-border-status is enabled, reserve 1 row for the
             // border label so it doesn't overlap pane content (#288).
@@ -730,6 +793,32 @@ pub fn render_layout_json(
             } else {
                 area
             };
+            // ── Sixel: collect fully-inside images for post-draw emit (#431) ──
+            // Mirror FRAME_HYPERLINKS: push geometry+id during render, defer the
+            // blob-cache-presence check to emit time (the cache is not in scope
+            // here). A sixel cannot be partially clipped, so only push when the
+            // whole cell footprint lies inside the pane's inner content rect.
+            for desc in images {
+                if desc.row < 0 {
+                    continue; // anchored above the viewport → not fully inside
+                }
+                if desc.row as i64 + desc.ch as i64 > inner.height as i64 {
+                    continue; // bottom edge past the pane
+                }
+                if desc.col as i64 + desc.cw as i64 > inner.width as i64 {
+                    continue; // right edge past the pane
+                }
+                // row >= 0 and both bounds checks passed, so out_x/out_y fit u16.
+                let out_x = inner.x as i32 + desc.col as i32;
+                let out_y = inner.y as i32 + desc.row;
+                frame_sixels_push(SixelEmit {
+                    x: out_x as u16,
+                    y: out_y as u16,
+                    id: desc.id,
+                    cw: desc.cw,
+                    ch: desc.ch,
+                });
+            }
             let mut lines: Vec<Line> = Vec::new();
             let use_full_cells = *copy_mode && *active && !content.is_empty();
             // If the source pane is larger than the preview area, reflow
@@ -1400,6 +1489,9 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     fn default_status_visible() -> bool { true }
     fn default_repeat_time() -> u64 { 500 }
     fn default_bold_is_bright() -> bool { true }
+    // #431: default TRUE so a server without the `sixel` field still attempts
+    // rendering (a non-capable outer terminal simply ignores the DCS).
+    fn default_sixel() -> bool { true }
     fn default_paste_detection() -> bool { true }
     fn default_mouse_selection() -> bool { true }
     fn default_scroll_enter_copy_mode() -> bool { true }
@@ -1580,6 +1672,16 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         /// the server and pushed into the writer's atomic each frame.
         #[serde(default = "default_bold_is_bright")]
         bold_is_bright: bool,
+        /// Sixel option gate (#431): mirrors the server-side `sixel` option.
+        /// The client emits raw sixel bytes to its host terminal only when this
+        /// is true (M6). Defaults TRUE so an older server still attempts render.
+        #[serde(default = "default_sixel")]
+        sixel: bool,
+        /// One-shot-per-id sixel blob map (#431): stringified image id -> base64
+        /// of the raw ESC P..ST bytes. Shipped ONCE per id (empty {} on steady
+        /// frames), so the client accumulates these into a persistent cache.
+        #[serde(default)]
+        image_blobs: std::collections::HashMap<String, String>,
         /// Whether a pane is currently zoomed (borders should be hidden)
         #[serde(default)]
         zoomed: bool,
@@ -1698,6 +1800,17 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
     // Issue #269: last OSC 9;4 (host terminal progress) value emitted.
     // Same debounce pattern as host_title.
     let mut last_emitted_host_progress: Option<String> = None;
+    // ── Sixel graphics (#431) ───────────────────────────────────────
+    // Session-lifetime blob cache: image id -> decoded raw ESC P..ST bytes.
+    // Blobs are shipped ONCE per id in the dump-state `image_blobs` map, so
+    // this MUST persist across frames (declared outside the per-frame loop).
+    // M6 reads this cache to re-emit visible images each frame.
+    let mut image_blob_cache: std::collections::HashMap<u64, Vec<u8>> =
+        std::collections::HashMap::new();
+    // Latest value of the server `sixel` option gate, refreshed each frame
+    // (deferred init: assigned at the top of every frame before any read).
+    // M6 gates its emit block on this (plus outer-terminal capability).
+    let mut sixel_enabled: bool;
     // VT input mode: periodically re-send mouse-enable escape sequences.
     // Covers SSH sessions and JetBrains JediTerm (which sends VT mouse
     // sequences through ConPTY instead of native MOUSE_EVENT records).
@@ -4500,6 +4613,30 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         // The writer lives in this client process, so the server-side option
         // value must be pushed here for the rewrite toggle to take effect.
         crate::platform::set_bold_is_bright(state.bold_is_bright);
+        // ── Sixel model update (#431, M5) ───────────────────────────
+        // Refresh the option gate and accumulate any newly-shipped image
+        // blobs into the session-lifetime cache. Blobs arrive once per id
+        // (empty {} on steady frames), so decode each id exactly once and
+        // keep it for the life of the connection. M6 consumes both.
+        sixel_enabled = state.sixel;
+        if !state.image_blobs.is_empty() {
+            use base64::Engine;
+            for (id_str, b64) in &state.image_blobs {
+                let Ok(id) = id_str.parse::<u64>() else {
+                    // Malformed id key — skip, never panic.
+                    continue;
+                };
+                if image_blob_cache.contains_key(&id) {
+                    continue; // already decoded; decode once per id
+                }
+                match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
+                    Ok(bytes) => { image_blob_cache.insert(id, bytes); }
+                    Err(_e) => { /* skip undecodable blob; never panic */ }
+                }
+            }
+        }
+        // `image_blob_cache` and `sixel_enabled` are consumed by the post-draw
+        // sixel emit block (M6) below.
         // Update status-left / status-right from server (already format-expanded)
         if let Some(sl) = state.status_left {
             // Pass full string — visual truncation is handled by ratatui
@@ -4582,6 +4719,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
         }
         // Reset OSC 8 hyperlink runs collected during this frame's render (#361).
         frame_hyperlinks_clear();
+        // Reset sixel image emits collected during this frame's render (#431).
+        frame_sixels_clear();
         terminal.draw(|f| {
             let area = f.area();
             let constraints = if status_at_top {
@@ -5764,6 +5903,25 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
             }
         }
 
+        // ── Post-draw: overlay sixel images (#431) ───────────────────
+        // ratatui clears every cell each frame, destroying any painted
+        // sixel, so we re-emit the raw DCS bytes for each fully-inside,
+        // visible image AFTER the frame is drawn — this re-emission IS the
+        // redraw-persistence mechanism. Gated on the `sixel` option; a
+        // disabled option emits nothing. The blob-cache-presence check is
+        // done here (cache in scope) since the render pass could not see it.
+        {
+            let emits = frame_sixels_take();
+            if sixel_enabled && !emits.is_empty() {
+                let overlay = build_sixel_overlay(&emits, &image_blob_cache);
+                if !overlay.is_empty() {
+                    let mut out = std::io::stdout().lock();
+                    let _ = std::io::Write::write_all(&mut out, &overlay);
+                    let _ = std::io::Write::flush(&mut out);
+                }
+            }
+        }
+
         // ── Post-draw: emit buffered OSC 52 clipboard ────────────────
         // Written AFTER terminal.draw() so it doesn't interfere with
         // ratatui's VT output buffer.
@@ -6095,3 +6253,7 @@ mod test_issue345_command_prompt_utf8;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue361_osc8_overlay.rs"]
 mod test_issue361_osc8_overlay;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_sixel_client_model.rs"]
+mod test_sixel_client_model;

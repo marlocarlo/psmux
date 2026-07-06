@@ -59,6 +59,7 @@ pub static OPTION_CATALOG: &[OptionDef] = &[
     OptionDef { name: "set-titles-string", scope: "session", option_type: "string", default: "#S:#I:#W", description: "Terminal title format string" },
     OptionDef { name: "word-separators", scope: "session", option_type: "string", default: " -_@", description: "Characters treated as word boundaries" },
     OptionDef { name: "allow-passthrough", scope: "session", option_type: "choice", default: "off", description: "Allow passthrough escape sequences" },
+    OptionDef { name: "sixel", scope: "session", option_type: "boolean", default: "on", description: "Render sixel graphics from panes (issue #431)" },
     OptionDef { name: "allow-rename", scope: "session", option_type: "boolean", default: "on", description: "Allow programs to rename windows" },
     OptionDef { name: "allow-set-title", scope: "session", option_type: "boolean", default: "off", description: "Allow programs to set pane title via escape sequences" },
     OptionDef { name: "update-environment", scope: "session", option_type: "string", default: "", description: "Environment variables to update on attach" },

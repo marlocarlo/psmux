@@ -904,6 +904,7 @@ pub fn parse_option_value(app: &mut AppState, rest: &str, _is_global: bool) {
             app.bold_is_bright = matches!(value, "on" | "true" | "1");
             crate::platform::set_bold_is_bright(app.bold_is_bright);
         }
+        "sixel" => app.sixel = matches!(value, "on" | "true" | "1"),
         "prefix" => {
             if let Some(key) = parse_key_name(value) {
                 app.prefix_key = key;

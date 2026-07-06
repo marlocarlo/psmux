@@ -71,6 +71,38 @@ fn serialize_overlay_json(app: &AppState) -> String {
     out
 }
 
+/// Build the top-level `image_blobs` JSON object for a dump-state frame.
+///
+/// Returns `{"<id>":"<base64 of SixelImage.raw>", ...}` for every sixel image
+/// currently visible in the active window (per `helpers::visible_image_blobs`)
+/// whose id is NOT yet in `app.shipped_image_ids`, and records each emitted id
+/// so subsequent frames ship only the tiny per-leaf descriptor.  When every
+/// visible id has already shipped this returns `"{}"`, keeping steady-state
+/// frames small and NC-dedup effective (sixel design section 3b / M4).  Called
+/// at BOTH dump-state build sites (design risk 7).
+fn build_image_blobs_json(app: &mut AppState) -> String {
+    use base64::Engine as _;
+    let visible = helpers::visible_image_blobs(app);
+    let mut json = String::from("{");
+    let mut first = true;
+    for (id, raw) in visible {
+        if app.shipped_image_ids.contains(&id) {
+            continue;
+        }
+        if !first {
+            json.push(',');
+        }
+        first = false;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+        // ids are decimal digits and the standard base64 alphabet
+        // (A-Za-z0-9+/=) needs no JSON escaping, so embed both verbatim.
+        let _ = std::fmt::Write::write_fmt(&mut json, format_args!("\"{}\":\"{}\"", id, b64));
+        app.shipped_image_ids.insert(id);
+    }
+    json.push('}');
+    json
+}
+
 fn should_spawn_warm_server(app: &AppState) -> bool {
     app.warm_enabled && app.session_name != "__warm__" && !app.destroy_unattached
 }
@@ -1589,6 +1621,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                     });
                     hook_event = Some("client-attached");
+                    // Sixel M4 resync: a newly attached (or re-attaching) client
+                    // has an empty per-connection blob cache, so re-ship every
+                    // currently-visible blob.  Clearing the shipped set makes the
+                    // next dump-state frame re-emit all visible `image_blobs`;
+                    // force a rebuild so that frame is actually produced.
+                    app.shipped_image_ids.clear();
+                    state_dirty = true;
                     // update-environment: refresh env vars from the attaching client's environment
                     let update_vars = app.update_environment.clone();
                     for var_spec in &update_vars {
@@ -1775,8 +1814,16 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         sf
                     };
                     let cursor_style_code = crate::rendering::configured_cursor_code();
+                    // Sixel M4: ship each currently-visible image blob's base64
+                    // bytes exactly once.  The per-leaf `images` descriptor is
+                    // emitted every frame (tiny); the large raw bytes go into
+                    // this top-level `image_blobs` map only for visible ids not
+                    // yet in `shipped_image_ids`.  Steady-state frames (all ids
+                    // already shipped) emit `"image_blobs":{}` so NC-dedup and
+                    // frame caching keep working.  See helpers::visible_image_blobs.
+                    let image_blobs_json = build_image_blobs_json(&mut app);
                     let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"defaults_suppressed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"bold_is_bright\":{}}}",
+                        "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"defaults_suppressed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"bold_is_bright\":{},\"sixel\":{},\"image_blobs\":{}}}",
                         layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, app.pane_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, pbhs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                         matches!(app.mode, Mode::ClockMode), cached_bindings_json,
                         app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
@@ -1790,6 +1837,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         app.choose_tree_preview,
                         app.scroll_enter_copy_mode,
                         app.bold_is_bright,
+                        app.sixel,
+                        image_blobs_json,
                     ));
                     // Inject overlay state (popup, menu, confirm, display_panes)
                     {
@@ -3537,6 +3586,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     output.push_str(&format!("status-right-length {}\n", app.status_right_length));
                     output.push_str(&format!("window-size {}\n", app.window_size));
                     output.push_str(&format!("allow-passthrough {}\n", app.allow_passthrough));
+                    output.push_str(&format!("sixel {}\n", if app.sixel { "on" } else { "off" }));
                     output.push_str(&format!("set-clipboard {}\n", app.set_clipboard));
                     if !app.copy_command.is_empty() {
                         output.push_str(&format!("copy-command \"{}\"\n", app.copy_command));
@@ -4047,7 +4097,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     app.status_message = Some(("lock: not available on Windows".to_string(), std::time::Instant::now(), None));
                     state_dirty = true;
                 }
-                CtrlReq::RefreshClient => { state_dirty = true; meta_dirty = true; }
+                CtrlReq::RefreshClient => {
+                    // Sixel M4 resync: a full redraw (refresh-client) means the
+                    // client repaints from scratch, discarding any painted sixel,
+                    // so re-ship every visible blob on the next frame.
+                    app.shipped_image_ids.clear();
+                    state_dirty = true;
+                    meta_dirty = true;
+                }
                 CtrlReq::SuspendClient => {
                     app.status_message = Some(("suspend: not available on Windows".to_string(), std::time::Instant::now(), None));
                     state_dirty = true;
@@ -4952,8 +5009,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 sf
             };
             let cursor_style_code = crate::rendering::configured_cursor_code();
+            // Sixel M4: ship each currently-visible image blob's base64 bytes
+            // exactly once (mirror of the response-path site above; both build
+            // sites MUST inject `image_blobs` or images vanish intermittently
+            // depending on which path served the frame — design risk 7).
+            let image_blobs_json = build_image_blobs_json(&mut app);
             let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
-                "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"bold_is_bright\":{}}}",
+                "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"bold_is_bright\":{},\"sixel\":{},\"image_blobs\":{}}}",
                 layout_json, cached_windows_json, cached_prefix_str, cached_prefix2_str, cached_tree_json, cached_base_index, app.pane_base_index, cached_pred_dim, ss_escaped, sl_expanded, sr_expanded, pbs_escaped, pabs_escaped, pbhs_escaped, wsf_escaped, wscf_escaped, wss_escaped, ws_style_escaped, wsc_style_escaped,
                 matches!(app.mode, Mode::ClockMode), cached_bindings_json,
                 app.status_left_length, app.status_right_length, app.status_lines, status_format_json,
@@ -4966,6 +5028,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 app.choose_tree_preview,
                 app.scroll_enter_copy_mode,
                 app.bold_is_bright,
+                app.sixel,
+                image_blobs_json,
             ));
             // Inject overlay state (popup, menu, confirm, display_panes)
             {
@@ -5306,3 +5370,7 @@ mod test_issue167_startup_log;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue370_startup_error_passthrough.rs"]
 mod test_issue370_startup_error_passthrough;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue431_m4_blobs.rs"]
+mod test_issue431_m4_blobs;

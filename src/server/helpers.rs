@@ -303,6 +303,147 @@ pub(crate) fn active_pane_progress(app: &AppState) -> Option<(u8, u8)> {
     parser.screen().progress()
 }
 
+/// Viewport-relative descriptor for one sixel image visible in a pane, emitted
+/// into each leaf's dump-state JSON (see the sixel design, section 3a).  The
+/// blob itself is shipped once by id (M4); this carries only position + size so
+/// the client can place and clip it.  `row` is relative to the client viewport
+/// top and MAY be negative when an image straddles the top edge (the client
+/// culls partially-visible images); all other fields are non-negative.
+pub(crate) struct ImageDesc {
+    /// Stable per-`Screen` image id (matches `image_blobs` key shipped by M4).
+    pub id: u64,
+    /// Row of the image's top-left cell relative to the viewport top; signed
+    /// because an image anchored above the viewport can still be partly visible.
+    pub row: i32,
+    /// Column of the image's top-left cell (grid column, always >= 0).
+    pub col: u16,
+    /// Image width in pixels.
+    pub pw: u32,
+    /// Image height in pixels.
+    pub ph: u32,
+    /// Image width in cells.
+    pub cw: u16,
+    /// Image height in cells.
+    pub ch: u16,
+}
+
+/// Gather the sixel images of `screen` that intersect the visible viewport,
+/// converting each image's absolute `anchor_line` into a row relative to the
+/// client viewport (accounting for the current scrollback offset `scroll_off`
+/// and `last_rows` viewport height).  Only images owned by the currently-active
+/// grid whose row-span `[row, row + cell_height)` intersects `[0, last_rows)`
+/// are returned (server-side viewport cull).  Mirrors `active_pane_progress`:
+/// the caller holds the pane mutex and passes `parser.screen()`.
+pub(crate) fn visible_pane_images(
+    screen: &vt100::Screen,
+    last_rows: u16,
+    scroll_off: usize,
+) -> Vec<ImageDesc> {
+    let on_alt = screen.alternate_screen();
+    // Absolute line at viewport row 0 (offset 0), minus the current scroll
+    // offset, is the absolute line currently shown at viewport row 0.
+    let top_line = screen.drawing_top_line() as i64;
+    let scroll_off = i64::try_from(scroll_off).unwrap_or(i64::MAX);
+    let last_rows = i64::from(last_rows);
+    let mut out = Vec::new();
+    for img in screen.images() {
+        // Only images on the grid the client is currently viewing are placeable.
+        if img.on_alt != on_alt {
+            continue;
+        }
+        let vrow = img.anchor_line as i64 - (top_line - scroll_off);
+        let ch = i64::from(img.cell_height);
+        // Cull images whose row-span does not intersect the visible rows.
+        if vrow + ch <= 0 || vrow >= last_rows {
+            continue;
+        }
+        out.push(ImageDesc {
+            id: img.id,
+            row: i32::try_from(vrow)
+                .unwrap_or(if vrow < 0 { i32::MIN } else { i32::MAX }),
+            col: img.anchor_col,
+            pw: img.px_width,
+            ph: img.px_height,
+            cw: img.cell_width,
+            ch: img.cell_height,
+        });
+    }
+    out
+}
+
+/// Gather `(id, raw)` for every sixel image currently VISIBLE in the active
+/// window's panes, so the dump-state builder can ship each blob's bytes once
+/// (M4).  Walks exactly the panes the layout serialiser covers
+/// (`app.windows[active_idx].root`) and applies the SAME per-pane visibility as
+/// `dump_layout_json_fast::write_node`: only the active pane scrolls back while
+/// the session is in copy mode, all others use scroll offset 0.  Reuses
+/// [`visible_pane_images`] for the viewport/alt cull so the set of ids here is
+/// identical to the descriptors emitted per leaf; the caller then filters out
+/// ids already in `shipped_image_ids` and base64-encodes the survivors.
+pub(crate) fn visible_image_blobs(app: &AppState) -> Vec<(u64, Vec<u8>)> {
+    let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
+    let win = match app.windows.get(app.active_idx) {
+        Some(w) => w,
+        None => return out,
+    };
+    let in_copy = matches!(
+        app.mode,
+        crate::types::Mode::CopyMode | crate::types::Mode::CopySearch { .. }
+    );
+    let scroll_off = app.copy_scroll_offset;
+    let mut path: Vec<usize> = Vec::new();
+    collect_image_blobs_in_node(
+        &win.root,
+        &mut path,
+        &win.active_path,
+        in_copy,
+        scroll_off,
+        &mut out,
+    );
+    out
+}
+
+fn collect_image_blobs_in_node(
+    node: &Node,
+    cur_path: &mut Vec<usize>,
+    active_path: &[usize],
+    in_copy: bool,
+    scroll_off: usize,
+    out: &mut Vec<(u64, Vec<u8>)>,
+) {
+    match node {
+        Node::Leaf(p) => {
+            if p.dead {
+                return;
+            }
+            let parser = match p.term.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let screen = parser.screen();
+            let is_active = cur_path.as_slice() == active_path;
+            let img_scroll_off = if is_active && in_copy { scroll_off } else { 0 };
+            let descs = visible_pane_images(screen, p.last_rows, img_scroll_off);
+            if descs.is_empty() {
+                return;
+            }
+            let visible: std::collections::HashSet<u64> = descs.iter().map(|d| d.id).collect();
+            for img in screen.images() {
+                if visible.contains(&img.id) {
+                    out.push((img.id, img.raw.clone()));
+                }
+            }
+        }
+        Node::Split { children, .. } => {
+            for (i, c) in children.iter().enumerate() {
+                cur_path.push(i);
+                collect_image_blobs_in_node(c, cur_path, active_path, in_copy, scroll_off, out);
+                cur_path.pop();
+            }
+        }
+    }
+}
+
 /// Drain a pending OSC 52 clipboard payload from any pane in the tree.
 /// Returns the first `(selector, base64_data)` found and clears it on the
 /// source pane.  Lets a child process inside any pane (e.g. Claude Code's
@@ -506,3 +647,7 @@ pub(crate) const TMUX_COMMANDS: &[&str] = &[
     "unlink-window (unlinkw)",
     "wait-for (wait)",
 ];
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue431_server_desc.rs"]
+mod test_issue431_server_desc;
