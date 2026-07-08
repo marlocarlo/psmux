@@ -45,7 +45,8 @@ $tests = @(
     "test_smoke_pr.ps1",
     "test_session_mgmt.ps1",
     "test_run_shell.ps1",
-    "test_issue209_e2e_verify.ps1"
+    "test_issue209_e2e_verify.ps1",
+    "test_swapw_revert.ps1"
 )
 
 $suitePass = 0

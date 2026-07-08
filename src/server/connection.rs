@@ -810,7 +810,7 @@ let args: Vec<&str> = {
 // Commands that should permanently change focus when used with -t
 let is_focus_cmd = matches!(cmd, "select-window" | "selectw" | "select-pane" | "selectp");
 // Commands that handle -t internally and should NOT get FocusWindowTemp
-let skip_target_focus = matches!(cmd, "join-pane" | "joinp" | "move-pane" | "movep");
+let skip_target_focus = matches!(cmd, "join-pane" | "joinp" | "move-pane" | "movep" | "swap-window" | "swapw");
 if let Some(wid) = target_win {
     if is_focus_cmd {
         if target_win_is_id {
@@ -2142,7 +2142,10 @@ match cmd {
         let _ = tx.send(CtrlReq::MoveWindow(target));
     }
     "swap-window" | "swapw" => {
-        if let Some(target) = args.iter().find(|a| a.parse::<usize>().is_ok()).and_then(|s| s.parse().ok()) {
+        // Use the resolved -t target (parse_target mapped session:window +
+        // base-index); the bare-arg scan misses it because -t is stripped from args.
+        if let Some(target) = target_win
+            .or_else(|| args.iter().find(|a| a.parse::<usize>().is_ok()).and_then(|s| s.parse().ok())) {
             let _ = tx.send(CtrlReq::SwapWindow(target));
         }
     }

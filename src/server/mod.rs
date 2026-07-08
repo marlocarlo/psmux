@@ -3602,8 +3602,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                 }
                 CtrlReq::SwapWindow(target) => {
-                    if target < app.windows.len() && app.active_idx != target {
-                        app.windows.swap(app.active_idx, target);
+                    let target = target.checked_sub(app.window_base_index);
+                    if let Some(target) = target {
+                        if target < app.windows.len() && app.active_idx != target {
+                            app.windows.swap(app.active_idx, target);
+                            resize_all_panes(&mut app);
+                            meta_dirty = true;
+                            state_dirty = true;
+                        }
                     }
                 }
                 CtrlReq::LinkWindow(src_idx_opt, dst_idx_opt) => {
