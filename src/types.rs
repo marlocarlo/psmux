@@ -749,6 +749,19 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Whether this server should run the periodic `status-interval` timer,
+    /// which fires user `status-interval` hooks and re-renders the status line
+    /// so time formats (`%H:%M:%S`, `%r`, ...) stay current.
+    ///
+    /// The hidden `__warm__` pre-spawn server has no clients and no visible
+    /// status bar, so it must not run this timer: otherwise a global
+    /// `status-interval` hook fires twice — once on the real server and once
+    /// on the warm one. Once claimed and renamed, its `session_name` is no
+    /// longer `__warm__`, so it runs the timer normally.
+    pub fn should_run_status_interval_timer(&self) -> bool {
+        self.status_interval > 0 && self.session_name != "__warm__"
+    }
+
     /// Reap a dead client's `client_registry` entry exactly once, keeping the
     /// `attached_clients` counter in lock-step with the registry.
     ///

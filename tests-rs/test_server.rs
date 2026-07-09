@@ -143,6 +143,29 @@ fn get_option_allow_rename() {
 }
 
 #[test]
+fn warm_server_does_not_run_status_interval_timer() {
+    // Guards the double-fire fix; see AppState::should_run_status_interval_timer.
+    let mut app = AppState::new("__warm__".to_string());
+    app.status_interval = 5;
+    assert!(
+        !app.should_run_status_interval_timer(),
+        "warm server must not run the status-interval timer"
+    );
+
+    app.session_name = "main".to_string();
+    assert!(
+        app.should_run_status_interval_timer(),
+        "a real session must run the status-interval timer"
+    );
+
+    app.status_interval = 0;
+    assert!(
+        !app.should_run_status_interval_timer(),
+        "status-interval=0 disables the timer"
+    );
+}
+
+#[test]
 fn get_option_bell_action() {
     let app = AppState::new("test".to_string());
     let val = super::options::get_option_value(&app, "bell-action");

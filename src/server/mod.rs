@@ -2940,6 +2940,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // user's session-creation time — reset on claim or list-sessions /
                     // session_created / uptime would report the warm pool's age.
                     app.created_at = chrono::Local::now();
+                    // Same reason for the status-interval phase: the warm server skips
+                    // the timer (see should_run_status_interval_timer), so its last-fire
+                    // stamp is the warm start time — reset it so a claimed session fires
+                    // one interval after creation, not immediately.
+                    app.last_status_interval_fire = std::time::Instant::now();
                     // Update env so run-shell/hooks from this server target the new name
                     env::set_var("PSMUX_TARGET_SESSION", app.port_file_base());
                     // Honour the client's working directory: the warm server
@@ -5413,7 +5418,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             crate::types::push_frame(&combined_buf);
         }
         // ── Status-interval timer: fire hooks periodically ──
-        if app.status_interval > 0 {
+        if app.should_run_status_interval_timer() {
             let elapsed = app.last_status_interval_fire.elapsed().as_secs();
             if elapsed >= app.status_interval {
                 app.last_status_interval_fire = std::time::Instant::now();
