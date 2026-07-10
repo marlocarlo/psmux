@@ -970,7 +970,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
     match parts[0] {
         "new-window" | "neww" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "new-window\n", &app.session_key);
+                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
             }
         }
         "split-window" | "splitw" | "split-pane" | "splitp" => {

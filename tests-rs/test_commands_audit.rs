@@ -5,6 +5,12 @@
 
 use super::*;
 
+use std::io::{Read, Write as IoWrite};
+use std::net::TcpListener;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
 fn mock_app() -> AppState {
     let mut app = AppState::new("test_session".to_string());
     app.window_base_index = 0;
@@ -45,6 +51,34 @@ fn mock_app_with_windows(names: &[&str]) -> AppState {
         app.windows.push(make_window(name, i));
     }
     app
+}
+
+fn capture_control_request() -> (u16, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut request = Vec::new();
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut seen_lf = 0;
+            let mut buf = [0u8; 1];
+            while seen_lf < 2 {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        request.push(buf[0]);
+                        if buf[0] == b'\n' {
+                            seen_lf += 1;
+                        }
+                    }
+                }
+            }
+            let _ = stream.write_all(b"OK\n");
+            let _ = stream.flush();
+        }
+        let _ = tx.send(String::from_utf8_lossy(&request).to_string());
+    });
+    (port, rx)
 }
 
 /// Extract popup output text, panicking with context if not PopupMode.
@@ -90,6 +124,20 @@ fn display_alias_works() {
     execute_command_string(&mut app, "display test_alias").unwrap();
     let msg = extract_status_message(&app);
     assert_eq!(msg, "test_alias");
+}
+
+#[test]
+fn new_window_forwards_full_command_to_control_port() {
+    let command = r#"new-window -n 'Foo Bar' -c 'D:\x y' 'clod --resume=abc 123'"#;
+    let (port, request_rx) = capture_control_request();
+    let mut app = mock_app_with_window();
+    app.control_port = Some(port);
+    app.session_key = "test-key".to_string();
+
+    execute_command_string(&mut app, command).unwrap();
+
+    let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(request, format!("AUTH test-key\n{}\n", command));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
