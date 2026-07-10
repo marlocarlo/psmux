@@ -749,17 +749,26 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Whether this is the hidden `__warm__` pre-spawn server: a server started
+    /// ahead of time so the next `new-session` can claim it instead of paying a
+    /// cold-start. It has no client and no visible session until it is claimed
+    /// and renamed to a real session, so it must sit out anything that assumes a
+    /// real, client-facing session - status-interval timers, startup
+    /// client-attached/session-created hooks, and the like.
+    pub fn is_warm_server(&self) -> bool {
+        self.session_name == "__warm__"
+    }
+
     /// Whether this server should run the periodic `status-interval` timer,
     /// which fires user `status-interval` hooks and re-renders the status line
     /// so time formats (`%H:%M:%S`, `%r`, ...) stay current.
     ///
-    /// The hidden `__warm__` pre-spawn server has no clients and no visible
-    /// status bar, so it must not run this timer: otherwise a global
-    /// `status-interval` hook fires twice — once on the real server and once
-    /// on the warm one. Once claimed and renamed, its `session_name` is no
-    /// longer `__warm__`, so it runs the timer normally.
+    /// The `__warm__` server has no clients and no visible status bar, so it must
+    /// not run this timer: otherwise a global `status-interval` hook fires twice -
+    /// once on the real server and once on the warm one. Once claimed and renamed,
+    /// it is no longer warm and runs the timer normally.
     pub fn should_run_status_interval_timer(&self) -> bool {
-        self.status_interval > 0 && self.session_name != "__warm__"
+        self.status_interval > 0 && !self.is_warm_server()
     }
 
     /// Reap a dead client's `client_registry` entry exactly once, keeping the

@@ -166,6 +166,17 @@ fn warm_server_does_not_run_status_interval_timer() {
 }
 
 #[test]
+fn is_warm_server_tracks_the_reserved_name() {
+    // Guards the double-fire fix; see AppState::is_warm_server.
+    let mut app = AppState::new("__warm__".to_string());
+    assert!(app.is_warm_server(), "the __warm__ pre-spawn server is warm");
+
+    // Claiming a warm server renames it to the real session; it is no longer warm.
+    app.session_name = "main".to_string();
+    assert!(!app.is_warm_server(), "a claimed/real session is not warm");
+}
+
+#[test]
 fn get_option_bell_action() {
     let app = AppState::new("test".to_string());
     let val = super::options::get_option_value(&app, "bell-action");
