@@ -1500,7 +1500,8 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                             };
                             if let Some(win) = app.windows.get_mut(app.active_idx) {
                                 if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
-                                    let _ = p.writer.write_all(expanded.as_bytes());
+                                    // DECCKM app-cursor mode: SS3, not CSI (see crate::input::write_key_seq).
+                                    crate::input::write_key_seq(p, expanded.as_bytes());
                                     let _ = p.writer.flush();
                                 }
                             }

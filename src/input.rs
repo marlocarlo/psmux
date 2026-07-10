@@ -1899,6 +1899,43 @@ pub fn encode_key_event(key: &KeyEvent) -> Option<Vec<u8>> {
     Some(encoded)
 }
 
+/// Map a CSI cursor key (`ESC [` A/B/C/D/H/F) to its SS3 form (`ESC O` x) when the
+/// target pane is in DECCKM application-cursor-keys mode; `None` keeps the CSI form.
+///
+/// Apps that enable application-cursor mode (via `ESC [ ? 1 h`), notably
+/// PowerShell/PSReadLine reached through an SSH pane, expect SS3 for unmodified
+/// arrows/Home/End and echo the raw escape when handed CSI instead. Local panes
+/// usually leave the mode off, so the mismatch only bites over SSH. Modified cursor
+/// keys stay xterm CSI (`ESC [ 1 ; mod x`); they are longer than 3 bytes, so the
+/// `len() == 3` guard skips them. tmux parity (`input_key`, `MODE_KCURSOR`).
+pub(crate) fn csi_cursor_to_ss3(seq: &[u8], app_cursor: bool) -> Option<[u8; 3]> {
+    if app_cursor
+        && seq.len() == 3
+        && seq[0] == 0x1b
+        && seq[1] == b'['
+        && matches!(seq[2], b'A' | b'B' | b'C' | b'D' | b'H' | b'F')
+    {
+        Some([0x1b, b'O', seq[2]])
+    } else {
+        None
+    }
+}
+
+/// Write a key's byte sequence to a pane, upgrading a CSI cursor key to its SS3
+/// form when the pane is in DECCKM application-cursor mode (see csi_cursor_to_ss3).
+/// The transform no-ops on every other sequence, so all named keys route through
+/// this uniformly. Does not flush; callers flush once after the write.
+pub(crate) fn write_key_seq(p: &mut crate::types::Pane, seq: &[u8]) {
+    use std::io::Write as _;
+    let app_cursor = p.term.lock()
+        .map(|t| t.screen().application_cursor())
+        .unwrap_or(false);
+    let _ = match csi_cursor_to_ss3(seq, app_cursor) {
+        Some(ss3) => p.writer.write_all(&ss3),
+        None => p.writer.write_all(seq),
+    };
+}
+
 /// A printable text keystroke on the INTERACTIVE input route (drives
 /// `#{pane_last_text_input}`). Excludes control codes and any Ctrl/Alt-modified
 /// key, so navigation, shortcuts, Enter, Tab, etc. don't count. Shift is fine
@@ -3307,22 +3344,22 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
     fn write_named_key_to_pane(p: &mut crate::types::Pane, k: &str) {
         use std::io::Write as _;
         match k {
-            "enter" => { let _ = write!(p.writer, "\r"); }
-            "tab" => { let _ = write!(p.writer, "\t"); }
-            "btab" | "backtab" => { let _ = write!(p.writer, "\x1b[Z"); }
-            "backspace" => { let _ = p.writer.write_all(&[0x7F]); }
-            "delete" => { let _ = write!(p.writer, "\x1b[3~"); }
-            "esc" => { let _ = write!(p.writer, "\x1b"); }
-            "left" => { let _ = write!(p.writer, "\x1b[D"); }
-            "right" => { let _ = write!(p.writer, "\x1b[C"); }
-            "up" => { let _ = write!(p.writer, "\x1b[A"); }
-            "down" => { let _ = write!(p.writer, "\x1b[B"); }
-            "pageup" => { let _ = write!(p.writer, "\x1b[5~"); }
-            "pagedown" => { let _ = write!(p.writer, "\x1b[6~"); }
-            "home" => { let _ = write!(p.writer, "\x1b[H"); }
-            "end" => { let _ = write!(p.writer, "\x1b[F"); }
-            "insert" => { let _ = write!(p.writer, "\x1b[2~"); }
-            "space" => { let _ = write!(p.writer, " "); }
+            "enter" => write_key_seq(p, b"\r"),
+            "tab" => write_key_seq(p, b"\t"),
+            "btab" | "backtab" => write_key_seq(p, b"\x1b[Z"),
+            "backspace" => write_key_seq(p, b"\x7f"),
+            "delete" => write_key_seq(p, b"\x1b[3~"),
+            "esc" => write_key_seq(p, b"\x1b"),
+            "up" => write_key_seq(p, b"\x1b[A"),
+            "down" => write_key_seq(p, b"\x1b[B"),
+            "right" => write_key_seq(p, b"\x1b[C"),
+            "left" => write_key_seq(p, b"\x1b[D"),
+            "home" => write_key_seq(p, b"\x1b[H"),
+            "end" => write_key_seq(p, b"\x1b[F"),
+            "pageup" => write_key_seq(p, b"\x1b[5~"),
+            "pagedown" => write_key_seq(p, b"\x1b[6~"),
+            "insert" => write_key_seq(p, b"\x1b[2~"),
+            "space" => write_key_seq(p, b" "),
             s if s.starts_with("f") && s.len() >= 2 && s.len() <= 3 => {
                 if let Ok(n) = s[1..].parse::<u8>() {
                     let seq = match n {
