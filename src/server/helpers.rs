@@ -658,6 +658,39 @@ pub(crate) const TMUX_COMMANDS: &[&str] = &[
     "wait-for (wait)",
 ];
 
+/// Split a `TMUX_COMMANDS` entry into `(canonical_name, alias)`.
+///
+/// Entries are encoded either as `"command-prompt"` (no alias) or as
+/// `"split-window (splitw)"`.  The encoding is owned here, next to the data it
+/// describes, so consumers do not each re-implement the parse.
+pub(crate) fn split_command_entry(entry: &str) -> (&str, Option<&str>) {
+    match entry.split_once(" (") {
+        Some((cmd, alias)) => {
+            let alias = alias.trim_end_matches(')');
+            if alias.is_empty() { (cmd, None) } else { (cmd, Some(alias)) }
+        }
+        None => (entry, None),
+    }
+}
+
+/// Every token the `:` command prompt can complete: canonical command names
+/// plus their aliases, sorted and deduped.
+///
+/// Aliases are offered as first-class candidates because tmux completes both
+/// forms (`status_prompt_complete_list` matches name and alias) and users type
+/// `lsw`/`neww`/`splitw` as often as the long names.
+pub(crate) fn command_name_candidates() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = Vec::with_capacity(TMUX_COMMANDS.len() * 2);
+    for &entry in TMUX_COMMANDS {
+        let (cmd, alias) = split_command_entry(entry);
+        v.push(cmd);
+        if let Some(a) = alias { v.push(a); }
+    }
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue451_status_styles.rs"]
 mod tests_issue451_status_styles;

@@ -25,6 +25,7 @@ mod window_ops;
 mod util;
 mod format;
 mod help;
+mod completion;
 mod server;
 mod preview;
 mod client;

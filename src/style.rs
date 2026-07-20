@@ -234,6 +234,58 @@ pub fn spans_visual_width(spans: &[Span]) -> usize {
     spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum()
 }
 
+/// Take the substring of `s` occupying display columns
+/// `[skip_cols, skip_cols + take_cols)`.
+///
+/// Unlike `truncate_spans_to_width` this windows from both ends, which is what
+/// horizontally scrolling a long command-prompt line needs.  A double-width
+/// character straddling either edge becomes a space, so the result is exactly
+/// `take_cols` wide and no glyph is cut in half.
+pub fn skip_and_take_cols(s: &str, skip_cols: usize, take_cols: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut col = 0usize;
+    let mut taken = 0usize;
+    for ch in s.chars() {
+        if taken >= take_cols {
+            break;
+        }
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cw == 0 {
+            // Combining mark: attach it to whatever we last emitted.
+            if !out.is_empty() {
+                out.push(ch);
+            }
+            continue;
+        }
+        let start = col;
+        col += cw;
+        if col <= skip_cols {
+            continue; // entirely left of the window
+        }
+        if start < skip_cols {
+            // Straddles the left edge: emit blanks for the visible half.
+            let visible = (col - skip_cols).min(take_cols - taken);
+            for _ in 0..visible {
+                out.push(' ');
+            }
+            taken += visible;
+            continue;
+        }
+        if taken + cw > take_cols {
+            // Straddles the right edge: pad out and stop.
+            for _ in 0..(take_cols - taken) {
+                out.push(' ');
+            }
+            taken = take_cols;
+            break;
+        }
+        out.push(ch);
+        taken += cw;
+    }
+    out
+}
+
 /// Truncate a list of styled spans so their total visual width fits within
 /// `max_width` columns.  If the content exceeds `max_width`, spans are
 /// trimmed character by character and a trailing ellipsis is NOT added (to

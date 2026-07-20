@@ -796,6 +796,141 @@ pub fn render_clock_overlay(f: &mut Frame, area: Rect, colour: Color) {
 /// the modal popup overlay, so popups still stack on top. Reuses the popup
 /// run-rendering; borders come from `-B` (mapped to ratatui border types),
 /// `none` draws no border. The focused float gets a highlighted border.
+/// View state for the `:` command prompt, as handed to `render_command_prompt`.
+pub(crate) struct CommandPromptView<'a> {
+    /// Text the user has typed.
+    pub buf: &'a str,
+    /// Cursor as a BYTE offset into `buf`; always on a char boundary.
+    pub cursor: usize,
+    /// Label from `command-prompt -p`; `None` uses the default `:`.
+    pub label: Option<&'a str>,
+    /// Expanded `message-style`; empty falls back to tmux's `bg=yellow,fg=black`.
+    pub message_style: &'a str,
+    /// Expanded `mode-style`, used to highlight the completion list.
+    pub mode_style: &'a str,
+    /// Completion candidates. Empty means the list is closed.
+    pub completions: &'a [String],
+    /// Index of the selected candidate.
+    pub completion_sel: usize,
+}
+
+/// Draw the `:` command prompt on the status line, plus its completion list.
+///
+/// tmux draws this prompt in the status line rather than as a floating box, and
+/// on the LAST status line, so `set -g status 2` keeps the window list visible.
+/// When the status bar is hidden entirely we borrow one row of the content area
+/// rather than changing the layout constraints: `status_lines` feeds
+/// `last_status_lines`, so a layout change would force a client-size re-send and
+/// reflow every pane each time the prompt opens or closes.
+///
+/// `view_off` (horizontal scroll, in display columns) and `completion_scroll`
+/// are in/out state, clamped here against the geometry available this frame.
+///
+/// Returns the screen-absolute cursor position, or `None` if there was no room
+/// to draw. The caller must apply that via the post-draw atomic cursor write —
+/// NOT `Frame::set_cursor_position`, which the post-draw write would override
+/// with the active pane's cursor.
+pub(crate) fn render_command_prompt(
+    f: &mut Frame,
+    content_chunk: Rect,
+    status_chunk: Rect,
+    status_lines: usize,
+    status_at_top: bool,
+    view: &CommandPromptView,
+    view_off: &mut usize,
+    completion_scroll: &mut usize,
+) -> Option<(u16, u16)> {
+    use unicode_width::UnicodeWidthStr;
+    let screen = f.area();
+    let (prompt_row, prompt_x, prompt_w) = if status_lines > 0 && status_chunk.height > 0 {
+        (status_chunk.y + status_chunk.height - 1, status_chunk.x, status_chunk.width)
+    } else if content_chunk.height > 0 {
+        let y = if status_at_top { content_chunk.y } else { content_chunk.y + content_chunk.height - 1 };
+        (y, content_chunk.x, content_chunk.width)
+    } else {
+        return None;
+    };
+
+    let msg_style = crate::rendering::parse_tmux_style(
+        if view.message_style.is_empty() { "bg=yellow,fg=black" } else { view.message_style }
+    );
+    let prefix = view.label.unwrap_or(":");
+    let prefix_w = UnicodeWidthStr::width(prefix);
+    let total_w = prompt_w as usize;
+    let avail = total_w.saturating_sub(prefix_w).max(1);
+    // view.cursor is a BYTE offset and is always on a char boundary (the
+    // prompt's insert/backspace/left/right arms maintain that — issue #345).
+    // Convert it to a display column.
+    let cur_col = UnicodeWidthStr::width(&view.buf[..view.cursor.min(view.buf.len())]);
+    // Sticky horizontal scroll: shift only when the cursor would leave the
+    // window, so the text does not jitter on every keystroke.
+    if cur_col < *view_off {
+        *view_off = cur_col;
+    } else if cur_col >= *view_off + avail {
+        *view_off = cur_col + 1 - avail;
+    }
+    let visible = crate::style::skip_and_take_cols(view.buf, *view_off, avail);
+    let text = format!("{}{}", prefix, visible);
+    let used = UnicodeWidthStr::width(text.as_str());
+    let padded = format!("{}{}", text, " ".repeat(total_w.saturating_sub(used)));
+    let rect = Rect { x: prompt_x, y: prompt_row, width: prompt_w, height: 1 };
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(padded, msg_style))).style(msg_style),
+        rect,
+    );
+    let cx = (prompt_x as usize + prefix_w + cur_col.saturating_sub(*view_off))
+        .min(prompt_x as usize + total_w.saturating_sub(1)) as u16;
+
+    // Completion candidates, opening away from the prompt: below it when the
+    // status bar is at the top, above it otherwise.
+    if !view.completions.is_empty() {
+        let sel_style = crate::rendering::parse_tmux_style(view.mode_style);
+        let widest = view.completions.iter()
+            .map(|s| UnicodeWidthStr::width(s.as_str()))
+            .max().unwrap_or(0);
+        let box_w = ((widest + 4) as u16).clamp(6, screen.width.max(6)).min(screen.width);
+        let avail_h = if status_at_top {
+            (screen.y + screen.height).saturating_sub(prompt_row + 1)
+        } else {
+            prompt_row.saturating_sub(screen.y)
+        };
+        let rows = (view.completions.len() as u16)
+            .min(10)
+            .min(avail_h.saturating_sub(2));
+        if rows > 0 && box_w >= 6 {
+            let box_h = rows + 2;
+            let y = if status_at_top { prompt_row + 1 } else { prompt_row - box_h };
+            let x = prompt_x.min((screen.x + screen.width).saturating_sub(box_w));
+            let oa = Rect { x, y, width: box_w, height: box_h };
+            // Keep the selection inside the visible window.
+            if view.completion_sel < *completion_scroll {
+                *completion_scroll = view.completion_sel;
+            } else if view.completion_sel >= *completion_scroll + rows as usize {
+                *completion_scroll = view.completion_sel + 1 - rows as usize;
+            }
+            let block = Block::default().borders(Borders::ALL).border_style(sel_style);
+            let inner = block.inner(oa);
+            f.render_widget(Clear, oa);
+            f.render_widget(block, oa);
+            let lines: Vec<Line<'static>> = view.completions.iter().enumerate()
+                .skip(*completion_scroll)
+                .take(rows as usize)
+                .map(|(i, c)| {
+                    if i == view.completion_sel {
+                        Line::from(Span::styled(format!(" {} ", c), sel_style))
+                    } else {
+                        Line::from(format!(" {} ", c))
+                    }
+                })
+                .collect();
+            f.render_widget(Paragraph::new(Text::from(lines)), inner);
+        }
+    }
+
+    Some((cx, prompt_row))
+}
+
 pub(crate) fn render_float_overlays(f: &mut Frame, content_chunk: Rect, floats: &[FloatJson]) {
     for fl in floats {
         if fl.w < 2 || fl.h < 2 { continue; }
@@ -1434,6 +1569,16 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
     let mut command_template: Option<String> = None;
     // Custom prompt label from command-prompt -p 'prompt:'
     let mut command_prompt_label: Option<String> = None;
+    // Tab-completion candidates for the command prompt. Non-empty IS the
+    // "list is open" flag — a separate bool could desync from the contents.
+    let mut command_completions: Vec<String> = Vec::new();
+    let mut command_completion_sel: usize = 0;
+    let mut command_completion_scroll: usize = 0;
+    // Byte range in command_buf that an accepted candidate replaces.
+    let mut command_completion_span: (usize, usize) = (0, 0);
+    // Horizontal scroll of the prompt, in display columns. Sticky: it shifts
+    // only when the cursor would leave the visible window.
+    let mut command_view_off: usize = 0;
     // Track active window name from last dump-state for #W expansion
     let mut active_window_name = String::new();
     let mut window_idx_input = false;
@@ -2626,9 +2771,21 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 }
                             }
                         }
+                        else if matches!(key.code, KeyCode::Esc) && command_input && !command_completions.is_empty() {
+                            // Esc dismisses the completion list only — the
+                            // prompt stays open. Must sit ahead of the general
+                            // Esc branch below, which closes the prompt.
+                            command_completions.clear();
+                            command_completion_sel = 0;
+                            command_completion_scroll = 0;
+                        }
                         else if matches!(key.code, KeyCode::Esc) && (command_input || renaming || pane_renaming || tree_chooser || buffer_chooser || session_chooser || confirm_cmd.is_some() || keys_viewer) {
                             command_input = false;
                             command_cursor = 0;
+                            command_completions.clear();
+                            command_completion_sel = 0;
+                            command_completion_scroll = 0;
+                            command_view_off = 0;
                             renaming = false;
                             pane_renaming = false;
                             tree_chooser = false;
@@ -2658,6 +2815,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                             #[cfg(windows)]
                             { ime_was_open = crate::platform::ime_disable(); }
                             prefix_armed = true; prefix_armed_at = Instant::now(); prefix_repeating = false; cmd_batch.push("prefix-begin\n".into());
+                            // This branch bypasses the key match below, where the
+                            // completion list is otherwise dismissed, so drop it
+                            // here too rather than leaving it rendered.
+                            command_completions.clear();
+                            command_completion_sel = 0;
+                            command_completion_scroll = 0;
                         }
                         // NOTE: when the prefix key is pressed while the prefix is
                         // ALREADY armed we deliberately do NOT re-arm here. Falling
@@ -2732,6 +2895,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 } else if cmd == "command-prompt" || cmd.starts_with("command-prompt ") {
                                     command_input = true;
                                     command_cursor = 0;
+                                    command_completions.clear();
+                                    command_completion_sel = 0;
+                                    command_completion_scroll = 0;
+                                    command_view_off = 0;
                                     command_history_idx = command_history.len();
                                     command_template = None;
                                     command_prompt_label = None;
@@ -2864,7 +3031,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 KeyCode::Char('t') => { cmd_batch.push("clock-mode\n".into()); }
                                 KeyCode::Char('=') => { do_choose_buffer = true; }
                                 KeyCode::Char('#') => { cmd_batch.push("list-buffers\n".into()); }
-                                KeyCode::Char(':') => { command_input = true; command_buf.clear(); command_cursor = 0; command_history_idx = command_history.len(); }
+                                KeyCode::Char(':') => { command_input = true; command_buf.clear(); command_cursor = 0; command_history_idx = command_history.len(); command_completions.clear(); command_completion_sel = 0; command_completion_scroll = 0; command_view_off = 0; }
                                 KeyCode::Char('\'') => { window_idx_input = true; window_idx_buf.clear(); }
                                 KeyCode::Char('w') => { do_choose_tree = true; }
                                 KeyCode::Char('s') => { do_choose_session = true; }
@@ -3187,6 +3354,12 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 paste_suppress_until.map_or(false, |t| Instant::now() < t);
                             #[cfg(not(windows))]
                             let paste_burst_active = false;
+                            // Any key that is not explicitly whitelisted below
+                            // closes the command-prompt completion list (tmux:
+                            // "any other key cancels completion"). A whitelist
+                            // at the match boundary beats sprinkling .clear()
+                            // through ~40 arms and missing one.
+                            let mut keep_completions = false;
                             match key.code {
                                 KeyCode::Up if session_chooser => { if session_selected > 0 { session_selected -= 1; } }
                                 KeyCode::Down if session_chooser => { if session_selected + 1 < session_entries.len() { session_selected += 1; } }
@@ -3489,6 +3662,67 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 KeyCode::Char(c) if pane_renaming && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { pane_title_buf.push(c); }
                                 KeyCode::Char(c) if window_idx_input && c.is_ascii_digit() && !paste_burst_active => { window_idx_buf.push(c); }
                                 KeyCode::Char(c) if command_input && !key.modifiers.contains(KeyModifiers::CONTROL) && !paste_burst_active => { command_buf.insert(command_cursor, c); command_cursor += c.len_utf8(); }
+
+                                // ── ':' prompt Tab-completion ───────────────
+                                // These arms MUST precede the unguarded
+                                // KeyCode::Tab / KeyCode::BackTab arms further
+                                // down, which push "send-key tab" and would
+                                // otherwise leak a literal tab into the pane
+                                // underneath the prompt.
+                                //
+                                // A tab arriving mid paste-burst is data, not a
+                                // completion request — same rationale as the
+                                // !paste_burst_active guard on Char above.
+                                KeyCode::Tab if command_input && paste_burst_active => {}
+
+                                // List open: navigate it.
+                                KeyCode::Tab | KeyCode::Down if command_input && !command_completions.is_empty() => {
+                                    command_completion_sel = (command_completion_sel + 1) % command_completions.len();
+                                    keep_completions = true;
+                                }
+                                KeyCode::BackTab | KeyCode::Up if command_input && !command_completions.is_empty() => {
+                                    command_completion_sel = command_completion_sel
+                                        .checked_sub(1)
+                                        .unwrap_or(command_completions.len() - 1);
+                                    keep_completions = true;
+                                }
+                                KeyCode::Enter if command_input && !command_completions.is_empty() => {
+                                    // Accept the selection into the buffer. This
+                                    // does not submit; a second Enter does.
+                                    let span = crate::completion::WordSpan {
+                                        start: command_completion_span.0,
+                                        end: command_completion_span.1,
+                                    };
+                                    let repl = format!("{} ", command_completions[command_completion_sel]);
+                                    let (nb, nc) = crate::completion::apply(&command_buf, &span, &repl);
+                                    command_buf = nb;
+                                    command_cursor = nc;
+                                    // keep_completions stays false → list closes.
+                                }
+
+                                // List closed: compute a completion.
+                                KeyCode::Tab if command_input => {
+                                    let (span, outcome) = crate::completion::complete(&command_buf, command_cursor);
+                                    match outcome {
+                                        crate::completion::CompletionOutcome::NoMatch => {}
+                                        crate::completion::CompletionOutcome::Unique { replacement }
+                                        | crate::completion::CompletionOutcome::Extended { replacement } => {
+                                            let (nb, nc) = crate::completion::apply(&command_buf, &span, &replacement);
+                                            command_buf = nb;
+                                            command_cursor = nc;
+                                        }
+                                        crate::completion::CompletionOutcome::Ambiguous { matches } => {
+                                            command_completions = matches;
+                                            command_completion_sel = 0;
+                                            command_completion_scroll = 0;
+                                            command_completion_span = (span.start, span.end);
+                                            keep_completions = true;
+                                        }
+                                    }
+                                }
+                                // Swallow BackTab in the prompt even with no
+                                // list open, so it never reaches the pane.
+                                KeyCode::BackTab if command_input => {}
                                 KeyCode::Backspace if renaming => { let _ = rename_buf.pop(); }
                                 KeyCode::Backspace if pane_renaming => { let _ = pane_title_buf.pop(); }
                                 KeyCode::Backspace if window_idx_input => { let _ = window_idx_buf.pop(); }
@@ -3609,6 +3843,11 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 KeyCode::Esc if renaming => { renaming = false; session_renaming = false; }
                                 KeyCode::Esc if pane_renaming => { pane_renaming = false; }
                                 KeyCode::Esc if window_idx_input => { window_idx_input = false; }
+                                // Unreachable: Esc is intercepted earlier by the
+                                // `matches!(key.code, KeyCode::Esc) && (command_input || ...)`
+                                // branch of the if/else chain that guards this
+                                // match, so it never reaches here. Kept as-is;
+                                // the live handler is up there.
                                 KeyCode::Esc if command_input => { command_input = false; command_cursor = 0; }
 
                                 // Command prompt: cursor movement, history, and editing keys
@@ -3899,6 +4138,14 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 KeyCode::F(n) => { cmd_batch.push(format!("send-key {}\n", modified_key_name(&format!("F{}", n), key.modifiers))); }
                                 _ => {}
                             }
+                            // Close the completion list unless the arm that just
+                            // ran explicitly asked to keep it (see the
+                            // keep_completions declaration above the match).
+                            if !keep_completions {
+                                command_completions.clear();
+                                command_completion_sel = 0;
+                                command_completion_scroll = 0;
+                            }
                         }
                     }
                     Event::Paste(data) => {
@@ -3912,7 +4159,13 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                             pane_renaming, &mut pane_title_buf,
                             window_idx_input, &mut window_idx_buf,
                         );
-                        if !consumed {
+                        if consumed {
+                            // Pasted text edits the prompt buffer, which
+                            // invalidates any open completion list.
+                            command_completions.clear();
+                            command_completion_sel = 0;
+                            command_completion_scroll = 0;
+                        } else {
                             let encoded = base64_encode(&data);
                             cmd_batch.push(format!("send-paste {}\n", encoded));
                         }
@@ -3981,8 +4234,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                         }
                         match me.kind {
                             MouseEventKind::Down(MouseButton::Left) => {
-                                // Status bar tab click
-                                if me.row == client_status_row {
+                                // Status bar tab click. Skipped while the command
+                                // prompt is open — it occupies the status row, so
+                                // a click there is not a window tab.
+                                if me.row == client_status_row && !command_input {
                                     let mut clicked_tab: Option<usize> = None;
                                     for &(win_idx, x_start, x_end) in &client_tab_positions {
                                         if me.column >= x_start && me.column < x_end {
@@ -4720,6 +4975,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         // which causes rapid cursor flicker during high-frequency
         // output (e.g. opencode streaming).
         let mut post_draw_cursor: Option<(u16, u16)> = None; // pane-local (col, row)
+        // Screen-absolute cursor for the ':' command prompt. Set inside the
+        // draw closure; takes priority over post_draw_cursor below, because the
+        // prompt owns the cursor while it is open.
+        let mut prompt_cursor: Option<(u16, u16)> = None;
         {
             fn active_cursor_info(node: &LayoutJson) -> Option<(bool, u16, u16, bool)> {
                 match node {
@@ -5819,19 +6078,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 let para = Paragraph::new(format!("title: {}", pane_title_buf));
                 f.render_widget(para, overlay.inner(oa));
             }
-            if command_input {
-                let title = command_prompt_label.as_deref().unwrap_or("command");
-                let overlay = Block::default().borders(Borders::ALL).title(title);
-                let oa = centered_rect(60, 3, content_chunk);
-                f.render_widget(Clear, oa);
-                f.render_widget(&overlay, oa);
-                let inner = overlay.inner(oa);
-                let para = Paragraph::new(format!(": {}", command_buf));
-                f.render_widget(para, inner);
-                // Show cursor at the correct position within the prompt
-                let cx = inner.x + 2 + command_cursor as u16; // +2 for ": "
-                f.set_cursor_position((cx, inner.y));
-            }
+            // The ':' command prompt is drawn on the status line, at the very
+            // end of this closure — see the block after the display-panes
+            // overlay below.
             if window_idx_input {
                 let overlay = Block::default().borders(Borders::ALL).title("select window");
                 let oa = centered_rect(50, 3, content_chunk);
@@ -6109,6 +6358,32 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 }
             }
 
+            // ── ':' command prompt, on the status line (tmux parity) ─────
+            // Drawn last so it paints over every other overlay, and so the
+            // status-hidden case can borrow a content row that the menu /
+            // customize / display-panes overlays above would otherwise repaint.
+            if command_input {
+                let view = CommandPromptView {
+                    buf: &command_buf,
+                    cursor: command_cursor,
+                    label: command_prompt_label.as_deref(),
+                    message_style: state.message_style.as_deref().unwrap_or(""),
+                    mode_style: &mode_style_str,
+                    completions: &command_completions,
+                    completion_sel: command_completion_sel,
+                };
+                prompt_cursor = render_command_prompt(
+                    f,
+                    content_chunk,
+                    status_chunk,
+                    status_lines,
+                    status_at_top,
+                    &view,
+                    &mut command_view_off,
+                    &mut command_completion_scroll,
+                );
+            }
+
         })?;
         if client_log_enabled() {
             client_log("draw", &format!("draw OK, render={}us overlays: popup={} confirm={} menu={} display_panes={}",
@@ -6248,7 +6523,11 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 compute_active_rect_json_zoom_aware(&root, content_chunk, client_zoomed)
             };
             // Compute screen-global cursor position from pane-local coords.
-            let cursor_visible = if let (Some((cc, cr)), Some(inner)) = (post_draw_cursor, active_pane_area) {
+            // The ':' prompt wins when open — it already computed a
+            // screen-absolute position inside the draw closure.
+            let cursor_visible = if let Some(pc) = prompt_cursor {
+                Some(pc)
+            } else if let (Some((cc, cr)), Some(inner)) = (post_draw_cursor, active_pane_area) {
                 let cy = inner.y + cr.min(inner.height.saturating_sub(1));
                 let cx = inner.x + cc.min(inner.width.saturating_sub(1));
                 Some((cx, cy))

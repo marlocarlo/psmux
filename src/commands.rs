@@ -2583,6 +2583,10 @@ mod tests_copy_line_numbers_render;
 mod tests_floating_render;
 
 #[cfg(test)]
+#[path = "../tests-rs/test_command_prompt_render.rs"]
+mod tests_command_prompt_render;
+
+#[cfg(test)]
 #[path = "../tests-rs/test_pr207_compat_bugs.rs"]
 mod tests_pr207_compat_bugs;
 

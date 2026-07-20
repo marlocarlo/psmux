@@ -590,11 +590,8 @@ pub(crate) fn is_known_command(app: &AppState, name: &str) -> bool {
         return true;
     }
     crate::server::helpers::TMUX_COMMANDS.iter().any(|entry| {
-        let (cmd, alias) = match entry.split_once(" (") {
-            Some((c, a)) => (c, a.trim_end_matches(')')),
-            None => (*entry, ""),
-        };
-        cmd == name || (!alias.is_empty() && alias == name)
+        let (cmd, alias) = crate::server::helpers::split_command_entry(entry);
+        cmd == name || alias == Some(name)
     })
 }
 
