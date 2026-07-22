@@ -110,6 +110,87 @@ pub(crate) fn json_escape_string(s: &str) -> String {
     out
 }
 
+/// Every status/style format that has to be expanded to build one render frame.
+///
+/// This exists because the DumpState handler and the server auto-push block in
+/// `server/mod.rs` need the identical set of expansions, and for a while they
+/// each had their own copy of the list. One copy was wrapped in an
+/// [`crate::format::AsyncFormatGuard`] and the other was not, so `#()` in the
+/// status bar spawned a process synchronously on the server event loop — the
+/// same thread that delivers keystrokes to ConPTY — on every pane output burst.
+/// With a `cmd /c` helper measured at 88ms and a loop that targets 1ms
+/// iterations while PTY data flows, that alone was seconds of input lag per
+/// second of typing.
+///
+/// The fix is structural: one list, one guard, owned by the function. Adding a
+/// new render path can no longer reintroduce the bug, because there is nothing
+/// left to remember to do.
+pub(crate) struct StatusFormats {
+    pub status_style: String,
+    pub status_left: String,
+    pub status_right: String,
+    pub pane_border_style: String,
+    pub pane_active_border_style: String,
+    pub pane_border_hover_style: String,
+    pub window_status_separator: String,
+    pub window_status_style: String,
+    pub window_status_current_style: String,
+    pub mode_style: String,
+    pub message_style: String,
+    /// Pre-built JSON array for the multi-line status bar.
+    pub status_format_json: String,
+    /// Expanded `set-titles-string`, or `None` when `set-titles` is off. The
+    /// client turns this into an OSC 0 for its host terminal.
+    pub host_title: Option<String>,
+}
+
+/// Expand every per-frame status/style format in one guarded pass.
+///
+/// `status_style` is passed in rather than read from `app` because both callers
+/// hold it in a metadata cache that is only rebuilt on structural change.
+pub(crate) fn expand_status_formats(app: &AppState, status_style: &str) -> StatusFormats {
+    use crate::format::expand_format;
+    // The one guard. Everything below expands #() asynchronously against the
+    // TTL cache instead of blocking the event loop.
+    let _async_fmt = crate::format::AsyncFormatGuard::new();
+    StatusFormats {
+        status_style: expand_format(status_style, app),
+        status_left: expand_format(&app.status_left, app),
+        status_right: expand_format(&app.status_right, app),
+        pane_border_style: expand_format(&app.pane_border_style, app),
+        pane_active_border_style: expand_format(&app.pane_active_border_style, app),
+        pane_border_hover_style: expand_format(&app.pane_border_hover_style, app),
+        window_status_separator: expand_format(&app.window_status_separator, app),
+        window_status_style: expand_format(&app.window_status_style, app),
+        window_status_current_style: expand_format(&app.window_status_current_style, app),
+        mode_style: expand_format(&app.mode_style, app),
+        message_style: expand_format(&app.message_style, app),
+        status_format_json: {
+            let mut sf = String::from("[");
+            for (i, fmt_str) in app.status_format.iter().enumerate() {
+                if i > 0 { sf.push(','); }
+                sf.push('"');
+                sf.push_str(&json_escape_string(&expand_format(fmt_str, app)));
+                sf.push('"');
+            }
+            sf.push(']');
+            sf
+        },
+        // set-titles-string was expanded outside the guard on BOTH paths, so it
+        // blocked even where the rest of the bar did not. It belongs here.
+        host_title: if app.set_titles {
+            let fmt = if app.set_titles_string.is_empty() {
+                "#S:#I:#W"
+            } else {
+                app.set_titles_string.as_str()
+            };
+            Some(expand_format(fmt, app))
+        } else {
+            None
+        },
+    }
+}
+
 /// Inject the status-bar style options that were dropped when the monolithic
 /// `app.rs` renderer was split into the modular client (regression from the
 /// modularization refactor, issue #451). The client only ever received
@@ -120,6 +201,13 @@ pub(crate) fn json_escape_string(s: &str) -> String {
 /// `}`, add fields, re-close), so the giant format-string arg list is untouched.
 pub(crate) fn append_extra_style_json(buf: &mut String, app: &AppState) {
     if !buf.ends_with('}') { return; }
+    // Guard lives HERE, not at the call site. This runs on the per-repaint
+    // render path (both the DumpState handler and the server auto-push block),
+    // so any #() in these style options must expand async or it blocks the one
+    // event loop that also delivers keystrokes. Keeping the guard inside the
+    // function makes that impossible to forget when a new call site appears —
+    // which is exactly how the auto-push path lost it.
+    let _async_fmt = crate::format::AsyncFormatGuard::new();
     buf.pop();
     for (key, raw) in [
         ("status_left_style", &app.status_left_style),
@@ -140,6 +228,10 @@ pub(crate) fn append_extra_style_json(buf: &mut String, app: &AppState) {
 /// Build windows JSON with pre-expanded tab_text for each window.
 /// The tab_text is the fully expanded window-status-format / window-status-current-format.
 pub(crate) fn list_windows_json_with_tabs(app: &AppState) -> io::Result<String> {
+    // Async #() for the same reason as append_extra_style_json above — and this
+    // one expands window-status-format once PER WINDOW, so a synchronous #()
+    // here multiplies by the window count.
+    let _async_fmt = crate::format::AsyncFormatGuard::new();
     let mut v: Vec<WinInfo> = Vec::new();
     for (i, w) in app.windows.iter().enumerate() {
         let is_active = i == app.active_idx;
@@ -661,3 +753,7 @@ pub(crate) const TMUX_COMMANDS: &[&str] = &[
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue451_status_styles.rs"]
 mod tests_issue451_status_styles;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_render_path_async_format.rs"]
+mod tests_render_path_async_format;

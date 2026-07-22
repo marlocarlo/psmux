@@ -246,23 +246,21 @@ pub fn expand_format_for_window(fmt: &str, app: &AppState, win_idx: usize) -> St
     result
 }
 
-/// Expand `#(command)` (tmux compatibility): return the last cached stdout and,
-/// when it is missing or older than the TTL, spawn a background worker to
-/// refresh it. The call never blocks the server loop; the worker's result is
-/// delivered over `format_job_tx` and applied by the drain in the server loop,
-/// which then repaints. Before the first result the expansion is empty.
-///
-/// Cached in `app.format_shell_cache`, keyed by command string, TTL =
-/// `status-interval` seconds (1s floor). A command already in flight is not
-/// re-spawned, so a burst of pushes runs it at most once per TTL. See issue #272.
+// NOTE: this doc block used to sit here, detached, describing `run_shell_command`
+// as if it were unconditionally async — which it is not, and has not been since
+// d981d94. `cargo` flagged it as an unused doc comment and it was left in place;
+// meanwhile it was the only documentation anyone reading this file would find,
+// and it described the wrong half of the function. It now lives on
+// `run_shell_command` itself, covering BOTH branches.
 thread_local! {
     // When true, `#()` expansion is ASYNC (spawn a background worker, return the
     // cached value, apply the result on a later repaint). Default false = SYNC.
     static FORMAT_ASYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// RAII guard that puts `#()` expansion in ASYNC mode for its lifetime. ONLY the
-/// periodic status-bar / dump-state render path should use this: that path runs
+/// RAII guard that puts `#()` expansion in ASYNC mode for its lifetime.
+///
+/// ONLY the periodic status-bar / render path should use this: that path runs
 /// every server-loop tick, so a slow `#(command)` there must never block the
 /// loop (issue #272 / PR #477). Every other caller — one-shot `display-message
 /// -p '#(cmd)'`, hooks, etc. — expands `#()` synchronously so a single expansion
@@ -270,19 +268,58 @@ thread_local! {
 /// async, which silently broke one-shot `#()` (it returned the empty pre-first-
 /// result value and never repainted). This restores tmux-parity: async only for
 /// the status bar, synchronous everywhere else.
-pub struct AsyncFormatGuard(());
+///
+/// DO NOT construct this at a render call site. It is created inside the three
+/// functions that make up the render path —
+/// `server::helpers::expand_status_formats`, `list_windows_json_with_tabs`, and
+/// `append_extra_style_json`. It was previously created at the call sites, and
+/// the server auto-push block was written without it, so `#()` in the status bar
+/// spawned a process synchronously on the event loop that also delivers
+/// keystrokes — on every pane output burst. Keeping construction inside the
+/// functions means a new render path cannot reintroduce that.
+pub struct AsyncFormatGuard(bool);
 impl AsyncFormatGuard {
     pub fn new() -> Self {
-        FORMAT_ASYNC.with(|c| c.set(true));
-        AsyncFormatGuard(())
+        // Save and restore the PREVIOUS value rather than unconditionally
+        // clearing on drop. If two guarded helpers ever nest, a blind
+        // `set(false)` in the inner Drop would silently drop the outer region
+        // back to synchronous — re-creating the exact bug this guard exists to
+        // prevent, but only in the nested case and therefore much harder to
+        // spot. Restoring makes nesting a non-event.
+        let prev = FORMAT_ASYNC.with(|c| c.replace(true));
+        AsyncFormatGuard(prev)
     }
 }
 impl Drop for AsyncFormatGuard {
     fn drop(&mut self) {
-        FORMAT_ASYNC.with(|c| c.set(false));
+        let prev = self.0;
+        FORMAT_ASYNC.with(|c| c.set(prev));
     }
 }
 
+/// Expand `#(command)` (tmux compatibility). Has two modes, selected by the
+/// thread-local [`FORMAT_ASYNC`] flag that [`AsyncFormatGuard`] sets:
+///
+/// - **Sync (the default, no guard active):** run the command inline with
+///   `Command::output()` and return its real stdout. Correct — and required —
+///   for one-shot callers like `display-message -p '#(cmd)'`, which have no
+///   later repaint to pick up an async result. It BLOCKS the calling thread for
+///   as long as the child runs.
+/// - **Async (under an [`AsyncFormatGuard`]):** return the last cached stdout
+///   and, when it is missing or older than the TTL, spawn a background worker to
+///   refresh it. Never blocks; the worker's result is delivered over
+///   `format_job_tx` and applied by the drain in the server loop, which then
+///   repaints. Before the first result the expansion is empty.
+///
+/// The async cache is `app.format_shell_cache`, keyed by command string, TTL =
+/// `status-interval` seconds (1s floor). A command already in flight is not
+/// re-spawned, so a burst of pushes runs it at most once per TTL (issue #272).
+///
+/// The sync branch writes that cache but deliberately does not read it: a
+/// one-shot caller asked for the command's output *now*, and serving it a value
+/// from up to `status-interval` ago would make `#(date)` and friends silently
+/// stale. That asymmetry is why the guard has to be right — anything on the
+/// render path that misses it does not merely lose caching, it blocks the loop.
 fn run_shell_command(cmd: &str, app: &AppState) -> String {
     // Synchronous one-shot expansion (the default): run the command inline and
     // return its real output. A one-shot `display-message -p '#(cmd)'` has no

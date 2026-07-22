@@ -1976,40 +1976,30 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // to bright green). wsf/wscf stay raw: they are per-window
                     // formats the client expands with each window's own context.
                     // #() in these periodic status/style formats expands ASYNC so
-                    // a slow shell helper never blocks the server loop; the guard
-                    // is dropped right after this block so one-shot expansions
-                    // elsewhere (display-message -p) stay synchronous (see format.rs).
-                    let _async_fmt = crate::format::AsyncFormatGuard::new();
-                    let ss_escaped = json_escape_string(&expand_format(&cached_status_style, &app));
-                    let sl_expanded = json_escape_string(&expand_format(&app.status_left, &app));
-                    let sr_expanded = json_escape_string(&expand_format(&app.status_right, &app));
-                    let pbs_escaped = json_escape_string(&expand_format(&app.pane_border_style, &app));
-                    let pabs_escaped = json_escape_string(&expand_format(&app.pane_active_border_style, &app));
-                    let pbhs_escaped = json_escape_string(&expand_format(&app.pane_border_hover_style, &app));
+                    // a slow shell helper never blocks the server loop. The guard
+                    // now lives inside expand_status_formats, so one-shot
+                    // expansions elsewhere (display-message -p) still run
+                    // synchronously (see format.rs) without anything to remember
+                    // here.
+                    let sf = helpers::expand_status_formats(&app, &cached_status_style);
+                    let ss_escaped = json_escape_string(&sf.status_style);
+                    let sl_expanded = json_escape_string(&sf.status_left);
+                    let sr_expanded = json_escape_string(&sf.status_right);
+                    let pbs_escaped = json_escape_string(&sf.pane_border_style);
+                    let pabs_escaped = json_escape_string(&sf.pane_active_border_style);
+                    let pbhs_escaped = json_escape_string(&sf.pane_border_hover_style);
                     let wsf_escaped = json_escape_string(&app.window_status_format);
                     let wscf_escaped = json_escape_string(&app.window_status_current_format);
-                    let wss_escaped = json_escape_string(&expand_format(&app.window_status_separator, &app));
-                    let ws_style_escaped = json_escape_string(&expand_format(&app.window_status_style, &app));
-                    let wsc_style_escaped = json_escape_string(&expand_format(&app.window_status_current_style, &app));
-                    let mode_style_escaped = json_escape_string(&expand_format(&app.mode_style, &app));
+                    let wss_escaped = json_escape_string(&sf.window_status_separator);
+                    let ws_style_escaped = json_escape_string(&sf.window_status_style);
+                    let wsc_style_escaped = json_escape_string(&sf.window_status_current_style);
+                    let mode_style_escaped = json_escape_string(&sf.mode_style);
                     // #372: message-style was never sent to the client (it
                     // hard-coded bg=yellow,fg=black). Send it, format-expanded.
-                    let message_style_escaped = json_escape_string(&expand_format(&app.message_style, &app));
+                    let message_style_escaped = json_escape_string(&sf.message_style);
                     let status_position_escaped = json_escape_string(&app.status_position);
                     let status_justify_escaped = json_escape_string(&app.status_justify);
-                    // Build status_format JSON array for multi-line status bar
-                    let status_format_json = {
-                        let mut sf = String::from("[");
-                        for (i, fmt_str) in app.status_format.iter().enumerate() {
-                            if i > 0 { sf.push(','); }
-                            sf.push('"');
-                            sf.push_str(&json_escape_string(&expand_format(fmt_str, &app)));
-                            sf.push('"');
-                        }
-                        sf.push(']');
-                        sf
-                    };
-                    drop(_async_fmt); // end async-#() region; later expansions run synchronously
+                    let status_format_json = &sf.status_format_json;
                     let cursor_style_code = crate::rendering::configured_cursor_code();
                     let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
                         "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"defaults_suppressed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"bold_is_bright\":{}}}",
@@ -2080,19 +2070,18 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                         helpers::append_copy_ln_json(&app, &mut combined_buf);
                         helpers::append_floats_json(&app, &mut combined_buf);
-                        // set-titles: when on, expand set-titles-string and ship
-                        // it so the client emits OSC 0 to its host terminal.
-                        if app.set_titles && combined_buf.ends_with('}') {
-                            let fmt = if app.set_titles_string.is_empty() {
-                                "#S:#I:#W"
-                            } else {
-                                app.set_titles_string.as_str()
-                            };
-                            let expanded = expand_format(fmt, &app);
-                            combined_buf.pop();
-                            combined_buf.push_str(",\"host_title\":\"");
-                            combined_buf.push_str(&json_escape_string(&expanded));
-                            combined_buf.push_str("\"}");
+                        // set-titles: when on, ship the expanded set-titles-string
+                        // so the client emits OSC 0 to its host terminal.
+                        // Expanded under the async guard in
+                        // expand_status_formats; it used to be expanded here,
+                        // outside it.
+                        if let Some(title) = sf.host_title.as_deref() {
+                            if combined_buf.ends_with('}') {
+                                combined_buf.pop();
+                                combined_buf.push_str(",\"host_title\":\"");
+                                combined_buf.push_str(&json_escape_string(title));
+                                combined_buf.push_str("\"}");
+                            }
                         }
                         // Issue #269: forward OSC 9;4 progress from the active
                         // pane so the client emits the same sequence to the
@@ -5539,34 +5528,28 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             // #372: style options must be format-expanded too (see persistent
             // path above). wsf/wscf stay raw: per-window formats the client
             // expands with each window's own context.
-            let ss_escaped = json_escape_string(&expand_format(&cached_status_style, &app));
-            let sl_expanded = json_escape_string(&expand_format(&app.status_left, &app));
-            let sr_expanded = json_escape_string(&expand_format(&app.status_right, &app));
-            let pbs_escaped = json_escape_string(&expand_format(&app.pane_border_style, &app));
-            let pabs_escaped = json_escape_string(&expand_format(&app.pane_active_border_style, &app));
-            let pbhs_escaped = json_escape_string(&expand_format(&app.pane_border_hover_style, &app));
+            // All of it goes through the one guarded helper — this block used to
+            // carry its own copy of the list WITHOUT the async guard, which is
+            // what made every keystroke wait on a status-bar #() spawn.
+            let sf = helpers::expand_status_formats(&app, &cached_status_style);
+            let ss_escaped = json_escape_string(&sf.status_style);
+            let sl_expanded = json_escape_string(&sf.status_left);
+            let sr_expanded = json_escape_string(&sf.status_right);
+            let pbs_escaped = json_escape_string(&sf.pane_border_style);
+            let pabs_escaped = json_escape_string(&sf.pane_active_border_style);
+            let pbhs_escaped = json_escape_string(&sf.pane_border_hover_style);
             let wsf_escaped = json_escape_string(&app.window_status_format);
             let wscf_escaped = json_escape_string(&app.window_status_current_format);
-            let wss_escaped = json_escape_string(&expand_format(&app.window_status_separator, &app));
-            let ws_style_escaped = json_escape_string(&expand_format(&app.window_status_style, &app));
-            let wsc_style_escaped = json_escape_string(&expand_format(&app.window_status_current_style, &app));
-            let mode_style_escaped = json_escape_string(&expand_format(&app.mode_style, &app));
+            let wss_escaped = json_escape_string(&sf.window_status_separator);
+            let ws_style_escaped = json_escape_string(&sf.window_status_style);
+            let wsc_style_escaped = json_escape_string(&sf.window_status_current_style);
+            let mode_style_escaped = json_escape_string(&sf.mode_style);
             // #372: message-style was never sent to the client (it hard-coded
             // bg=yellow,fg=black). Send it, format-expanded.
-            let message_style_escaped = json_escape_string(&expand_format(&app.message_style, &app));
+            let message_style_escaped = json_escape_string(&sf.message_style);
             let status_position_escaped = json_escape_string(&app.status_position);
             let status_justify_escaped = json_escape_string(&app.status_justify);
-            let status_format_json = {
-                let mut sf = String::from("[");
-                for (i, fmt_str) in app.status_format.iter().enumerate() {
-                    if i > 0 { sf.push(','); }
-                    sf.push('"');
-                    sf.push_str(&json_escape_string(&expand_format(fmt_str, &app)));
-                    sf.push('"');
-                }
-                sf.push(']');
-                sf
-            };
+            let status_format_json = &sf.status_format_json;
             let cursor_style_code = crate::rendering::configured_cursor_code();
             let _ = std::fmt::Write::write_fmt(&mut combined_buf, format_args!(
                 "{{\"layout\":{},\"windows\":{},\"prefix\":\"{}\",\"prefix2\":\"{}\",\"tree\":{},\"base_index\":{},\"pane_base_index\":{},\"prediction_dimming\":{},\"status_style\":\"{}\",\"status_left\":\"{}\",\"status_right\":\"{}\",\"pane_border_style\":\"{}\",\"pane_active_border_style\":\"{}\",\"pane_border_hover_style\":\"{}\",\"wsf\":\"{}\",\"wscf\":\"{}\",\"wss\":\"{}\",\"ws_style\":\"{}\",\"wsc_style\":\"{}\",\"clock_mode\":{},\"bindings\":{},\"status_left_length\":{},\"status_right_length\":{},\"status_lines\":{},\"status_format\":{},\"mode_style\":\"{}\",\"message_style\":\"{}\",\"status_position\":\"{}\",\"status_justify\":\"{}\",\"cursor_style_code\":{},\"status_visible\":{},\"repeat_time\":{},\"zoomed\":{},\"pwsh_mouse_selection\":{},\"mouse_selection\":{},\"paste_detection\":{},\"choose_tree_preview\":{},\"scroll_enter_copy_mode\":{},\"bold_is_bright\":{}}}",
@@ -5625,19 +5608,17 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 }
                 helpers::append_copy_ln_json(&app, &mut combined_buf);
                 helpers::append_floats_json(&app, &mut combined_buf);
-                // set-titles: when on, expand set-titles-string and ship
-                // it so the client emits OSC 0 to its host terminal.
-                if app.set_titles && combined_buf.ends_with('}') {
-                    let fmt = if app.set_titles_string.is_empty() {
-                        "#S:#I:#W"
-                    } else {
-                        app.set_titles_string.as_str()
-                    };
-                    let expanded = expand_format(fmt, &app);
-                    combined_buf.pop();
-                    combined_buf.push_str(",\"host_title\":\"");
-                    combined_buf.push_str(&json_escape_string(&expanded));
-                    combined_buf.push_str("\"}");
+                // set-titles: when on, ship the expanded set-titles-string so the
+                // client emits OSC 0 to its host terminal. Expanded up in
+                // expand_status_formats, under the async guard — it used to be
+                // expanded right here, outside it.
+                if let Some(title) = sf.host_title.as_deref() {
+                    if combined_buf.ends_with('}') {
+                        combined_buf.pop();
+                        combined_buf.push_str(",\"host_title\":\"");
+                        combined_buf.push_str(&json_escape_string(title));
+                        combined_buf.push_str("\"}");
+                    }
                 }
                 // Issue #269: forward OSC 9;4 progress from the active pane.
                 if combined_buf.ends_with('}') {
