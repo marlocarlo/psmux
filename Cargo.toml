@@ -104,7 +104,7 @@ serde_json = "1.0"
 regex = "1"
 glob = "0.3"
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 
 [profile.release]
 opt-level = 3
