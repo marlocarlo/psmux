@@ -1,4 +1,4 @@
-use crate::types::{AppState, ControlNotification, Node, LayoutKind, Window};
+use crate::types::{AppState, ControlClient, ControlNotification, ControlOutput, Node, LayoutKind, Window};
 use ratatui::layout::Rect;
 
 /// Compute tmux's 16-bit rotating checksum over the layout body.
@@ -173,15 +173,19 @@ pub fn emit_notification(app: &AppState, notif: ControlNotification) {
                 continue;
             }
         }
-        let _ = client.notification_tx.try_send(notif.clone());
+        try_send_notification(client, notif.clone());
     }
 }
 
 /// Send a notification to a single control client by id (no-op if unknown).
 pub fn emit_to_client(app: &AppState, client_id: u64, notif: ControlNotification) {
     if let Some(client) = app.control_clients.get(&client_id) {
-        let _ = client.notification_tx.try_send(notif);
+        try_send_notification(client, notif);
     }
+}
+
+pub fn try_send_notification(client: &ControlClient, notif: ControlNotification) {
+    let _ = client.output_tx.try_send(ControlOutput::Notification(notif));
 }
 
 /// Emit the initial state burst to a freshly-attached control mode client.
@@ -388,7 +392,7 @@ mod tests {
             client_id: 1,
             cmd_counter: 0,
             echo_enabled: true,
-            notification_tx: tx,
+            output_tx: tx,
             paused_panes: std::collections::HashSet::new(),
             subscriptions: std::collections::HashMap::new(),
             subscription_values: std::collections::HashMap::new(),
@@ -410,7 +414,7 @@ mod tests {
             client_id: 1,
             cmd_counter: 0,
             echo_enabled: false,
-            notification_tx: tx,
+            output_tx: tx,
             paused_panes: std::collections::HashSet::new(),
             subscriptions: std::collections::HashMap::new(),
             subscription_values: std::collections::HashMap::new(),
@@ -423,7 +427,10 @@ mod tests {
         });
         emit_notification(&app, ControlNotification::WindowAdd { window_id: 5 });
         let notif = rx.try_recv().unwrap();
-        assert!(matches!(notif, ControlNotification::WindowAdd { window_id: 5 }));
+        assert!(matches!(
+            notif,
+            ControlOutput::Notification(ControlNotification::WindowAdd { window_id: 5 })
+        ));
     }
 
     #[test]
@@ -436,7 +443,7 @@ mod tests {
             client_id: 1,
             cmd_counter: 0,
             echo_enabled: false,
-            notification_tx: tx,
+            output_tx: tx,
             paused_panes: paused,
             subscriptions: std::collections::HashMap::new(),
             subscription_values: std::collections::HashMap::new(),

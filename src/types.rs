@@ -70,12 +70,18 @@ pub enum ControlNotification {
     Message { text: String },
 }
 
+#[derive(Debug)]
+pub enum ControlOutput {
+    Notification(ControlNotification),
+    CommandBlock(String),
+}
+
 /// Per-connection control mode client state.
 pub struct ControlClient {
     pub client_id: u64,
     pub cmd_counter: u64,
     pub echo_enabled: bool,
-    pub notification_tx: mpsc::SyncSender<ControlNotification>,
+    pub output_tx: mpsc::SyncSender<ControlOutput>,
     pub paused_panes: HashSet<usize>,
     /// `refresh-client -B name:what:format` subscriptions.
     /// Key = subscription name, Value = (target, format_string).
@@ -1780,7 +1786,7 @@ pub enum CtrlReq {
     ControlRegister {
         client_id: u64,
         echo: bool,
-        notif_tx: mpsc::SyncSender<ControlNotification>,
+        output_tx: mpsc::SyncSender<ControlOutput>,
     },
     /// Deregister a control mode client.
     ControlDeregister {

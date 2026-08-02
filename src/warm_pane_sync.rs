@@ -32,9 +32,15 @@
 //! `apply` honours `app.warm_enabled`: if warm panes are disabled,
 //! `Respawn` degrades to a kill with no respawn.
 
-use crate::types::AppState;
+use std::io;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
-/// Decision returned by the `for_*` helpers.  Apply via [`apply`].
+use crate::types::{AppState, WarmPane};
+
+/// Decision returned by the `for_*` helpers. Apply it with [`apply`] during
+/// startup or [`apply_runtime`] once the server loop is running.
+#[derive(Debug)]
 pub enum WarmPaneSync {
     Noop,
     Patch(WarmPanePatch),
@@ -42,7 +48,7 @@ pub enum WarmPaneSync {
 }
 
 /// In-place mutations safe to perform on a running warm pane.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum WarmPanePatch {
     /// Resize the vt100 parser's scrollback cap.  Trims oldest rows
     /// if shrinking.  See `vt100::Screen::set_scrollback_len`.
@@ -77,6 +83,11 @@ pub fn for_option_change(name: &str, app: &AppState) -> WarmPaneSync {
 
         // The shell binary itself differs — must respawn.
         "default-shell" => WarmPaneSync::Respawn("default-shell changed"),
+
+        // These options change how the child is constructed, or whether a
+        // spare should exist at all.
+        "env-shim" => WarmPaneSync::Respawn("env-shim changed"),
+        "warm" => WarmPaneSync::Respawn("warm setting changed"),
 
         // We send a different PSReadLine init script depending on this
         // option (PSRL_FIX vs PSRL_CRASH_GUARD).  The script runs once
@@ -116,8 +127,16 @@ pub fn for_env_change() -> WarmPaneSync {
 pub fn for_resize(app: &AppState, new_rows: u16, new_cols: u16) -> WarmPaneSync {
     match app.warm_pane.as_ref() {
         Some(wp) if wp.rows == new_rows && wp.cols == new_cols => WarmPaneSync::Noop,
-        _ => WarmPaneSync::Respawn("client resized"),
+        Some(_) => WarmPaneSync::Respawn("client resized"),
+        None if app.client_area.height == new_rows && app.client_area.width == new_cols => {
+            WarmPaneSync::Noop
+        }
+        None => WarmPaneSync::Respawn("client resized"),
     }
+}
+
+pub fn for_config_reload() -> WarmPaneSync {
+    WarmPaneSync::Respawn("configuration reloaded")
 }
 
 /// After the user's config has been parsed at server boot, the
@@ -175,8 +194,8 @@ pub fn for_post_config(app: &AppState) -> WarmPaneSync {
     WarmPaneSync::Noop
 }
 
-/// The single mutation point for `app.warm_pane`.  Every other call
-/// site outside of pre-warm boot and consume paths goes through here.
+/// Synchronous startup reconciliation. Runtime call sites must use
+/// [`apply_runtime`] so ConPTY creation never blocks the server loop.
 pub fn apply(
     app: &mut AppState,
     pty_system: &dyn portable_pty::PtySystem,
@@ -186,6 +205,159 @@ pub fn apply(
         WarmPaneSync::Noop => {}
         WarmPaneSync::Patch(patch) => apply_patch(app, patch),
         WarmPaneSync::Respawn(_reason) => respawn(app, pty_system),
+    }
+}
+
+struct SpawnCompletion {
+    generation: u64,
+    result: io::Result<WarmPane>,
+}
+
+/// Owns the one permitted runtime warm-pane worker. A generation number
+/// rejects results built from stale size/config snapshots, while backoff
+/// prevents a broken PTY environment from spawning in a tight loop.
+pub struct WarmPaneSpawner {
+    generation: u64,
+    in_flight: bool,
+    completion_tx: mpsc::Sender<SpawnCompletion>,
+    completion_rx: mpsc::Receiver<SpawnCompletion>,
+    consecutive_failures: u32,
+    retry_not_before: Option<Instant>,
+}
+
+impl WarmPaneSpawner {
+    pub fn new() -> Self {
+        let (completion_tx, completion_rx) = mpsc::channel();
+        Self {
+            generation: 0,
+            in_flight: false,
+            completion_tx,
+            completion_rx,
+            consecutive_failures: 0,
+            retry_not_before: None,
+        }
+    }
+
+    pub fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.retry_not_before = None;
+    }
+
+    pub fn poll(&mut self, app: &mut AppState) {
+        while let Ok(mut completion) = self.completion_rx.try_recv() {
+            self.in_flight = false;
+            let current = completion.generation == self.generation
+                && app.warm_enabled
+                && app.warm_pane.is_none();
+            if !current {
+                if let Ok(ref mut pane) = completion.result {
+                    pane.child.kill().ok();
+                }
+                continue;
+            }
+            match completion.result {
+                Ok(pane) => {
+                    app.warm_pane = Some(pane);
+                    self.consecutive_failures = 0;
+                    self.retry_not_before = None;
+                }
+                Err(_) => self.record_failure(),
+            }
+        }
+    }
+
+    pub fn ensure(&mut self, app: &mut AppState) {
+        if !app.warm_enabled || app.warm_pane.is_some() || self.in_flight {
+            return;
+        }
+        if self.retry_not_before.is_some_and(|deadline| Instant::now() < deadline) {
+            return;
+        }
+        let spec = match crate::pane::prepare_warm_pane_spawn(app) {
+            Ok(spec) => spec,
+            Err(_) => {
+                self.record_failure();
+                return;
+            }
+        };
+        let generation = self.generation;
+        let completion_tx = self.completion_tx.clone();
+        self.in_flight = true;
+        std::thread::spawn(move || {
+            #[cfg(debug_assertions)]
+            if let Ok(delay) = std::env::var("PSMUX_TEST_WARM_PANE_DELAY_MS") {
+                if let Ok(delay) = delay.parse::<u64>() {
+                    if let Ok(path) =
+                        std::env::var("PSMUX_TEST_WARM_PANE_DELAY_STARTED_FILE")
+                    {
+                        std::fs::write(path, b"started").ok();
+                    }
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let pty_system = portable_pty::native_pty_system();
+                crate::pane::spawn_warm_pane_from_spec(&*pty_system, spec)
+            }))
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "warm pane worker panicked",
+                ))
+            });
+            let completion = SpawnCompletion { generation, result };
+            if let Err(mpsc::SendError(mut completion)) = completion_tx.send(completion) {
+                if let Ok(ref mut pane) = completion.result {
+                    pane.child.kill().ok();
+                }
+            }
+        });
+    }
+
+    fn record_failure(&mut self) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let delay = retry_delay(self.consecutive_failures);
+        self.retry_not_before = Some(Instant::now() + delay);
+    }
+}
+
+impl Default for WarmPaneSpawner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn retry_delay(consecutive_failures: u32) -> Duration {
+    match consecutive_failures {
+        0 | 1 => Duration::from_millis(100),
+        2 => Duration::from_millis(500),
+        3 => Duration::from_secs(2),
+        _ => Duration::from_secs(5),
+    }
+}
+
+/// Apply runtime policy without performing PTY creation on the caller.
+pub fn apply_runtime(
+    app: &mut AppState,
+    spawner: &mut WarmPaneSpawner,
+    sync: WarmPaneSync,
+) {
+    match sync {
+        WarmPaneSync::Noop => {}
+        WarmPaneSync::Patch(patch) => {
+            apply_patch(app, patch);
+            if app.warm_pane.is_none() {
+                spawner.invalidate();
+                spawner.ensure(app);
+            }
+        }
+        WarmPaneSync::Respawn(_reason) => {
+            if let Some(mut old) = app.warm_pane.take() {
+                old.child.kill().ok();
+            }
+            spawner.invalidate();
+            spawner.ensure(app);
+        }
     }
 }
 
