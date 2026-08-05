@@ -165,10 +165,16 @@ pub fn remove_session_id_file(port_file_base: &str) {
 /// process anchor.
 pub fn write_session_pid_file(port_file_base: &str, pid: u32) {
     let pid_path = crate::paths::pid_file(port_file_base);
-    // `pid:creation_filetime` — same body as ensure_session_registry_files, so a
-    // freshly renamed session is force-kill-identifiable before the next re-ensure.
+    write_pid_anchor(&std::path::Path::new(&pid_path), pid);
+}
+
+/// Write `pid` (with its process creation time) into the `.pid` anchor at
+/// `pid_path`. Body is `pid:creation_filetime` — same as
+/// `ensure_session_registry_files`, so a freshly renamed session is
+/// force-kill-identifiable before the next re-ensure.
+fn write_pid_anchor(pid_path: &std::path::Path, pid: u32) {
     let creation = crate::platform::process_kill::process_creation_time(pid).unwrap_or(0);
-    let _ = std::fs::write(&pid_path, format_pid_file_contents(pid, creation));
+    let _ = std::fs::write(pid_path, format_pid_file_contents(pid, creation));
 }
 
 /// Remove the `.pid` file for a session.
@@ -1188,6 +1194,62 @@ fn cleanup_stale_port_files_in_with<F>(psmux_dir: &Path, mut probe: F)
 where
     F: FnMut(&str, u16) -> PortProbeResult,
 {
+    cleanup_stale_port_files_in_with_full(
+        psmux_dir,
+        &mut pid_anchor_verdict,
+        &mut probe,
+        &mut listener_pid_for_port,
+    );
+}
+
+/// Outcome of the stale-port sweep for one registry entry, given the `.pid`
+/// anchor verdict and the network probe result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CleanupDecision {
+    /// The entry belongs to a live server (anchor says live, or the probe
+    /// authenticated the port). Nothing to clean.
+    Keep,
+    /// The probe proved the port is served by a live psmux server while the
+    /// anchor said dead: repair the `.pid` in place rather than reap.
+    RepairAnchor,
+    /// The strongest available signal (anchor alive OR probe stale) says the
+    /// server is gone.
+    Reap,
+}
+
+/// Liveness decision for one registry entry. The `.pid` anchor is only a
+/// process-table guess: a live server can read as "dead" when the client
+/// cannot open its process (elevated/service spawns), when its image was
+/// renamed, when its PID was recycled, or when the `.pid` file itself is
+/// stale (a hard-killed server's leftover anchor that the replacement server
+/// has not rewritten yet). A dead anchor is therefore never proof of death on
+/// its own — only a stale network verdict (refused/timeout/rejected AUTH) may
+/// reap. An anchor that said dead but whose port authenticates gets repaired
+/// instead.
+fn decide_registry_fate(anchor: Option<bool>, probe: PortProbeResult) -> CleanupDecision {
+    match anchor {
+        Some(true) => CleanupDecision::Keep,
+        Some(false) => match probe {
+            PortProbeResult::Stale => CleanupDecision::Reap,
+            PortProbeResult::Alive => CleanupDecision::RepairAnchor,
+            PortProbeResult::Inconclusive => CleanupDecision::Keep,
+        },
+        None => match probe {
+            PortProbeResult::Stale => CleanupDecision::Reap,
+            PortProbeResult::Alive | PortProbeResult::Inconclusive => CleanupDecision::Keep,
+        },
+    }
+}
+
+/// Core of [`cleanup_stale_port_files_in_with`] with the liveness oracles
+/// injected so tests can drive every verdict deterministically on any
+/// platform (the real `pid_anchor_verdict` is Windows-only).
+fn cleanup_stale_port_files_in_with_full(
+    psmux_dir: &Path,
+    anchor: &mut dyn FnMut(&Path) -> Option<bool>,
+    probe: &mut dyn FnMut(&str, u16) -> PortProbeResult,
+    listener_pid: &mut dyn FnMut(u16) -> Option<u32>,
+) {
     let boot = system_boot_time();
     if let Ok(entries) = std::fs::read_dir(psmux_dir) {
         for entry in entries.flatten() {
@@ -1210,36 +1272,54 @@ where
                         }
                     }
                 }
-                // PID-anchor fast path (issue #448 sentinel): the process table
-                // answers liveness instantly and definitively, so registry
-                // entries with a `.pid` sibling never pay a network probe.
-                // Dead-port probes are not just slow (they can burn the full
-                // connect timeout per attempt on Windows loopback) - they are
-                // also inconclusive, so stale files were never reaped and the
-                // probe tax repeated on every subsequent CLI invocation.
-                match pid_anchor_verdict(&path) {
-                    Some(true) => continue, // live server; nothing to clean
-                    Some(false) => {
-                        if crate::debug_log::session_log_enabled() {
-                            crate::debug_log::session_log("cleanup", &format!(
-                                "reaping '{}': recorded server PID is dead or recycled",
-                                registry_base(&path)));
-                        }
-                        remove_session_registry_files(&path);
-                        continue;
-                    }
-                    None => {} // no .pid anchor; fall through to the network probe
+                // PID-anchor fast path (issue #448 sentinel): a LIVE anchor
+                // answers keep instantly and microsecond-cheap, so registry
+                // entries with a live `.pid` sibling never pay a network
+                // probe. Dead-port probes are not just slow (they can burn
+                // the full connect timeout per attempt on Windows loopback)
+                // - they are also inconclusive, so stale files were never
+                // reaped and the probe tax repeated on every subsequent CLI
+                // invocation.
+                //
+                // A DEAD anchor, however, is only a process-table guess and
+                // must not be trusted as proof of death: it can misread a
+                // live server (unopenable elevated/service-spawned process,
+                // renamed image, recycled PID) or be a leftover from a
+                // previous killed incarnation. Dead-anchor entries therefore
+                // escalate to the network probe; only the probe's verdict may
+                // reap. A probe that authenticates the port repairs the stale
+                // anchor in place instead of deleting the registry.
+                let verdict = anchor(&path);
+                if verdict == Some(true) {
+                    continue; // live server; nothing to clean
                 }
                 if let Ok(port_str) = std::fs::read_to_string(&path) {
                     if let Ok(port) = port_str.trim().parse::<u16>() {
                         let key = read_key_for_port_path(&path);
-                        if probe(&key, port) == PortProbeResult::Stale {
-                            if crate::debug_log::session_log_enabled() {
-                                crate::debug_log::session_log("cleanup", &format!(
-                                    "reaping '{}' (port {}): no psmux server authenticated as ours (stale)",
-                                    registry_base(&path), port));
+                        let result = probe(&key, port);
+                        match decide_registry_fate(verdict, result) {
+                            CleanupDecision::Keep => {}
+                            CleanupDecision::Reap => {
+                                if crate::debug_log::session_log_enabled() {
+                                    crate::debug_log::session_log("cleanup", &format!(
+                                        "reaping '{}' (port {}): recorded server PID is dead or recycled and the probe confirms no psmux server authenticated as ours",
+                                        registry_base(&path), port));
+                                }
+                                remove_session_registry_files(&path);
                             }
-                            remove_session_registry_files(&path);
+                            CleanupDecision::RepairAnchor => {
+                                if let Some(pid) = listener_pid(port) {
+                                    repair_stale_pid_anchor(&path, port, pid);
+                                } else if crate::debug_log::session_log_enabled() {
+                                    // Could not resolve the listener PID (port
+                                    // table unavailable or race); leave the
+                                    // stale anchor — the server's 5s registry
+                                    // self-heal rewrites it.
+                                    crate::debug_log::session_log("cleanup", &format!(
+                                        "kept '{}' (port {}): recorded server PID was dead or recycled but the probe shows a live psmux server; waiting for its .pid self-heal",
+                                        registry_base(&path), port));
+                                }
+                            }
                         }
                     } else {
                         if crate::debug_log::session_log_enabled() {
@@ -1258,6 +1338,51 @@ where
 /// Display name (file stem) of a registry path, for logging.
 fn registry_base(port_path: &Path) -> &str {
     port_path.file_stem().and_then(|s| s.to_str()).unwrap_or("?")
+}
+
+/// Resolve the PID currently listening on loopback `port`, when the OS can
+/// say. Used to repair a stale `.pid` anchor after a network probe proved a
+/// live psmux server owns the port. Windows-only: elsewhere the port table is
+/// unavailable and the server's own registry self-heal repairs the anchor.
+pub fn listener_pid_for_port(port: u16) -> Option<u32> {
+    crate::platform::process_kill::loopback_listener_pids()
+        .into_iter()
+        .find(|(_, p)| *p == port)
+        .map(|(pid, _)| pid)
+}
+
+/// Best-effort repair of a stale `.pid` anchor: resolve the PID listening on
+/// `port` (the caller's AUTH round-trip already proved the listener is a live
+/// psmux server) and rewrite the anchor to name it.
+///
+/// Returns false when the listener PID cannot be resolved; the server's 5s
+/// registry self-heal rewrites the anchor then, so a false return is safe.
+pub fn repair_session_pid_anchor(port_file_base: &str, port: u16) -> bool {
+    let Some(pid) = listener_pid_for_port(port) else {
+        return false;
+    };
+    let pid_path = crate::paths::pid_file(port_file_base);
+    write_pid_anchor(&std::path::Path::new(&pid_path), pid);
+    if crate::debug_log::session_log_enabled() {
+        crate::debug_log::session_log("cleanup", &format!(
+            "repaired '{}' .pid anchor: recorded server PID was dead or recycled but port {} is served by a live psmux server (pid {})",
+            port_file_base, port, pid));
+    }
+    true
+}
+
+/// Rewrite the `.pid` anchor next to `port_path` to name `pid`, which the
+/// caller's AUTH round-trip proved is the live psmux server for that port.
+/// Writes next to the `.port` file (the same directory-relative convention as
+/// [`remove_session_registry_files`]) so the sweep never touches the profile
+/// dir it does not own.
+fn repair_stale_pid_anchor(port_path: &Path, port: u16, pid: u32) {
+    write_pid_anchor(&port_path.with_extension("pid"), pid);
+    if crate::debug_log::session_log_enabled() {
+        crate::debug_log::session_log("cleanup", &format!(
+            "repaired '{}' .pid anchor: recorded server PID was dead or recycled but port {} is served by a live psmux server (pid {})",
+            registry_base(port_path), port, pid));
+    }
 }
 
 /// Remove a session's entire registry set, given its `.port` path.

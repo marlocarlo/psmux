@@ -620,14 +620,21 @@ fn run_main() -> io::Result<()> {
                                     // PID-anchor fast path: a dead entry would
                                     // otherwise cost a full TCP connect timeout
                                     // here (dead loopback ports can time out
-                                    // rather than refuse on Windows). Reap it
-                                    // and move on without touching the network.
-                                    if crate::session::registry_pid_anchor_alive(base) == Some(false) {
-                                        crate::session::remove_session_registry(base);
-                                        continue;
-                                    }
+                                    // rather than refuse on Windows). But a dead
+                                    // anchor is a process-table guess, never
+                                    // proof of death: it can misread a live
+                                    // server (elevated/service spawn the client
+                                    // cannot open, renamed image, recycled PID)
+                                    // or be a leftover of a previously killed
+                                    // server that the replacement has not
+                                    // re-anchored yet. Only an ACTIVELY REFUSED
+                                    // connect below may reap; a session whose
+                                    // dead-looking anchor answers AUTH gets its
+                                    // .pid repaired instead.
+                                    let anchor_said_dead =
+                                        crate::session::registry_pid_anchor_alive(base) == Some(false);
                                     if let Ok(port_str) = std::fs::read_to_string(e.path()) {
-                                        if let Ok(_p) = port_str.trim().parse::<u16>() {
+                                        if let Ok(port) = port_str.trim().parse::<u16>() {
                                             let addr = format!("127.0.0.1:{}", port_str.trim());
                                             let conn = std::net::TcpStream::connect_timeout(
                                                 &addr.parse().unwrap(),
@@ -717,6 +724,14 @@ fn run_main() -> io::Result<()> {
                                                         if !passes { continue; }
                                                     }
                                                     println!("{}", display_name); 
+                                                }
+                                                // The session answered AUTH despite a
+                                                // dead-looking anchor: the anchor was a
+                                                // false negative. Re-anchor it so the
+                                                // next listing is fast again and no
+                                                // sweep can misjudge this live server.
+                                                if anchor_said_dead {
+                                                    crate::session::repair_session_pid_anchor(base, port);
                                                 }
                                             } else if refused {
                                                 // Actively refused → truly dead. Remove the WHOLE
