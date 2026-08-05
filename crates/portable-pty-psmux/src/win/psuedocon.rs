@@ -178,6 +178,14 @@ fn supports_passthrough_mode() -> bool {
 /// always starts on a fresh screen, so inheriting the host cursor row buys
 /// nothing here.
 fn base_flags() -> DWORD {
+    // `PSMUX_NO_WIN32_INPUT=1` drops PSEUDOCONSOLE_WIN32_INPUT_MODE — a
+    // diagnostic escape hatch for conhost builds that crash around it.
+    if std::env::var("PSMUX_NO_WIN32_INPUT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return PSEUDOCONSOLE_RESIZE_QUIRK;
+    }
     PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_WIN32_INPUT_MODE
 }
 
