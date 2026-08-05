@@ -25,6 +25,13 @@
 // files. The fix escalates dead-anchor verdicts to the AUTH network probe and
 // reaps only when the probe confirms; a probe that authenticates the port
 // repairs the stale .pid anchor in place instead.
+//
+// Timeout rule: only an ACTIVELY refused connect proves no listener exists.
+// A probe timeout is never proof of death — the server's single-threaded
+// FIFO can be saturated (concurrent snapshot/capture) so the AUTH round-trip
+// times out on every attempt while the server is alive (field case:
+// refused=false, timed_out=true reaped a live server). Every timed-out probe
+// classifies Inconclusive and keeps the registry.
 
 use super::*;
 
@@ -124,8 +131,11 @@ fn dead_pid_anchor_with_alive_probe_and_no_listener_pid_is_kept() {
     let _ = fs::remove_dir_all(dir.parent().unwrap());
 }
 
-/// (b) Dead .pid + refused probe: the probe confirms the server is really
-/// gone, so the whole registry is reaped as before.
+/// (b) Dead .pid + refused probe: the probe ACTIVELY refused on every
+/// attempt (no listener), confirming the server is really gone, so the whole
+/// registry is reaped as before. `Stale` is only produced by an active
+/// refusal now — a timed-out probe classifies Inconclusive instead (see
+/// busy_server_timeout_probe_with_dead_anchor_is_kept).
 #[test]
 fn dead_pid_anchor_with_stale_probe_reaps_registry() {
     let dir = temp_psmux_dir("anchor_dead_probe_stale");
@@ -177,6 +187,77 @@ fn dead_pid_anchor_with_inconclusive_probe_is_kept() {
     assert!(key_path.exists(), "inconclusive probe must not remove .key");
     assert!(sid_path.exists(), "inconclusive probe must not remove .sid");
     let _ = fs::remove_dir_all(dir.parent().unwrap());
+}
+
+/// (d) The field regression: a busy-but-alive server (single-threaded FIFO
+/// saturated by concurrent snapshot/capture commands) times out the AUTH
+/// round-trip on every probe attempt while a stale-looking PID anchor
+/// escalates. Every attempt times out -> the probe must classify
+/// Inconclusive and the sweep must keep the whole registry. Only an active
+/// refusal may reap.
+#[test]
+fn busy_server_timeout_probe_with_dead_anchor_is_kept() {
+    let dir = temp_psmux_dir("busy_server_timeout");
+    // A listener that completes the TCP handshake but never answers the AUTH
+    // line: the stand-in for a live server whose event loop is saturated.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (port_path, key_path, sid_path) = write_registry(&dir, "vibex__tmex", &port.to_string());
+    fs::write(dir.join("vibex__tmex.pid"), STALE_ANCHOR).unwrap();
+
+    // The REAL probe function, not an injected verdict.
+    sweep_with(&dir, |_| Some(false), probe_session_for_cleanup, |_| None);
+
+    assert!(port_path.exists(), "a busy server's registry must survive a timed-out probe");
+    assert!(key_path.exists(), "matching .key must survive");
+    assert!(sid_path.exists(), "matching .sid must survive");
+    assert!(dir.join("vibex__tmex.pid").exists(), "the anchor must survive too");
+    let _ = fs::remove_dir_all(dir.parent().unwrap());
+}
+
+/// Every probe attempt timed out and nothing refused: the exact field
+/// signature (`refused=false, timed_out=true`) that used to reap a live,
+/// busy server. A timeout proves nothing about the listener, so it must
+/// classify Inconclusive.
+#[test]
+fn probe_verdict_timeout_alone_is_inconclusive() {
+    assert_eq!(
+        classify_probe_verdict(54321, false, true, false),
+        PortProbeResult::Inconclusive
+    );
+}
+
+/// An active refusal on every attempt with no other signal is the only
+/// probe-side proof of death.
+#[test]
+fn probe_verdict_refused_alone_is_stale() {
+    assert_eq!(
+        classify_probe_verdict(54321, true, false, false),
+        PortProbeResult::Stale
+    );
+}
+
+/// A single timeout poisons staleness even when other attempts refused: "no
+/// listener" was never actually proven, and the server may simply be busy.
+#[test]
+fn probe_verdict_refused_with_timeout_is_inconclusive() {
+    assert_eq!(
+        classify_probe_verdict(54321, true, true, false),
+        PortProbeResult::Inconclusive
+    );
+}
+
+/// Any response byte (however unparseable) keeps the conservative verdict.
+#[test]
+fn probe_verdict_any_inconclusive_signal_is_inconclusive() {
+    assert_eq!(
+        classify_probe_verdict(54321, false, false, true),
+        PortProbeResult::Inconclusive
+    );
+    assert_eq!(
+        classify_probe_verdict(54321, true, true, true),
+        PortProbeResult::Inconclusive
+    );
 }
 
 /// The live-PID fast path stays probe-free: only dead-anchor verdicts are

@@ -2849,6 +2849,44 @@ pub mod process_info {
         }
     }
 
+    /// Whether a process with the given PID exists in the system process
+    /// table.
+    ///
+    /// Unlike [`get_process_name`], this enumerates the toolhelp snapshot
+    /// without opening the target process, so it sees elevated,
+    /// service-spawned, and otherwise protected processes that a
+    /// lower-privilege caller cannot `OpenProcess`. Use it to tell "the PID
+    /// is gone" (dead) from "the PID exists but its image cannot be read"
+    /// (alive but unopenable — must never be declared dead).
+    ///
+    /// A snapshot failure (rare) conservatively reports the process as
+    /// present so callers escalate to the network probe instead of trusting
+    /// a broken query as proof of death.
+    pub fn process_exists(pid: u32) -> bool {
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == 0 || snap == INVALID_HANDLE {
+                return true;
+            }
+            let mut pe: PROCESSENTRY32W = std::mem::zeroed();
+            pe.dw_size = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let mut found = false;
+            if Process32FirstW(snap, &mut pe) != 0 {
+                loop {
+                    if pe.th32_process_id == pid {
+                        found = true;
+                        break;
+                    }
+                    if Process32NextW(snap, &mut pe) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snap);
+            found
+        }
+    }
+
     /// Get the current working directory of a process by PID.
     /// Reads the PEB → ProcessParameters → CurrentDirectory from the target process.
     pub fn get_process_cwd(pid: u32) -> Option<String> {
@@ -3352,6 +3390,7 @@ pub mod process_info {
 #[cfg(not(windows))]
 pub mod process_info {
     pub fn get_process_name(_pid: u32) -> Option<String> { None }
+    pub fn process_exists(_pid: u32) -> bool { false }
     pub fn get_process_cwd(_pid: u32) -> Option<String> { None }
     pub fn get_foreground_process_name(_pid: u32) -> Option<String> { None }
     pub fn get_foreground_cwd(_pid: u32) -> Option<String> { None }

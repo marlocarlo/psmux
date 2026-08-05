@@ -1009,13 +1009,20 @@ fn run_main() -> io::Result<()> {
                 let mut server_pid: Option<u32> = None;
                 if std::path::Path::new(&port_path).exists() {
                     // Verify server is actually running
+                    // Only an actively refused connect proves the server is
+                    // gone; a timeout means busy-but-alive and must not be
+                    // treated as dead (same rule as probe_session_for_cleanup).
                     let server_alive = if let Ok(port_str) = std::fs::read_to_string(&port_path) {
                         if let Ok(port) = port_str.trim().parse::<u16>() {
                             let addr = format!("127.0.0.1:{}", port);
-                            std::net::TcpStream::connect_timeout(
+                            match std::net::TcpStream::connect_timeout(
                                 &addr.parse().unwrap(),
                                 Duration::from_millis(100)
-                            ).is_ok()
+                            ) {
+                                Ok(_) => true,
+                                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => false,
+                                Err(_) => true,
+                            }
                         } else { false }
                     } else { false };
                     
@@ -3947,13 +3954,21 @@ fn run_main() -> io::Result<()> {
         // empty-scrollback server on every single bare/control-mode connection,
         // silently orphaning the running session. Mirrors the liveness check the
         // explicit `new-session` command path already performs above.
+        // Only an actively refused connect proves the session is dead; a
+        // timeout means a busy-but-alive server, which must keep its registry
+        // and skip the warm-claim/clobber path (same rule as the cleanup
+        // probe).
         let server_already_alive = std::fs::read_to_string(&port_path)
             .ok()
             .and_then(|s| s.trim().parse::<u16>().ok())
-            .map(|p| std::net::TcpStream::connect_timeout(
-                &format!("127.0.0.1:{}", p).parse().unwrap(),
-                Duration::from_millis(100),
-            ).is_ok())
+            .map(|p| {
+                let addr: std::net::SocketAddr = format!("127.0.0.1:{}", p).parse().unwrap();
+                match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+                    Ok(_) => true,
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => false,
+                    Err(_) => true,
+                }
+            })
             .unwrap_or(false);
 
         // Try warm server claim first (fast path)

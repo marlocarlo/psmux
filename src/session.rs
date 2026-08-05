@@ -1106,28 +1106,63 @@ const PID_REUSE_MARGIN_TICKS: u64 = 60 * 10_000_000; // 60s in 100ns ticks
 /// Returns:
 ///   Some(true)  - recorded PID is a live psmux-image process created no later
 ///                 than the `.pid` file was written -> genuinely our server.
-///   Some(false) - PID gone, recycled by a non-psmux image, or recycled by a
-///                 psmux process created long after the file -> server is dead.
-///   None        - no usable `.pid` anchor (pre-#448 registry) -> caller must
-///                 fall back to the network probe.
+///   Some(false) - PID absent from the process table, recycled by a non-psmux
+///                 image, or recycled by a psmux process created long after
+///                 the file -> server is dead.
+///   None        - no usable `.pid` anchor (pre-#448 registry) OR the process
+///                 exists but its image cannot be read (elevated/service
+///                 spawn at a different elevation/session) -> caller must
+///                 fall back to the network probe. A process that exists but
+///                 cannot be opened is NOT dead; declaring it dead is a false
+///                 negative that would reap a live server.
 fn pid_anchor_verdict(port_path: &Path) -> Option<bool> {
     // The process-table queries below are Windows-only; other platforms fall
     // back to the network probe rather than misreading stub returns as "dead".
     if !cfg!(windows) {
         return None;
     }
+    let base = registry_base(port_path);
+    let log_verdict = |reason: &str| {
+        if crate::debug_log::session_log_enabled() {
+            crate::debug_log::session_log("anchor", &format!("'{}': {}", base, reason));
+        }
+    };
     let pid_path = port_path.with_extension("pid");
     // Tolerate both `pid` and `pid:creation_filetime` bodies (the latter written
     // so kill-server can verify identity); the anchor only needs the pid.
-    let (pid, _creation) = parse_pid_file_contents(&std::fs::read_to_string(&pid_path).ok()?)?;
+    let (pid, _creation) = match parse_pid_file_contents(&std::fs::read_to_string(&pid_path).ok()?) {
+        Some(v) => v,
+        None => {
+            log_verdict("no usable .pid anchor -> network probe");
+            return None;
+        }
+    };
     let name = match crate::platform::process_info::get_process_name(pid) {
-        // No such process (a same-user psmux server is always openable with
-        // QUERY_LIMITED_INFORMATION, so an unopenable PID is not our server).
-        None => return Some(false),
+        // An unreadable PID is only "dead" when the process table no longer
+        // contains it. `get_process_name` also returns None when the process
+        // handle cannot be opened at all — a live elevated/service-spawned
+        // server that a lower-elevation CLI cannot open (field case: the
+        // sweep ran from a different elevation/session). Declaring that dead
+        // is the false negative that sent a live server's registry to the
+        // reaper; escalate it to the network probe as "alive-unknown"
+        // instead.
+        None => {
+            if crate::platform::process_info::process_exists(pid) {
+                log_verdict(&format!(
+                    "pid {}: process exists but its image cannot be read (elevated or other session?) -> alive-unknown, network probe",
+                    pid));
+                return None;
+            }
+            log_verdict(&format!("pid {}: no such process -> dead", pid));
+            return Some(false);
+        }
         Some(n) => n.to_ascii_lowercase(),
     };
     if !PSMUX_SERVER_IMAGE_NAMES.contains(&name.as_str()) {
         // PID recycled by an unrelated application; our server is gone.
+        log_verdict(&format!(
+            "pid {}: process is '{}', not a psmux server -> dead (recycled PID)",
+            pid, name));
         return Some(false);
     }
     // PID-reuse guard (same idea as the #447 reaper guard): a psmux process
@@ -1140,10 +1175,14 @@ fn pid_anchor_verdict(port_path: &Path) -> Option<bool> {
             .and_then(system_time_to_filetime_ticks)
         {
             if created_ft > mtime_ft.saturating_add(PID_REUSE_MARGIN_TICKS) {
+                log_verdict(&format!(
+                    "pid {}: process created after the .pid file was written -> dead (recycled PID)",
+                    pid));
                 return Some(false);
             }
         }
     }
+    log_verdict(&format!("pid {}: live psmux server -> keep (probe skipped)", pid));
     Some(true)
 }
 
@@ -1223,9 +1262,10 @@ enum CleanupDecision {
 /// renamed, when its PID was recycled, or when the `.pid` file itself is
 /// stale (a hard-killed server's leftover anchor that the replacement server
 /// has not rewritten yet). A dead anchor is therefore never proof of death on
-/// its own — only a stale network verdict (refused/timeout/rejected AUTH) may
-/// reap. An anchor that said dead but whose port authenticates gets repaired
-/// instead.
+/// its own — only a stale network verdict (actively refused connect, or a
+/// rejected AUTH by a port-reusing server) may reap; probe timeouts classify
+/// Inconclusive because a busy-but-alive server times out too. An anchor that
+/// said dead but whose port authenticates gets repaired instead.
 fn decide_registry_fate(anchor: Option<bool>, probe: PortProbeResult) -> CleanupDecision {
     match anchor {
         Some(true) => CleanupDecision::Keep,
@@ -1459,31 +1499,27 @@ fn probe_auth_identity(addr: std::net::SocketAddr, key: &str) -> Result<AuthProb
 /// that grabbed the same port after a crash or reboot — that false "alive"
 /// is exactly what left dead sessions showing `(not responding)` in the
 /// picker. This probe instead requires the AUTH key to match:
-///   - connection refused (or a full timeout with zero response) on every
-///     attempt                                    -> `Stale`
-///   - server accepts our key (`OK`)              -> `Alive`
+///   - connection ACTIVELY refused on every attempt -> `Stale`
+///   - server accepts our key (`OK`)                -> `Alive`
 ///   - server rejects our key (`ERROR`, reused port) -> `Stale`
-///   - anything ambiguous (no reply, slow, foreign process) -> `Inconclusive`
+///   - anything ambiguous (timeout, no reply, foreign process) -> `Inconclusive`
 ///
 /// Only definitive signals delete a file; ambiguous ones are left for the
 /// boot-time guard, so a live-but-busy server is never reaped by mistake.
 ///
-/// Issue #7 batch D: some environments (confirmed on this host via a raw
-/// `TcpClient.BeginConnect`/`WaitOne` probe against several unbound loopback
-/// ports) never return an immediate ECONNREFUSED for a closed loopback
-/// port — the SYN is silently dropped and the connect attempt runs the full
-/// `STALE_PORT_CONNECT_TIMEOUT` before giving up, surfacing as
-/// `ErrorKind::TimedOut` rather than `ConnectionRefused`. The original code
-/// treated any `TimedOut` as ambiguous ("maybe a live-but-slow server"),
-/// which on such a host means the network probe can NEVER return `Stale` —
-/// orphaned `.port`/`.key` files with no `.pid` anchor (the only registry
-/// shape old enough to still reach this probe) are kept forever. A real
-/// live server on loopback completes the AUTH handshake in well under a
-/// millisecond; three full timeouts in a row with no byte of response ever
-/// received is just as definitive a "nothing is there" signal as an
-/// instant refusal, so treat it the same — but ONLY when every attempt saw
-/// refused/timed-out and nothing else (any actual response, however
-/// unparseable, still keeps the conservative `Inconclusive` verdict).
+/// Timeouts are deliberately NOT proof of death. The server's control loop
+/// is a single-threaded FIFO: a burst of commands (e.g. concurrent
+/// snapshot/capture work) can saturate it so the AUTH round-trip times out
+/// on every attempt while the server is plainly alive — the field case where
+/// `refused=false, timed_out=true` reaped a live server whose `.pid` had
+/// just been re-asserted at startup. Some Windows environments also surface
+/// a closed loopback port as a silent connect-timeout rather than
+/// `ConnectionRefused`; both ambiguities resolve to `Inconclusive`, matching
+/// `probe_session_alive`'s conservatism ("a busy server must never be
+/// wrongly declared dead"). The cost of keeping a stale file is one probe on
+/// the next invocation; the cost of reaping a live server is a broken
+/// session. Only an active `ConnectionRefused` proves that no process is
+/// listening.
 fn probe_session_for_cleanup(key: &str, port: u16) -> PortProbeResult {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let mut saw_refused = false;
@@ -1517,17 +1553,36 @@ fn probe_session_for_cleanup(key: &str, port: u16) -> PortProbeResult {
         }
     }
 
-    if (saw_refused || saw_timed_out) && !saw_inconclusive {
+    classify_probe_verdict(port, saw_refused, saw_timed_out, saw_inconclusive)
+}
+
+/// Terminal verdict of the probe after all attempts, from what the attempts
+/// saw.
+///
+/// Only an ACTIVE `ConnectionRefused` — proof that no process is listening —
+/// may classify the port `Stale`. A `TimedOut` never counts toward staleness
+/// and in fact forces `Inconclusive`: the server's control loop is a
+/// single-threaded FIFO, and a burst of commands can saturate it so the AUTH
+/// round-trip times out on every attempt while the server is alive (field
+/// case: `refused=false, timed_out=true` reaped a live server). A timeout is
+/// therefore indistinguishable from "busy-but-alive" and must be kept.
+fn classify_probe_verdict(
+    port: u16,
+    saw_refused: bool,
+    saw_timed_out: bool,
+    saw_inconclusive: bool,
+) -> PortProbeResult {
+    if saw_refused && !saw_timed_out && !saw_inconclusive {
         if crate::debug_log::session_log_enabled() {
             crate::debug_log::session_log("probe", &format!(
-                "port {}: refused/timed-out on every attempt (refused={}, timed_out={}) -> stale",
-                port, saw_refused, saw_timed_out));
+                "port {}: actively refused on every attempt -> stale", port));
         }
         PortProbeResult::Stale
     } else {
         if crate::debug_log::session_log_enabled() {
             crate::debug_log::session_log("probe",
-                &format!("port {}: no definitive answer -> inconclusive (kept)", port));
+                &format!("port {}: no definitive answer (refused={}, timed_out={}, inconclusive={}) -> inconclusive (kept)",
+                    port, saw_refused, saw_timed_out, saw_inconclusive));
         }
         PortProbeResult::Inconclusive
     }
@@ -1926,7 +1981,9 @@ pub fn classify_sessions_parallel(
 /// PID-anchor liveness for the session registered under `base`, for
 /// enumeration paths (e.g. CLI `list-sessions`) that would otherwise pay a
 /// TCP connect timeout per dead entry. Some(false) = definitively dead
-/// (reap + skip), Some(true) = live, None = no anchor (probe as usual).
+/// (reap + skip), Some(true) = live, None = no usable anchor or an
+/// unopenable (elevated/other-session) process, which is not proof of death
+/// (probe as usual).
 pub fn registry_pid_anchor_alive(base: &str) -> Option<bool> {
     let port_path = crate::paths::port_file_opt(base)?;
     pid_anchor_verdict(Path::new(&port_path))
