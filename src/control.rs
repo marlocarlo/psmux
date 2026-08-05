@@ -165,7 +165,8 @@ pub fn format_error(timestamp: i64, cmd_number: u64) -> String {
 }
 
 /// Emit a control notification to all connected control mode clients.
-/// Non-blocking: if a client's channel is full, the notification is dropped for that client.
+/// Non-blocking: a slow client sheds `%output` frames past a backlog
+/// threshold, but structural notifications are always queued.
 pub fn emit_notification(app: &AppState, notif: ControlNotification) {
     for client in app.control_clients.values() {
         if let ControlNotification::Output { pane_id, .. } = &notif {
@@ -184,8 +185,38 @@ pub fn emit_to_client(app: &AppState, client_id: u64, notif: ControlNotification
     }
 }
 
+/// Backlog level past which pane output frames are shed for a slow client.
+/// Dropped frames are harmless: any client resynchronizes the screen with
+/// capture-pane, exactly as after tmux pauses a pane.
+pub const OUTPUT_BACKLOG_SOFT_MAX: usize = 4 * 1024 * 1024;
+/// Backlog level past which everything is shed; a reader this far behind is
+/// effectively gone and only the TCP connection teardown will reap it.
+pub const OUTPUT_BACKLOG_HARD_MAX: usize = 64 * 1024 * 1024;
+
+/// Approximate wire cost of one queued control output, used for backlog
+/// accounting. Must be applied symmetrically by the enqueue and the writer.
+pub fn output_cost(output: &ControlOutput) -> usize {
+    match output {
+        ControlOutput::Notification(ControlNotification::Output { data, .. }) => data.len() + 32,
+        ControlOutput::Notification(ControlNotification::ExtendedOutput { data, .. }) => data.len() + 48,
+        ControlOutput::Notification(_) => 128,
+        ControlOutput::CommandBlock(block) => block.len(),
+    }
+}
+
 pub fn try_send_notification(client: &ControlClient, notif: ControlNotification) {
-    let _ = client.output_tx.try_send(ControlOutput::Notification(notif));
+    use std::sync::atomic::Ordering;
+    let backlog = client.backlog.load(Ordering::Relaxed);
+    let droppable = matches!(
+        notif,
+        ControlNotification::Output { .. } | ControlNotification::ExtendedOutput { .. }
+    );
+    if backlog >= OUTPUT_BACKLOG_HARD_MAX || (droppable && backlog >= OUTPUT_BACKLOG_SOFT_MAX) {
+        return;
+    }
+    let output = ControlOutput::Notification(notif);
+    client.backlog.fetch_add(output_cost(&output), Ordering::Relaxed);
+    let _ = client.output_tx.send(output);
 }
 
 /// Emit the initial state burst to a freshly-attached control mode client.
@@ -387,12 +418,13 @@ mod tests {
     #[test]
     fn test_has_control_clients_with_client() {
         let mut app = AppState::new("test".to_string());
-        let (tx, _rx) = std::sync::mpsc::sync_channel(16);
+        let (tx, _rx) = std::sync::mpsc::channel();
         app.control_clients.insert(1, crate::types::ControlClient {
             client_id: 1,
             cmd_counter: 0,
             echo_enabled: true,
             output_tx: tx,
+            backlog: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             paused_panes: std::collections::HashSet::new(),
             subscriptions: std::collections::HashMap::new(),
             subscription_values: std::collections::HashMap::new(),
@@ -409,12 +441,13 @@ mod tests {
     #[test]
     fn test_emit_notification_to_clients() {
         let mut app = AppState::new("test".to_string());
-        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let (tx, rx) = std::sync::mpsc::channel();
         app.control_clients.insert(1, crate::types::ControlClient {
             client_id: 1,
             cmd_counter: 0,
             echo_enabled: false,
             output_tx: tx,
+            backlog: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             paused_panes: std::collections::HashSet::new(),
             subscriptions: std::collections::HashMap::new(),
             subscription_values: std::collections::HashMap::new(),
@@ -436,7 +469,7 @@ mod tests {
     #[test]
     fn test_emit_notification_skips_paused_pane() {
         let mut app = AppState::new("test".to_string());
-        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut paused = std::collections::HashSet::new();
         paused.insert(3usize);
         app.control_clients.insert(1, crate::types::ControlClient {
@@ -444,6 +477,7 @@ mod tests {
             cmd_counter: 0,
             echo_enabled: false,
             output_tx: tx,
+            backlog: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             paused_panes: paused,
             subscriptions: std::collections::HashMap::new(),
             subscription_values: std::collections::HashMap::new(),

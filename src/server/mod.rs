@@ -5429,12 +5429,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         state_dirty = true;
                     }
                 }
-                CtrlReq::ControlRegister { client_id, echo, output_tx } => {
+                CtrlReq::ControlRegister { client_id, echo, output_tx, backlog } => {
                     app.control_clients.insert(client_id, crate::types::ControlClient {
                         client_id,
                         cmd_counter: 0,
                         echo_enabled: echo,
                         output_tx,
+                        backlog,
                         paused_panes: std::collections::HashSet::new(),
                         subscriptions: std::collections::HashMap::new(),
                         subscription_values: std::collections::HashMap::new(),

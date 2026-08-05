@@ -32,7 +32,6 @@ fn auth_debug(msg: &str) {
 use crate::commands::parse_command_line;
 use super::helpers::TMUX_COMMANDS;
 
-const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, PartialEq)]
 enum ControlCommandResponse {
@@ -597,13 +596,18 @@ if control_echo || control_noecho {
             Err(_) => return,
         },
     };
-    let _ = write_stream.set_write_timeout(Some(CONTROL_WRITE_TIMEOUT));
+    // No write timeout here: a slow control reader must be buffered, not
+    // disconnected (tmux keeps an unbounded evbuffer per control client).
+    // Backpressure is handled by backlog accounting — %output frames are
+    // shed past a threshold while structural notifications always queue —
+    // and a dead peer surfaces as a hard write error via TCP reset.
     let _connection_guard = ControlConnectionGuard {
         client_id: ctrl_client_id,
         request_tx: tx.clone(),
     };
 
-    let (output_tx, output_rx) = std::sync::mpsc::sync_channel::<ControlOutput>(4096);
+    let (output_tx, output_rx) = std::sync::mpsc::channel::<ControlOutput>();
+    let output_backlog = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // For -CC (no-echo) mode, emit the DCS opening sequence "\033P1000p"
     // before anything else. Real tmux writes exactly 7 bytes with NO
@@ -638,10 +642,14 @@ if control_echo || control_noecho {
     }
 
     crate::types::register_persistent_stream(ctrl_client_id, &write_stream);
+    let writer_backlog = output_backlog.clone();
     std::thread::spawn(move || {
         let _writer_guard = writer_guard;
         while let Ok(output) = output_rx.recv() {
-            match write_control_output(&mut write_stream, output) {
+            let cost = crate::control::output_cost(&output);
+            let result = write_control_output(&mut write_stream, output);
+            writer_backlog.fetch_sub(cost, std::sync::atomic::Ordering::Relaxed);
+            match result {
                 Ok(false) => {}
                 Ok(true) | Err(_) => return,
             }
@@ -657,6 +665,7 @@ if control_echo || control_noecho {
         client_id: ctrl_client_id,
         echo: control_echo,
         output_tx: output_tx.clone(),
+        backlog: output_backlog.clone(),
     }).is_err() {
         return;
     }
@@ -728,7 +737,9 @@ if control_echo || control_noecho {
                 cmd_counter,
                 Some(Ok(ControlCommandResponse::empty())),
             );
-            if output_tx.send(ControlOutput::CommandBlock(block)).is_err() {
+            let block_output = ControlOutput::CommandBlock(block);
+            output_backlog.fetch_add(crate::control::output_cost(&block_output), std::sync::atomic::Ordering::Relaxed);
+            if output_tx.send(block_output).is_err() {
                 break;
             }
             continue;
@@ -853,7 +864,9 @@ if control_echo || control_noecho {
             cmd_counter,
             response_result,
         );
-        if output_tx.send(ControlOutput::CommandBlock(block)).is_err() {
+        let block_output = ControlOutput::CommandBlock(block);
+        output_backlog.fetch_add(crate::control::output_cost(&block_output), std::sync::atomic::Ordering::Relaxed);
+        if output_tx.send(block_output).is_err() {
             break;
         }
     }

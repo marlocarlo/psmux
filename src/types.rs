@@ -81,7 +81,12 @@ pub struct ControlClient {
     pub client_id: u64,
     pub cmd_counter: u64,
     pub echo_enabled: bool,
-    pub output_tx: mpsc::SyncSender<ControlOutput>,
+    pub output_tx: mpsc::Sender<ControlOutput>,
+    /// Bytes queued for this client but not yet written to its socket.
+    /// Used to shed `%output` frames for slow readers instead of letting
+    /// the queue grow without bound (tmux buffers slow control clients
+    /// rather than disconnecting them; capture-pane heals dropped frames).
+    pub backlog: Arc<std::sync::atomic::AtomicUsize>,
     pub paused_panes: HashSet<usize>,
     /// `refresh-client -B name:what:format` subscriptions.
     /// Key = subscription name, Value = (target, format_string).
@@ -1786,7 +1791,8 @@ pub enum CtrlReq {
     ControlRegister {
         client_id: u64,
         echo: bool,
-        output_tx: mpsc::SyncSender<ControlOutput>,
+        output_tx: mpsc::Sender<ControlOutput>,
+        backlog: Arc<std::sync::atomic::AtomicUsize>,
     },
     /// Deregister a control mode client.
     ControlDeregister {
