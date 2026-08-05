@@ -1262,25 +1262,30 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 );
                                 continue;
                             }
-                            // Send as extended-output with age
+                            // Send as extended-output with age. Chunked so a
+                            // large drain never becomes one oversized line.
                             let age_ms = age.as_millis() as u64;
-                            crate::control::try_send_notification(
-                                client,
-                                crate::types::ControlNotification::ExtendedOutput {
-                                    pane_id: *pane_id,
-                                    age_ms,
-                                    data: data.clone(),
-                                },
-                            );
+                            for chunk in crate::control::chunk_output(data) {
+                                crate::control::try_send_notification(
+                                    client,
+                                    crate::types::ControlNotification::ExtendedOutput {
+                                        pane_id: *pane_id,
+                                        age_ms,
+                                        data: chunk.to_string(),
+                                    },
+                                );
+                            }
                         } else {
-                            // No pause-after: send normal %output
-                            crate::control::try_send_notification(
-                                client,
-                                crate::types::ControlNotification::Output {
-                                    pane_id: *pane_id,
-                                    data: data.clone(),
-                                },
-                            );
+                            // No pause-after: send normal %output, chunked
+                            for chunk in crate::control::chunk_output(data) {
+                                crate::control::try_send_notification(
+                                    client,
+                                    crate::types::ControlNotification::Output {
+                                        pane_id: *pane_id,
+                                        data: chunk.to_string(),
+                                    },
+                                );
+                            }
                         }
                     }
                 }

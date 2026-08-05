@@ -219,6 +219,38 @@ pub fn try_send_notification(client: &ControlClient, notif: ControlNotification)
     let _ = client.output_tx.send(output);
 }
 
+/// Maximum raw payload carried by a single %output / %extended-output line.
+/// tmux emits one notification per PTY read (bounded by its event-buffer read
+/// size), so clients never face a single multi-hundred-KB line. Splitting on
+/// UTF-8 boundaries keeps each chunk independently escapable.
+pub const OUTPUT_CHUNK_MAX: usize = 4096;
+
+/// Split pane output into chunks of at most `OUTPUT_CHUNK_MAX` bytes without
+/// cutting through a UTF-8 sequence.
+pub fn chunk_output(data: &str) -> impl Iterator<Item = &str> {
+    let mut rest = data;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        if rest.len() <= OUTPUT_CHUNK_MAX {
+            let chunk = rest;
+            rest = "";
+            return Some(chunk);
+        }
+        let mut split = OUTPUT_CHUNK_MAX;
+        while split > 0 && !rest.is_char_boundary(split) {
+            split -= 1;
+        }
+        if split == 0 {
+            split = rest.len();
+        }
+        let (chunk, tail) = rest.split_at(split);
+        rest = tail;
+        Some(chunk)
+    })
+}
+
 /// Emit the initial state burst to a freshly-attached control mode client.
 /// This mirrors what real tmux sends right after `-CC attach` so that
 /// integrations like iTerm2's tmux mode can bootstrap their UI without
@@ -279,6 +311,35 @@ mod tests {
     #[test]
     fn test_escape_output_printable() {
         assert_eq!(escape_output("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_chunk_output_short_passthrough() {
+        let chunks: Vec<&str> = chunk_output("hello").collect();
+        assert_eq!(chunks, vec!["hello"]);
+        assert_eq!(chunk_output("").count(), 0);
+    }
+
+    #[test]
+    fn test_chunk_output_splits_large_payload() {
+        let data = "x".repeat(OUTPUT_CHUNK_MAX * 2 + 100);
+        let chunks: Vec<&str> = chunk_output(&data).collect();
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|c| c.len() <= OUTPUT_CHUNK_MAX));
+        assert_eq!(chunks.concat(), data);
+    }
+
+    #[test]
+    fn test_chunk_output_never_splits_utf8_sequence() {
+        // Fill so a 3-byte CJK glyph straddles the chunk boundary.
+        let mut data = "a".repeat(OUTPUT_CHUNK_MAX - 1);
+        data.push_str("终端输出");
+        let chunks: Vec<&str> = chunk_output(&data).collect();
+        assert!(chunks.len() >= 2);
+        assert_eq!(chunks.concat(), data);
+        for chunk in &chunks {
+            assert!(std::str::from_utf8(chunk.as_bytes()).is_ok());
+        }
     }
 
     #[test]
