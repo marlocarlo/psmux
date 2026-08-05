@@ -45,13 +45,56 @@ shared_library!(ConPtyFuncs,
 );
 
 fn load_conpty() -> ConPtyFuncs {
-    // Always use the system kernel32.dll ConPTY implementation.
-    // Do NOT try to sideload conpty.dll — terminal emulators like WezTerm
-    // bundle their own conpty.dll + OpenConsole.exe, and the DLL search order
-    // can pick those up when psmux runs inside such a terminal.  Using a
-    // foreign conpty.dll causes blank panes and broken I/O because the
-    // bundled OpenConsole.exe may not be compatible with our ConPTY flags
-    // (PASSTHROUGH_MODE, WIN32_INPUT_MODE, etc.).
+    // Sideloading rules:
+    //
+    // - Never resolve "conpty.dll" through the default DLL search order:
+    //   terminal emulators like WezTerm bundle their own conpty.dll +
+    //   OpenConsole.exe and the search order can pick those up when psmux
+    //   runs inside such a terminal, yielding blank panes / broken I/O with
+    //   our flag set (PASSTHROUGH_MODE, WIN32_INPUT_MODE, etc.).
+    //
+    // - Absolute paths we control are fine, and are the standard way
+    //   (Windows Terminal / VS Code / WezTerm all ship their own conpty) to
+    //   escape bugs in the in-box conhost.exe, which only updates with the
+    //   OS.  Precedence:
+    //     1. PSMUX_CONPTY_DLL=<absolute path> (diagnostic override)
+    //     2. conpty.dll next to the psmux executable, only when the matching
+    //        OpenConsole.exe is present beside it (conpty.dll spawns
+    //        OpenConsole.exe from its own directory)
+    //     3. the system kernel32.dll implementation
+    if let Ok(path) = std::env::var("PSMUX_CONPTY_DLL") {
+        if !path.is_empty() {
+            match ConPtyFuncs::open(Path::new(&path)) {
+                Ok(funcs) => {
+                    log::info!("using ConPTY implementation from {path}");
+                    return funcs;
+                }
+                Err(err) => {
+                    log::warn!("PSMUX_CONPTY_DLL={path} failed to load ({err:?}), falling back");
+                }
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let dll = dir.join("conpty.dll");
+            let open_console = dir.join("OpenConsole.exe");
+            if dll.is_file() && open_console.is_file() {
+                match ConPtyFuncs::open(&dll) {
+                    Ok(funcs) => {
+                        log::info!("using bundled ConPTY implementation from {}", dll.display());
+                        return funcs;
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "bundled {} failed to load ({err:?}), falling back to kernel32",
+                            dll.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
     ConPtyFuncs::open(Path::new("kernel32.dll")).expect(
         "this system does not support conpty.  Windows 10 October 2018 or newer is required",
     )
