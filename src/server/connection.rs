@@ -1162,22 +1162,34 @@ match cmd {
         } else {
             let _ = tx.send(CtrlReq::CapturePane(rtx));
         }
-        if let Ok(mut text) = rrx.recv() {
-            if join_lines {
-                // Remove trailing whitespace from each line (join wrapped lines)
-                text = text.lines().map(|l| l.trim_end()).collect::<Vec<_>>().join("\n");
-            }
-            if print_stdout {
-                // Write text directly — it already ends with \n from capture
-                if persistent {
-                    let _ = tx.send(CtrlReq::ShowTextPopup("capture-pane".to_string(), text));
-                } else {
-                    let _ = write_stream.write_all(text.as_bytes());
-                    let _ = write_stream.flush();
+        // Bounded wait, mirroring the control-mode capture path: if the server
+        // loop is wedged the client must fail with an error instead of
+        // blocking forever on the response channel.
+        match rrx.recv_timeout(Duration::from_secs(5)) {
+            Ok(mut text) => {
+                if join_lines {
+                    // Remove trailing whitespace from each line (join wrapped lines)
+                    text = text.lines().map(|l| l.trim_end()).collect::<Vec<_>>().join("\n");
                 }
-                if !persistent { break; }
-            } else {
-                let _ = tx.send(CtrlReq::SetBuffer(text));
+                if print_stdout {
+                    // Write text directly — it already ends with \n from capture
+                    if persistent {
+                        let _ = tx.send(CtrlReq::ShowTextPopup("capture-pane".to_string(), text));
+                    } else {
+                        let _ = write_stream.write_all(text.as_bytes());
+                        let _ = write_stream.flush();
+                    }
+                    if !persistent { break; }
+                } else {
+                    let _ = tx.send(CtrlReq::SetBuffer(text));
+                }
+            }
+            Err(_) => {
+                if !persistent {
+                    let _ = writeln!(write_stream, "ERROR: capture-pane timed out");
+                    let _ = write_stream.flush();
+                    break;
+                }
             }
         }
     }
