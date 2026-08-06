@@ -2222,12 +2222,25 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 if let Ok(port_str) = std::fs::read_to_string(&port_path) {
                     if let Ok(port) = port_str.trim().parse::<u16>() {
                         let addr = format!("127.0.0.1:{}", port);
-                        if std::net::TcpStream::connect_timeout(
+                        match std::net::TcpStream::connect_timeout(
                             &addr.parse().unwrap(),
                             std::time::Duration::from_millis(100),
-                        ).is_ok() {
-                            app.status_message = Some((format!("session '{}' already exists", name), Instant::now(), None));
-                            return Ok(());
+                        ) {
+                            Ok(_) => {
+                                app.status_message = Some((format!("session '{}' already exists", name), Instant::now(), None));
+                                return Ok(());
+                            }
+                            // An active refusal proves no listener: the file
+                            // is stale. A timeout means a busy-but-alive
+                            // server — the name is still taken, so report
+                            // "already exists" instead of deleting the file
+                            // out from under it (same rule as the cleanup
+                            // probe).
+                            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+                            Err(_) => {
+                                app.status_message = Some((format!("session '{}' already exists", name), Instant::now(), None));
+                                return Ok(());
+                            }
                         }
                     }
                 }

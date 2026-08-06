@@ -842,6 +842,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         }
     };
 
+    // Re-assert the PID anchor the instant this process owns the name. A
+    // `.pid` left behind by a previously killed server for this session is a
+    // dead anchor; a concurrent CLI cleanup that reads it while this server
+    // is still coming up would trust it as proof of death and reap the whole
+    // registry out from under a live server. Writing it here — before the
+    // listener is even bound — closes that window; ensure_session_registry_files
+    // below then sees matching content and skips the rewrite.
+    crate::session::write_session_pid_file(&app.port_file_base(), std::process::id());
+
     // Bind the control listener BEFORE loading config so that run-shell
     // commands spawned by load_config can connect back to the server.
     let (tx, rx) = mpsc::channel::<CtrlReq>();
