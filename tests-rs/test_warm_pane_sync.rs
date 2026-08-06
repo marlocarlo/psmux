@@ -13,6 +13,7 @@ use crate::types::AppState;
 
 fn fresh_app() -> AppState {
     let mut app = AppState::new("test".to_string());
+    app.warm_enabled = true;
     // Strip the implicit-PSMUX_TARGET_SESSION-style entries that
     // AppState::new may seed; for_post_config skips those by name,
     // but explicit cleanup keeps the test intent visible.
@@ -38,6 +39,19 @@ fn option_default_shell_requires_respawn() {
     let app = fresh_app();
     assert!(matches!(
         for_option_change("default-shell", &app),
+        WarmPaneSync::Respawn(_)
+    ));
+}
+
+#[test]
+fn option_process_construction_settings_require_respawn() {
+    let app = fresh_app();
+    assert!(matches!(
+        for_option_change("env-shim", &app),
+        WarmPaneSync::Respawn(_)
+    ));
+    assert!(matches!(
+        for_option_change("warm", &app),
         WarmPaneSync::Respawn(_)
     ));
 }
@@ -148,6 +162,68 @@ fn resize_with_no_warm_pane_returns_respawn() {
     // and possibly spawn a fresh warm pane at the new size.
     let app = fresh_app();
     assert!(matches!(for_resize(&app, 30, 80), WarmPaneSync::Respawn(_)));
+}
+
+#[test]
+fn repeated_resize_with_no_warm_pane_is_noop() {
+    let app = fresh_app();
+    assert!(matches!(
+        for_resize(&app, app.client_area.height, app.client_area.width),
+        WarmPaneSync::Noop
+    ));
+}
+
+#[test]
+fn warm_spawner_allows_only_one_worker() {
+    let mut app = fresh_app();
+    let mut spawner = WarmPaneSpawner::new();
+    spawner.in_flight = true;
+    let next_pane_id = app.next_pane_id;
+
+    spawner.ensure(&mut app);
+
+    assert!(spawner.in_flight);
+    assert_eq!(app.next_pane_id, next_pane_id);
+}
+
+#[test]
+fn stale_worker_failure_does_not_poison_current_generation() {
+    let mut app = fresh_app();
+    let mut spawner = WarmPaneSpawner::new();
+    let stale_generation = spawner.generation;
+    spawner.in_flight = true;
+    spawner.invalidate();
+    spawner.completion_tx.send(SpawnCompletion {
+        generation: stale_generation,
+        result: Err(std::io::Error::new(std::io::ErrorKind::Other, "stale")),
+    }).unwrap();
+
+    spawner.poll(&mut app);
+
+    assert!(!spawner.in_flight);
+    assert_eq!(spawner.consecutive_failures, 0);
+    assert!(spawner.retry_not_before.is_none());
+}
+
+#[test]
+fn current_worker_failure_uses_bounded_backoff() {
+    let mut app = fresh_app();
+    let mut spawner = WarmPaneSpawner::new();
+    spawner.in_flight = true;
+    spawner.completion_tx.send(SpawnCompletion {
+        generation: spawner.generation,
+        result: Err(std::io::Error::new(std::io::ErrorKind::Other, "failed")),
+    }).unwrap();
+
+    spawner.poll(&mut app);
+
+    assert!(!spawner.in_flight);
+    assert_eq!(spawner.consecutive_failures, 1);
+    assert!(spawner.retry_not_before.is_some());
+    assert_eq!(retry_delay(1), std::time::Duration::from_millis(100));
+    assert_eq!(retry_delay(2), std::time::Duration::from_millis(500));
+    assert_eq!(retry_delay(3), std::time::Duration::from_secs(2));
+    assert_eq!(retry_delay(99), std::time::Duration::from_secs(5));
 }
 
 // ── for_post_config: priority order ────────────────────────────────

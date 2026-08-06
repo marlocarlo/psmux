@@ -1200,21 +1200,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // FocusWindowTemp/FocusPaneByIndexTemp in one batch plus the actual
     // command (e.g. CapturePane) in the next batch still works correctly.
     let mut temp_focus_restore: Option<(usize, usize)> = None;
+    let mut warm_pane_spawner = crate::warm_pane_sync::WarmPaneSpawner::new();
 
     loop {
-        // Tier 3 — keep warm-pane spawning OFF the command path. A warm pane is a
-        // fresh shell + ConPTY; spawning one can block the single event loop for
-        // 100ms–seconds under load. Doing it inline after every new-window/split
-        // stalled *other* clients' commands, surfacing as the intermittent
-        // `os error 10060` timeouts. Instead replenish only during a quiet gap
-        // (no command processed in the last 20ms), so window-create bursts
-        // transplant the ready pane instantly and the blocking spawn lands in idle
-        // time. If no warm pane is ready when a new-window arrives, create_window
-        // still spawns one synchronously — correctness is unchanged.
+        warm_pane_spawner.poll(&mut app);
+        // Warm ConPTY creation runs on the spawner's sole worker. The quiet-gap
+        // gate avoids needless replenishment in a window-create burst without
+        // ever blocking unrelated control commands on the server thread.
         if app.warm_pane.is_none() && last_client_activity.elapsed() >= Duration::from_millis(20) {
-            if let Ok(wp) = spawn_warm_pane(&*pty_system, &mut app) {
-                app.warm_pane = Some(wp);
-            }
+            warm_pane_spawner.ensure(&mut app);
         }
         if last_registry_check.elapsed() >= Duration::from_secs(5) {
             last_registry_check = Instant::now();
@@ -1262,28 +1256,36 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             if age.as_secs() >= pause_secs {
                                 // Client fell behind: pause this pane
                                 client.output_paused_panes.insert(*pane_id);
-                                let _ = client.notification_tx.try_send(
-                                    crate::types::ControlNotification::Pause { pane_id: *pane_id }
+                                crate::control::try_send_notification(
+                                    client,
+                                    crate::types::ControlNotification::Pause { pane_id: *pane_id },
                                 );
                                 continue;
                             }
-                            // Send as extended-output with age
+                            // Send as extended-output with age. Chunked so a
+                            // large drain never becomes one oversized line.
                             let age_ms = age.as_millis() as u64;
-                            let _ = client.notification_tx.try_send(
-                                crate::types::ControlNotification::ExtendedOutput {
-                                    pane_id: *pane_id,
-                                    age_ms,
-                                    data: data.clone(),
-                                }
-                            );
+                            for chunk in crate::control::chunk_output(data) {
+                                crate::control::try_send_notification(
+                                    client,
+                                    crate::types::ControlNotification::ExtendedOutput {
+                                        pane_id: *pane_id,
+                                        age_ms,
+                                        data: chunk.to_string(),
+                                    },
+                                );
+                            }
                         } else {
-                            // No pause-after: send normal %output
-                            let _ = client.notification_tx.try_send(
-                                crate::types::ControlNotification::Output {
-                                    pane_id: *pane_id,
-                                    data: data.clone(),
-                                }
-                            );
+                            // No pause-after: send normal %output, chunked
+                            for chunk in crate::control::chunk_output(data) {
+                                crate::control::try_send_notification(
+                                    client,
+                                    crate::types::ControlNotification::Output {
+                                        pane_id: *pane_id,
+                                        data: chunk.to_string(),
+                                    },
+                                );
+                            }
                         }
                     }
                 }
@@ -2285,6 +2287,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     };
                 }
                 CtrlReq::ClientSize(cid, w, h) => { 
+                    let warm_sync = crate::warm_pane_sync::for_resize(&app, h, w);
                     app.client_sizes.insert(cid, (w, h));
                     app.latest_client_id = Some(cid);
                     app.latest_size_client_id = Some(cid);
@@ -2300,12 +2303,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // Reconcile warm pane dimensions through the central
                     // policy module so resize uses the same code path as
                     // every other warm-pane invalidation (#271).
-                    let sync = crate::warm_pane_sync::for_resize(
-                        &app,
-                        app.client_area.height,
-                        app.client_area.width,
+                    crate::warm_pane_sync::apply_runtime(
+                        &mut app,
+                        &mut warm_pane_spawner,
+                        warm_sync,
                     );
-                    crate::warm_pane_sync::apply(&mut app, &*pty_system, sync);
                     hook_event = Some("client-resized");
                 }
                 CtrlReq::HostColors(spec) => {
@@ -3791,7 +3793,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // All option-driven warm-pane lifecycle decisions
                     // route through this single module — see #271.
                     let sync = crate::warm_pane_sync::for_option_change(&option, &app);
-                    crate::warm_pane_sync::apply(&mut app, &*pty_system, sync);
+                    crate::warm_pane_sync::apply_runtime(
+                        &mut app,
+                        &mut warm_pane_spawner,
+                        sync,
+                    );
                     // Update shared aliases if command-alias changed
                     if option == "command-alias" {
                         if let Ok(mut map) = shared_aliases_main.write() {
@@ -3828,7 +3834,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // also covers history-limit (#271), allow-predictions,
                     // default-terminal, and claude-code-* options.
                     let sync = crate::warm_pane_sync::for_option_change(&option, &app);
-                    crate::warm_pane_sync::apply(&mut app, &*pty_system, sync);
+                    crate::warm_pane_sync::apply_runtime(
+                        &mut app,
+                        &mut warm_pane_spawner,
+                        sync,
+                    );
                     // Update shared aliases if command-alias changed
                     if option == "command-alias" {
                         if let Ok(mut map) = shared_aliases_main.write() {
@@ -3883,6 +3893,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             _ => {}
                         }
                     }
+                    let sync = crate::warm_pane_sync::for_option_change(&option, &app);
+                    crate::warm_pane_sync::apply_runtime(
+                        &mut app,
+                        &mut warm_pane_spawner,
+                        sync,
+                    );
                 }
                 CtrlReq::SetOptionAppend(option, value) => {
                     // Append to existing option value
@@ -3924,6 +3940,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     if !already_set {
                         apply_set_option(&mut app, &option, &value, false);
                         app.user_set_options.insert(option.clone());
+                        let sync = crate::warm_pane_sync::for_option_change(&option, &app);
+                        crate::warm_pane_sync::apply_runtime(
+                            &mut app,
+                            &mut warm_pane_spawner,
+                            sync,
+                        );
                         if option == "command-alias" {
                             if let Ok(mut map) = shared_aliases_main.write() {
                                 *map = app.command_aliases.clone();
@@ -4084,6 +4106,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // unreadable path); flush them like the startup load does
                     // or they never reach config-warnings.log.
                     write_config_warnings_log(&app.config_warnings);
+                    let sync = crate::warm_pane_sync::for_config_reload();
+                    crate::warm_pane_sync::apply_runtime(
+                        &mut app,
+                        &mut warm_pane_spawner,
+                        sync,
+                    );
                     // source-file may change pane-border-status which
                     // affects pane content height (#288)
                     resize_all_panes(&mut app);
@@ -4763,13 +4791,21 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // which can't be patched in place — must respawn.
                     // Centralised through warm_pane_sync (#137 / #271).
                     let sync = crate::warm_pane_sync::for_env_change();
-                    crate::warm_pane_sync::apply(&mut app, &*pty_system, sync);
+                    crate::warm_pane_sync::apply_runtime(
+                        &mut app,
+                        &mut warm_pane_spawner,
+                        sync,
+                    );
                 }
                 CtrlReq::UnsetEnvironment(key) => {
                     app.environment.remove(&key);
                     env::remove_var(&key);
                     let sync = crate::warm_pane_sync::for_env_change();
-                    crate::warm_pane_sync::apply(&mut app, &*pty_system, sync);
+                    crate::warm_pane_sync::apply_runtime(
+                        &mut app,
+                        &mut warm_pane_spawner,
+                        sync,
+                    );
                 }
                 CtrlReq::ShowEnvironment(resp) => {
                     let mut output = String::new();
@@ -5212,6 +5248,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                 }
                 CtrlReq::ControlClientResize { client_id, window_id, size } => {
+                    let warm_sync = if window_id.is_none() {
+                        size.map(|(width, height)| {
+                            crate::warm_pane_sync::for_resize(&app, height, width)
+                        })
+                    } else {
+                        None
+                    };
                     let old_areas: std::collections::HashMap<usize, Rect> = app
                         .windows
                         .iter()
@@ -5238,6 +5281,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         let geometry_changed = crate::resize_window::refresh_dynamic_window_sizes(&mut app);
                         if geometry_changed {
                             resize_all_panes(&mut app);
+                        }
+                        if let Some(sync) = warm_sync {
+                            crate::warm_pane_sync::apply_runtime(
+                                &mut app,
+                                &mut warm_pane_spawner,
+                                sync,
+                            );
                         }
                         state_dirty = true;
                         meta_dirty = true;
@@ -5384,12 +5434,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         state_dirty = true;
                     }
                 }
-                CtrlReq::ControlRegister { client_id, echo, notif_tx } => {
+                CtrlReq::ControlRegister { client_id, echo, output_tx, backlog } => {
                     app.control_clients.insert(client_id, crate::types::ControlClient {
                         client_id,
                         cmd_counter: 0,
                         echo_enabled: echo,
-                        notification_tx: notif_tx,
+                        output_tx,
+                        backlog,
                         paused_panes: std::collections::HashSet::new(),
                         subscriptions: std::collections::HashMap::new(),
                         subscription_values: std::collections::HashMap::new(),
@@ -5446,8 +5497,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::ControlContinuePane { client_id, pane_id } => {
                     if let Some(cc) = app.control_clients.get_mut(&client_id) {
                         if cc.output_paused_panes.remove(&pane_id) {
-                            let _ = cc.notification_tx.try_send(
-                                crate::types::ControlNotification::Continue { pane_id }
+                            crate::control::try_send_notification(
+                                cc,
+                                crate::types::ControlNotification::Continue { pane_id },
                             );
                         }
                     }
@@ -5531,6 +5583,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             options[selected].1 = value.clone();
                             *editing = false;
                             options::apply_set_option(&mut app, &name, &value, true);
+                            let sync = crate::warm_pane_sync::for_option_change(&name, &app);
+                            crate::warm_pane_sync::apply_runtime(
+                                &mut app,
+                                &mut warm_pane_spawner,
+                                sync,
+                            );
                             state_dirty = true;
                         }
                     }
@@ -5552,6 +5610,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                                 let value = def.to_string();
                                 options[selected].1 = value.clone();
                                 options::apply_set_option(&mut app, &name, &value, true);
+                                let sync = crate::warm_pane_sync::for_option_change(&name, &app);
+                                crate::warm_pane_sync::apply_runtime(
+                                    &mut app,
+                                    &mut warm_pane_spawner,
+                                    sync,
+                                );
                                 state_dirty = true;
                             }
                         }
@@ -5973,7 +6037,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
             }
             for (cid, notif) in sub_notifs {
                 if let Some(cc) = app.control_clients.get(&cid) {
-                    let _ = cc.notification_tx.try_send(notif);
+                    crate::control::try_send_notification(cc, notif);
                 }
             }
         }
@@ -6034,9 +6098,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 .unwrap_or(false);
             if warm_dead {
                 if let Some(mut dead) = app.warm_pane.take() { dead.child.kill().ok(); }
-                if let Ok(nw) = spawn_warm_pane(&*pty_system, &mut app) {
-                    app.warm_pane = Some(nw);
-                }
+                warm_pane_spawner.invalidate();
+                warm_pane_spawner.ensure(&mut app);
             }
             // #450 (opt-in `@heal-crashed-panes`): a shell can FailFast on its
             // very first ConPTY read right after a warm-pane transplant (pwsh
@@ -6159,7 +6222,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         &app,
                         crate::types::ControlNotification::Exit { reason: None },
                     );
-                    // Give notification threads time to flush %exit through
+                    // Give control writers time to flush %exit through
                     // the DCS stream before we tear down the process.
                     std::thread::sleep(std::time::Duration::from_millis(80));
                 }

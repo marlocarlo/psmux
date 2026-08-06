@@ -1,4 +1,4 @@
-use crate::types::{AppState, ControlNotification, Node, LayoutKind, Window};
+use crate::types::{AppState, ControlClient, ControlNotification, ControlOutput, Node, LayoutKind, Window};
 use ratatui::layout::Rect;
 
 /// Compute tmux's 16-bit rotating checksum over the layout body.
@@ -165,7 +165,8 @@ pub fn format_error(timestamp: i64, cmd_number: u64) -> String {
 }
 
 /// Emit a control notification to all connected control mode clients.
-/// Non-blocking: if a client's channel is full, the notification is dropped for that client.
+/// Non-blocking: a slow client sheds `%output` frames past a backlog
+/// threshold, but structural notifications are always queued.
 pub fn emit_notification(app: &AppState, notif: ControlNotification) {
     for client in app.control_clients.values() {
         if let ControlNotification::Output { pane_id, .. } = &notif {
@@ -173,15 +174,81 @@ pub fn emit_notification(app: &AppState, notif: ControlNotification) {
                 continue;
             }
         }
-        let _ = client.notification_tx.try_send(notif.clone());
+        try_send_notification(client, notif.clone());
     }
 }
 
 /// Send a notification to a single control client by id (no-op if unknown).
 pub fn emit_to_client(app: &AppState, client_id: u64, notif: ControlNotification) {
     if let Some(client) = app.control_clients.get(&client_id) {
-        let _ = client.notification_tx.try_send(notif);
+        try_send_notification(client, notif);
     }
+}
+
+/// Backlog level past which pane output frames are shed for a slow client.
+/// Dropped frames are harmless: any client resynchronizes the screen with
+/// capture-pane, exactly as after tmux pauses a pane.
+pub const OUTPUT_BACKLOG_SOFT_MAX: usize = 4 * 1024 * 1024;
+/// Backlog level past which everything is shed; a reader this far behind is
+/// effectively gone and only the TCP connection teardown will reap it.
+pub const OUTPUT_BACKLOG_HARD_MAX: usize = 64 * 1024 * 1024;
+
+/// Approximate wire cost of one queued control output, used for backlog
+/// accounting. Must be applied symmetrically by the enqueue and the writer.
+pub fn output_cost(output: &ControlOutput) -> usize {
+    match output {
+        ControlOutput::Notification(ControlNotification::Output { data, .. }) => data.len() + 32,
+        ControlOutput::Notification(ControlNotification::ExtendedOutput { data, .. }) => data.len() + 48,
+        ControlOutput::Notification(_) => 128,
+        ControlOutput::CommandBlock(block) => block.len(),
+    }
+}
+
+pub fn try_send_notification(client: &ControlClient, notif: ControlNotification) {
+    use std::sync::atomic::Ordering;
+    let backlog = client.backlog.load(Ordering::Relaxed);
+    let droppable = matches!(
+        notif,
+        ControlNotification::Output { .. } | ControlNotification::ExtendedOutput { .. }
+    );
+    if backlog >= OUTPUT_BACKLOG_HARD_MAX || (droppable && backlog >= OUTPUT_BACKLOG_SOFT_MAX) {
+        return;
+    }
+    let output = ControlOutput::Notification(notif);
+    client.backlog.fetch_add(output_cost(&output), Ordering::Relaxed);
+    let _ = client.output_tx.send(output);
+}
+
+/// Maximum raw payload carried by a single %output / %extended-output line.
+/// tmux emits one notification per PTY read (bounded by its event-buffer read
+/// size), so clients never face a single multi-hundred-KB line. Splitting on
+/// UTF-8 boundaries keeps each chunk independently escapable.
+pub const OUTPUT_CHUNK_MAX: usize = 4096;
+
+/// Split pane output into chunks of at most `OUTPUT_CHUNK_MAX` bytes without
+/// cutting through a UTF-8 sequence.
+pub fn chunk_output(data: &str) -> impl Iterator<Item = &str> {
+    let mut rest = data;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        if rest.len() <= OUTPUT_CHUNK_MAX {
+            let chunk = rest;
+            rest = "";
+            return Some(chunk);
+        }
+        let mut split = OUTPUT_CHUNK_MAX;
+        while split > 0 && !rest.is_char_boundary(split) {
+            split -= 1;
+        }
+        if split == 0 {
+            split = rest.len();
+        }
+        let (chunk, tail) = rest.split_at(split);
+        rest = tail;
+        Some(chunk)
+    })
 }
 
 /// Emit the initial state burst to a freshly-attached control mode client.
@@ -244,6 +311,35 @@ mod tests {
     #[test]
     fn test_escape_output_printable() {
         assert_eq!(escape_output("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_chunk_output_short_passthrough() {
+        let chunks: Vec<&str> = chunk_output("hello").collect();
+        assert_eq!(chunks, vec!["hello"]);
+        assert_eq!(chunk_output("").count(), 0);
+    }
+
+    #[test]
+    fn test_chunk_output_splits_large_payload() {
+        let data = "x".repeat(OUTPUT_CHUNK_MAX * 2 + 100);
+        let chunks: Vec<&str> = chunk_output(&data).collect();
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|c| c.len() <= OUTPUT_CHUNK_MAX));
+        assert_eq!(chunks.concat(), data);
+    }
+
+    #[test]
+    fn test_chunk_output_never_splits_utf8_sequence() {
+        // Fill so a 3-byte CJK glyph straddles the chunk boundary.
+        let mut data = "a".repeat(OUTPUT_CHUNK_MAX - 1);
+        data.push_str("终端输出");
+        let chunks: Vec<&str> = chunk_output(&data).collect();
+        assert!(chunks.len() >= 2);
+        assert_eq!(chunks.concat(), data);
+        for chunk in &chunks {
+            assert!(std::str::from_utf8(chunk.as_bytes()).is_ok());
+        }
     }
 
     #[test]
@@ -383,12 +479,13 @@ mod tests {
     #[test]
     fn test_has_control_clients_with_client() {
         let mut app = AppState::new("test".to_string());
-        let (tx, _rx) = std::sync::mpsc::sync_channel(16);
+        let (tx, _rx) = std::sync::mpsc::channel();
         app.control_clients.insert(1, crate::types::ControlClient {
             client_id: 1,
             cmd_counter: 0,
             echo_enabled: true,
-            notification_tx: tx,
+            output_tx: tx,
+            backlog: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             paused_panes: std::collections::HashSet::new(),
             subscriptions: std::collections::HashMap::new(),
             subscription_values: std::collections::HashMap::new(),
@@ -405,12 +502,13 @@ mod tests {
     #[test]
     fn test_emit_notification_to_clients() {
         let mut app = AppState::new("test".to_string());
-        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let (tx, rx) = std::sync::mpsc::channel();
         app.control_clients.insert(1, crate::types::ControlClient {
             client_id: 1,
             cmd_counter: 0,
             echo_enabled: false,
-            notification_tx: tx,
+            output_tx: tx,
+            backlog: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             paused_panes: std::collections::HashSet::new(),
             subscriptions: std::collections::HashMap::new(),
             subscription_values: std::collections::HashMap::new(),
@@ -423,20 +521,24 @@ mod tests {
         });
         emit_notification(&app, ControlNotification::WindowAdd { window_id: 5 });
         let notif = rx.try_recv().unwrap();
-        assert!(matches!(notif, ControlNotification::WindowAdd { window_id: 5 }));
+        assert!(matches!(
+            notif,
+            ControlOutput::Notification(ControlNotification::WindowAdd { window_id: 5 })
+        ));
     }
 
     #[test]
     fn test_emit_notification_skips_paused_pane() {
         let mut app = AppState::new("test".to_string());
-        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut paused = std::collections::HashSet::new();
         paused.insert(3usize);
         app.control_clients.insert(1, crate::types::ControlClient {
             client_id: 1,
             cmd_counter: 0,
             echo_enabled: false,
-            notification_tx: tx,
+            output_tx: tx,
+            backlog: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             paused_panes: paused,
             subscriptions: std::collections::HashMap::new(),
             subscription_values: std::collections::HashMap::new(),
@@ -558,3 +660,11 @@ mod tests {
         assert_eq!(line, "%subscription-changed test_sub $1 @2 3 %4 : ");
     }
 }
+
+#[cfg(test)]
+#[path = "../tests-rs/test_control_slow_client_backlog.rs"]
+mod tests_control_slow_client_backlog;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_control_output_chunking.rs"]
+mod tests_control_output_chunking;

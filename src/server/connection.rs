@@ -3,7 +3,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 use std::net::TcpStream;
 
-use crate::types::{CtrlReq, LayoutKind, WaitForOp, ControlNotification};
+use crate::types::{CtrlReq, LayoutKind, WaitForOp, ControlNotification, ControlOutput};
 use crate::cli::{parse_target, extract_flag_value};
 use crate::util::base64_decode;
 use crate::control;
@@ -31,6 +31,109 @@ fn auth_debug(msg: &str) {
 }
 use crate::commands::parse_command_line;
 use super::helpers::TMUX_COMMANDS;
+
+
+#[derive(Debug, PartialEq)]
+enum ControlCommandResponse {
+    Success(String),
+    Error(String),
+}
+
+impl ControlCommandResponse {
+    fn empty() -> Self {
+        Self::Success(String::new())
+    }
+
+    fn success(body: impl Into<String>) -> Self {
+        Self::Success(body.into())
+    }
+
+    fn error(body: impl std::fmt::Display) -> Self {
+        Self::Error(body.to_string())
+    }
+}
+
+struct ControlConnectionGuard {
+    client_id: u64,
+    request_tx: mpsc::Sender<CtrlReq>,
+}
+
+impl Drop for ControlConnectionGuard {
+    fn drop(&mut self) {
+        // Deregistration drops the server's output sender. The writer then
+        // drains queued command blocks before it closes the shared socket.
+        let _ = self.request_tx.send(CtrlReq::ControlDeregister {
+            client_id: self.client_id,
+        });
+    }
+}
+
+struct ControlWriterGuard {
+    client_id: u64,
+    shutdown: TcpStream,
+}
+
+impl Drop for ControlWriterGuard {
+    fn drop(&mut self) {
+        crate::types::deregister_persistent_stream(self.client_id);
+        let _ = self.shutdown.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+fn write_control_output(stream: &mut TcpStream, output: ControlOutput) -> io::Result<bool> {
+    let (text, exit) = match output {
+        ControlOutput::Notification(notification) => {
+            let exit = matches!(notification, ControlNotification::Exit { .. });
+            (format!("{}\n", control::format_notification(&notification)), exit)
+        }
+        ControlOutput::CommandBlock(block) => (block, false),
+    };
+    stream.write_all(text.as_bytes())?;
+    stream.flush()?;
+    Ok(exit)
+}
+
+fn format_control_command_block(
+    echo: bool,
+    command: &str,
+    timestamp: i64,
+    command_number: u64,
+    response: Option<Result<ControlCommandResponse, mpsc::RecvError>>,
+) -> String {
+    let mut block = String::new();
+    if echo {
+        block.push_str(command);
+        block.push('\n');
+    }
+    block.push_str(&control::format_begin(timestamp, command_number));
+    block.push('\n');
+    match response {
+        Some(Ok(response)) => {
+            let (is_error, body) = match response {
+                ControlCommandResponse::Success(body) => (false, body),
+                ControlCommandResponse::Error(body) => (true, body),
+            };
+            if !body.is_empty() {
+                block.push_str(&body);
+                if !body.ends_with('\n') {
+                    block.push('\n');
+                }
+            }
+            block.push_str(&if is_error {
+                control::format_error(timestamp, command_number)
+            } else {
+                control::format_end(timestamp, command_number)
+            });
+        }
+        Some(Err(_)) => {
+            block.push_str("command response unavailable\n");
+            block.push_str(&control::format_error(timestamp, command_number));
+        }
+        None => block.push_str(&control::format_end(timestamp, command_number)),
+    }
+    block.push('\n');
+    block
+}
 
 /// Split a command line on top-level `;` separators, respecting single and
 /// double quotes and `\` escapes. Real tmux's parser treats `;` as a command
@@ -486,36 +589,25 @@ if control_echo || control_noecho {
     let _ = r.get_ref().set_read_timeout(Some(Duration::from_millis(5000)));
 
     let ctrl_client_id = crate::types::next_client_id();
-    crate::types::register_persistent_stream(ctrl_client_id, &write_stream);
+    let writer_guard = ControlWriterGuard {
+        client_id: ctrl_client_id,
+        shutdown: match write_stream.try_clone() {
+            Ok(stream) => stream,
+            Err(_) => return,
+        },
+    };
+    // No write timeout here: a slow control reader must be buffered, not
+    // disconnected (tmux keeps an unbounded evbuffer per control client).
+    // Backpressure is handled by backlog accounting — %output frames are
+    // shed past a threshold while structural notifications always queue —
+    // and a dead peer surfaces as a hard write error via TCP reset.
+    let _connection_guard = ControlConnectionGuard {
+        client_id: ctrl_client_id,
+        request_tx: tx.clone(),
+    };
 
-    let (notif_tx, notif_rx) = std::sync::mpsc::sync_channel::<ControlNotification>(4096);
-
-    // Wrap the write stream in a mutex so that the notification writer
-    // thread and the command-response loop never interleave bytes on
-    // the TCP socket.  Real tmux is single-threaded, so it never has
-    // this problem; we need explicit synchronization.
-    let write_lock = std::sync::Arc::new(std::sync::Mutex::new(write_stream));
-
-    // Spawn notification writer thread BEFORE writing DCS or registering,
-    // so it is ready to drain notifications as soon as they arrive.
-    let ws_notif = write_lock.clone();
-    let notif_thread = std::thread::spawn(move || {
-        while let Ok(notif) = notif_rx.recv() {
-            let is_exit = matches!(notif, ControlNotification::Exit { .. });
-            let formatted = control::format_notification(&notif);
-            let mut ws = match ws_notif.lock() {
-                Ok(ws) => ws,
-                Err(_) => break,
-            };
-            if writeln!(ws, "{}", formatted).is_err() { break; }
-            if ws.flush().is_err() { break; }
-            // Exit notification written — now signal the client to exit.
-            // Writing %exit through the DCS stream (before TCP close) lets
-            // iTerm2 receive it as a DCS message and close native windows
-            // immediately.  Then we break so the server can close the TCP.
-            if is_exit { break; }
-        }
-    });
+    let (output_tx, output_rx) = std::sync::mpsc::channel::<ControlOutput>();
+    let output_backlog = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     // For -CC (no-echo) mode, emit the DCS opening sequence "\033P1000p"
     // before anything else. Real tmux writes exactly 7 bytes with NO
@@ -534,31 +626,49 @@ if control_echo || control_noecho {
     //   - flag=0 (server-originated) creates a synthetic currentCommand_
     //     and the matching %end fires tmuxInitialCommandDidCompleteSuccessfully
     //     which kicks off iTerm's tmux integration (phony-command, ping, etc.).
-    {
-        let mut ws = write_lock.lock().unwrap();
+    let init_result = (|| -> io::Result<()> {
         if control_noecho {
             let init_ts = chrono::Utc::now().timestamp();
-            // DCS opener (no newline) immediately followed by %begin
-            let _ = ws.write_all(b"\x1bP1000p");
-            let _ = writeln!(ws, "%begin {} 1 0", init_ts);
-            let _ = writeln!(ws, "%end {} 1 0", init_ts);
+            write_stream.write_all(b"\x1bP1000p")?;
+            writeln!(write_stream, "%begin {} 1 0", init_ts)?;
+            writeln!(write_stream, "%end {} 1 0", init_ts)?;
         } else {
-            // -C (echo) mode: no DCS, just a blank ready line
-            let _ = writeln!(ws);
+            writeln!(write_stream)?;
         }
-        let _ = ws.flush();
+        write_stream.flush()
+    })();
+    if init_result.is_err() {
+        return;
     }
+
+    crate::types::register_persistent_stream(ctrl_client_id, &write_stream);
+    let writer_backlog = output_backlog.clone();
+    std::thread::spawn(move || {
+        let _writer_guard = writer_guard;
+        while let Ok(output) = output_rx.recv() {
+            let cost = crate::control::output_cost(&output);
+            let result = write_control_output(&mut write_stream, output);
+            writer_backlog.fetch_sub(cost, std::sync::atomic::Ordering::Relaxed);
+            match result {
+                Ok(false) => {}
+                Ok(true) | Err(_) => return,
+            }
+        }
+    });
 
     // NOW register with the server. This triggers emit_initial_state()
     // which sends %session-changed and other notifications through the
     // notification channel. Because we flushed the DCS + %begin/%end
     // above, those bytes are already in the kernel send buffer and will
     // arrive at the client before any notifications.
-    let _ = tx.send(CtrlReq::ControlRegister {
+    if tx.send(CtrlReq::ControlRegister {
         client_id: ctrl_client_id,
         echo: control_echo,
-        notif_tx: notif_tx,
-    });
+        output_tx: output_tx.clone(),
+        backlog: output_backlog.clone(),
+    }).is_err() {
+        return;
+    }
 
     // Control mode command loop: read lines, dispatch, wrap in %begin/%end/%error
     let mut cmd_counter: u64 = 0;
@@ -614,18 +724,24 @@ if control_echo || control_noecho {
         cmd_counter += 1;
         let ts = chrono::Utc::now().timestamp();
 
-        // Dispatch the command (before acquiring write lock)
+        // Dispatch the command before handing its completed block to the
+        // single control writer.
         let parsed = crate::cli::normalize_flag_equals(parse_command_line(trimmed));
         let raw_cmd = parsed.first().map(|s| s.as_str()).unwrap_or("");
 
         if raw_cmd.is_empty() {
-            let mut ws = write_lock.lock().unwrap();
-            if control_echo {
-                let _ = writeln!(ws, "{}", trimmed);
+            let block = format_control_command_block(
+                control_echo,
+                trimmed,
+                ts,
+                cmd_counter,
+                Some(Ok(ControlCommandResponse::empty())),
+            );
+            let block_output = ControlOutput::CommandBlock(block);
+            output_backlog.fetch_add(crate::control::output_cost(&block_output), std::sync::atomic::Ordering::Relaxed);
+            if output_tx.send(block_output).is_err() {
+                break;
             }
-            let _ = writeln!(ws, "{}", control::format_begin(ts, cmd_counter));
-            let _ = writeln!(ws, "{}", control::format_end(ts, cmd_counter));
-            let _ = ws.flush();
             continue;
         }
 
@@ -726,76 +842,35 @@ if control_echo || control_noecho {
         }
 
         // Dispatch command (use a oneshot for the response)
-        let (resp_s, resp_r) = mpsc::channel::<String>();
+        let (resp_s, resp_r) = mpsc::channel::<ControlCommandResponse>();
         let dispatched = dispatch_control_command(
             cmd_name, &filtered_args, &tx_ctrl, resp_s,
             ctrl_target_pane, ctrl_pane_is_id, ctrl_raw_target.as_deref(),
             ctrl_client_id,
         );
 
-        // Collect the response BEFORE acquiring the write lock, so the
-        // notification thread can still write while we wait.
+        // The dispatcher runs synchronously and each handled command must
+        // complete its oneshot exactly once. The writer remains independent,
+        // so waiting here never blocks control-socket output.
         let response_result = if dispatched {
-            Some(resp_r.recv_timeout(Duration::from_secs(5)))
+            Some(resp_r.recv())
         } else {
             None
         };
-
-        // Acquire write lock for the ENTIRE %begin … %end sequence so
-        // notifications from the notification thread never interleave
-        // with command responses.  This matches real tmux's single-
-        // threaded behaviour where command output and notifications are
-        // serialized on one bufferevent.
-        let mut ws = write_lock.lock().unwrap();
-
-        // Echo the command if -C mode
-        if control_echo {
-            let _ = writeln!(ws, "{}", trimmed);
+        let block = format_control_command_block(
+            control_echo,
+            trimmed,
+            ts,
+            cmd_counter,
+            response_result,
+        );
+        let block_output = ControlOutput::CommandBlock(block);
+        output_backlog.fetch_add(crate::control::output_cost(&block_output), std::sync::atomic::Ordering::Relaxed);
+        if output_tx.send(block_output).is_err() {
+            break;
         }
-
-        // Send %begin
-        let _ = writeln!(ws, "{}", control::format_begin(ts, cmd_counter));
-
-        match response_result {
-            Some(Ok(response)) => {
-                // Sentinel-encoded error: dispatcher signals %error
-                // instead of %end by prefixing with \u{0001}ERR\u{0001}.
-                let (is_error, body) = if let Some(stripped) = response.strip_prefix("\u{0001}ERR\u{0001}") {
-                    (true, stripped.to_string())
-                } else {
-                    (false, response)
-                };
-                if !body.is_empty() {
-                    let _ = write!(ws, "{}", body);
-                    if !body.ends_with('\n') {
-                        let _ = writeln!(ws);
-                    }
-                }
-                let footer = if is_error {
-                    control::format_error(ts, cmd_counter)
-                } else {
-                    control::format_end(ts, cmd_counter)
-                };
-                let _ = writeln!(ws, "{}", footer);
-            }
-            Some(Err(_)) => {
-                let _ = writeln!(ws, "command timed out");
-                let _ = writeln!(ws, "{}", control::format_error(ts, cmd_counter));
-            }
-            None => {
-                // Command dispatched without response channel (fire and forget)
-                let _ = writeln!(ws, "{}", control::format_end(ts, cmd_counter));
-            }
-        }
-        let _ = ws.flush();
-        drop(ws);
     }
 
-    // Deregister and clean up.
-    // The CLIENT emits %exit + ST to stdout (matching real tmux's
-    // client.c), so the server does not need to write ST here.
-    let _ = tx.send(CtrlReq::ControlDeregister { client_id: ctrl_client_id });
-    drop(notif_thread);
     return;
 }
 
@@ -1087,22 +1162,34 @@ match cmd {
         } else {
             let _ = tx.send(CtrlReq::CapturePane(rtx));
         }
-        if let Ok(mut text) = rrx.recv() {
-            if join_lines {
-                // Remove trailing whitespace from each line (join wrapped lines)
-                text = text.lines().map(|l| l.trim_end()).collect::<Vec<_>>().join("\n");
-            }
-            if print_stdout {
-                // Write text directly — it already ends with \n from capture
-                if persistent {
-                    let _ = tx.send(CtrlReq::ShowTextPopup("capture-pane".to_string(), text));
-                } else {
-                    let _ = write_stream.write_all(text.as_bytes());
-                    let _ = write_stream.flush();
+        // Bounded wait, mirroring the control-mode capture path: if the server
+        // loop is wedged the client must fail with an error instead of
+        // blocking forever on the response channel.
+        match rrx.recv_timeout(Duration::from_secs(5)) {
+            Ok(mut text) => {
+                if join_lines {
+                    // Remove trailing whitespace from each line (join wrapped lines)
+                    text = text.lines().map(|l| l.trim_end()).collect::<Vec<_>>().join("\n");
                 }
-                if !persistent { break; }
-            } else {
-                let _ = tx.send(CtrlReq::SetBuffer(text));
+                if print_stdout {
+                    // Write text directly — it already ends with \n from capture
+                    if persistent {
+                        let _ = tx.send(CtrlReq::ShowTextPopup("capture-pane".to_string(), text));
+                    } else {
+                        let _ = write_stream.write_all(text.as_bytes());
+                        let _ = write_stream.flush();
+                    }
+                    if !persistent { break; }
+                } else {
+                    let _ = tx.send(CtrlReq::SetBuffer(text));
+                }
+            }
+            Err(_) => {
+                if !persistent {
+                    let _ = writeln!(write_stream, "ERROR: capture-pane timed out");
+                    let _ = write_stream.flush();
+                    break;
+                }
             }
         }
     }
@@ -3355,13 +3442,40 @@ match cmd {
 } // end command loop
 }
 
+fn recv_control_response<T>(
+    command: &str,
+    receiver: mpsc::Receiver<T>,
+    timeout: Duration,
+) -> Result<T, String> {
+    receiver.recv_timeout(timeout).map_err(|error| match error {
+        mpsc::RecvTimeoutError::Timeout => format!("{} timed out", command),
+        mpsc::RecvTimeoutError::Disconnected => {
+            format!("{} response channel disconnected", command)
+        }
+    })
+}
+
+fn forward_control_response(
+    command: &str,
+    receiver: mpsc::Receiver<String>,
+    response_tx: &mpsc::Sender<ControlCommandResponse>,
+    timeout: Duration,
+) {
+    let response = match recv_control_response(command, receiver, timeout) {
+        Ok(body) => ControlCommandResponse::success(body),
+        Err(error) => ControlCommandResponse::error(error),
+    };
+    let _ = response_tx.send(response);
+}
+
 /// Dispatch a command from a control mode client.
-/// Returns true if a response was sent through `resp_tx`, false for fire-and-forget commands.
+/// Returns true when the caller must wait for exactly one response through
+/// `resp_tx`, or false for a fire-and-forget command.
 fn dispatch_control_command(
     cmd: &str,
     args: &[&str],
     tx: &mpsc::Sender<CtrlReq>,
-    resp_tx: mpsc::Sender<String>,
+    resp_tx: mpsc::Sender<ControlCommandResponse>,
     target_pane: Option<usize>,
     pane_is_id: bool,
     raw_target: Option<&str>,
@@ -3376,9 +3490,7 @@ fn dispatch_control_command(
             } else {
                 let _ = tx.send(CtrlReq::ListWindowsTmux(rtx));
             }
-            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(text);
-            }
+            forward_control_response(cmd, rrx, &resp_tx, Duration::from_secs(5));
             true
         }
         "list-panes" | "lsp" => {
@@ -3399,9 +3511,7 @@ fn dispatch_control_command(
                     let _ = tx.send(CtrlReq::ListPanes(rtx));
                 }
             }
-            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(text);
-            }
+            forward_control_response(cmd, rrx, &resp_tx, Duration::from_secs(5));
             true
         }
         "display-message" | "display" => {
@@ -3423,9 +3533,7 @@ fn dispatch_control_command(
             } else {
                 let _ = tx.send(CtrlReq::DisplayMessage(rtx, fmt, target_pane_idx, !print_mode, None));
             }
-            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(text);
-            }
+            forward_control_response(cmd, rrx, &resp_tx, Duration::from_secs(5));
             true
         }
         "new-pane" | "newp" => {
@@ -3433,7 +3541,7 @@ fn dispatch_control_command(
             if p.print {
                 let (rtx, rrx) = mpsc::channel::<String>();
                 let _ = tx.send(CtrlReq::NewFloat { command: p.command, x: p.x, y: p.y, w: p.w, h: p.h, border: p.border, title: p.title, start_dir: p.start_dir, detached: p.detached, empty: p.empty, resp: Some(rtx) });
-                if let Ok(text) = rrx.recv_timeout(Duration::from_secs(2)) { let _ = resp_tx.send(text); }
+                forward_control_response(cmd, rrx, &resp_tx, Duration::from_secs(2));
                 true
             } else {
                 let _ = tx.send(CtrlReq::NewFloat { command: p.command, x: p.x, y: p.y, w: p.w, h: p.h, border: p.border, title: p.title, start_dir: p.start_dir, detached: p.detached, empty: p.empty, resp: None });
@@ -3477,13 +3585,11 @@ fn dispatch_control_command(
             if print_info {
                 let (rtx, rrx) = mpsc::channel::<String>();
                 let _ = tx.send(CtrlReq::NewWindowPrint(cmd_str, name, detached, start_dir, format_str, rtx, title, empty, env_sets));
-                if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
-                    let _ = resp_tx.send(text);
-                }
+                forward_control_response(cmd, rrx, &resp_tx, Duration::from_secs(5));
                 true
             } else {
                 let _ = tx.send(CtrlReq::NewWindow(cmd_str, name, detached, start_dir, title, empty, env_sets));
-                let _ = resp_tx.send(String::new());
+                let _ = resp_tx.send(ControlCommandResponse::empty());
                 true
             }
         }
@@ -3520,9 +3626,7 @@ fn dispatch_control_command(
             } else {
                 let _ = tx.send(CtrlReq::SplitWindow(kind, cmd_str, detached, start_dir, split_size, rtx, title, env_sets));
             }
-            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(text);
-            }
+            forward_control_response(cmd, rrx, &resp_tx, Duration::from_secs(5));
             true
         }
         "send-keys" | "send" => {
@@ -3558,6 +3662,7 @@ fn dispatch_control_command(
                 if !bytes.is_empty() {
                     let _ = tx.send(CtrlReq::SendBytes(bytes));
                 }
+                let _ = resp_tx.send(ControlCommandResponse::empty());
                 return true;
             }
             // Convert real-tmux 0xNN hex codepoint syntax (used by iTerm2 for
@@ -3588,7 +3693,7 @@ fn dispatch_control_command(
             // #490: hand the tokens over UNJOINED so quoted arguments keep
             // their exact whitespace end to end.
             let _ = tx.send(CtrlReq::SendKeys(keys, effective_literal));
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "capture-pane" | "capturep" => {
@@ -3603,9 +3708,7 @@ fn dispatch_control_command(
             } else {
                 let _ = tx.send(CtrlReq::CapturePane(rtx));
             }
-            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(text);
-            }
+            forward_control_response(cmd, rrx, &resp_tx, Duration::from_secs(5));
             true
         }
         "kill-pane" | "killp" => {
@@ -3616,7 +3719,7 @@ fn dispatch_control_command(
             } else {
                 let _ = tx.send(CtrlReq::KillPane);
             }
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "kill-window" | "killw" => {
@@ -3636,23 +3739,23 @@ fn dispatch_control_command(
                     resp: resp_s,
                 });
                 match resp_r.recv_timeout(Duration::from_secs(5)) {
-                    Ok(Err(e)) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
-                    _ => { let _ = resp_tx.send(String::new()); }
+                    Ok(Err(e)) => { let _ = resp_tx.send(ControlCommandResponse::error(e)); }
+                    _ => { let _ = resp_tx.send(ControlCommandResponse::empty()); }
                 }
             } else {
                 let _ = tx.send(CtrlReq::KillWindow);
-                let _ = resp_tx.send(String::new());
+                let _ = resp_tx.send(ControlCommandResponse::empty());
             }
             true
         }
         "unlink-window" | "unlinkw" => {
             let _ = tx.send(CtrlReq::UnlinkWindow);
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "select-window" | "selectw" => {
             // Already handled by target focus above
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "select-pane" | "selectp" => {
@@ -3660,21 +3763,21 @@ fn dispatch_control_command(
             if let Some(t) = args.windows(2).find(|w| w[0] == "-T").map(|w| w[1].trim_matches('"').to_string()) {
                 let _ = tx.send(CtrlReq::SetPaneTitle(t));
             }
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "rename-window" | "renamew" => {
             if let Some(name) = args.last() {
                 let _ = tx.send(CtrlReq::RenameWindow(name.trim_matches('"').to_string()));
             }
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "rename-session" | "rename" => {
             if let Some(name) = args.last() {
                 let _ = tx.send(CtrlReq::RenameSession(name.trim_matches('"').to_string()));
             }
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "set-option" | "set" | "set-window-option" | "setw" => {
@@ -3726,7 +3829,7 @@ fn dispatch_control_command(
                     let _ = tx.send(CtrlReq::SetOptionToggle(positional[0].to_string()));
                 }
             }
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "show-options" | "show" | "show-window-options" | "showw"
@@ -3768,8 +3871,8 @@ fn dispatch_control_command(
             } else {
                 let _ = tx.send(CtrlReq::ShowOptions(rtx));
             }
-            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
-                if value_only && !has_opt_name {
+            match recv_control_response(cmd, rrx, Duration::from_secs(5)) {
+                Ok(text) if value_only && !has_opt_name => {
                     // Strip option names, keep values only
                     let values_only: String = text.lines()
                         .filter_map(|line| {
@@ -3779,9 +3882,13 @@ fn dispatch_control_command(
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    let _ = resp_tx.send(values_only);
-                } else {
-                    let _ = resp_tx.send(text);
+                    let _ = resp_tx.send(ControlCommandResponse::success(values_only));
+                }
+                Ok(text) => {
+                    let _ = resp_tx.send(ControlCommandResponse::success(text));
+                }
+                Err(error) => {
+                    let _ = resp_tx.send(ControlCommandResponse::error(error));
                 }
             }
             true
@@ -3789,9 +3896,7 @@ fn dispatch_control_command(
         "list-keys" | "lsk" => {
             let (rtx, rrx) = mpsc::channel::<String>();
             let _ = tx.send(CtrlReq::ListKeys(rtx));
-            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(text);
-            }
+            forward_control_response(cmd, rrx, &resp_tx, Duration::from_secs(5));
             true
         }
         "list-sessions" | "ls" => {
@@ -3802,9 +3907,7 @@ fn dispatch_control_command(
             } else {
                 let _ = tx.send(CtrlReq::SessionInfo(rtx));
             }
-            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(text);
-            }
+            forward_control_response(cmd, rrx, &resp_tx, Duration::from_secs(5));
             true
         }
         "list-buffers" | "lsb" => {
@@ -3815,37 +3918,46 @@ fn dispatch_control_command(
             } else {
                 let _ = tx.send(CtrlReq::ListBuffers(rtx));
             }
-            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(text);
-            }
+            forward_control_response(cmd, rrx, &resp_tx, Duration::from_secs(5));
             true
         }
         "show-buffer" | "showb" => {
             let buf_name: Option<String> = args.windows(2).find(|w| w[0] == "-b").map(|w| w[1].to_string());
-            let text: Option<String> = if let Some(name) = buf_name {
+            let text = if let Some(name) = buf_name {
                 let (rtx, rrx) = mpsc::channel::<Option<String>>();
                 if let Ok(idx) = name.parse::<usize>() {
                     let _ = tx.send(CtrlReq::ShowBufferAt(rtx, idx));
                 } else {
                     let _ = tx.send(CtrlReq::ShowNamedBuffer(rtx, name));
                 }
-                rrx.recv_timeout(Duration::from_secs(5)).ok().flatten()
+                recv_control_response(cmd, rrx, Duration::from_secs(5))
+                    .and_then(|text| text.ok_or_else(|| "buffer not found".to_string()))
             } else {
                 let (rtx, rrx) = mpsc::channel::<String>();
                 let _ = tx.send(CtrlReq::ShowBuffer(rtx));
-                rrx.recv_timeout(Duration::from_secs(5)).ok()
+                recv_control_response(cmd, rrx, Duration::from_secs(5))
             };
-            if let Some(text) = text {
-                let _ = resp_tx.send(text);
-            }
+            let response = match text {
+                Ok(body) => ControlCommandResponse::success(body),
+                Err(error) => ControlCommandResponse::error(error),
+            };
+            let _ = resp_tx.send(response);
             true
         }
         "has-session" | "has" => {
             let (rtx, rrx) = mpsc::channel::<bool>();
             let _ = tx.send(CtrlReq::HasSession(rtx));
-            if let Ok(exists) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(if exists { String::new() } else { "session not found".to_string() });
-            }
+            let response = recv_control_response(cmd, rrx, Duration::from_secs(5))
+                .and_then(|exists| {
+                    if exists {
+                        Ok(String::new())
+                    } else {
+                        Err("session not found".to_string())
+                    }
+                })
+                .map(ControlCommandResponse::success)
+                .unwrap_or_else(ControlCommandResponse::error);
+            let _ = resp_tx.send(response);
             true
         }
         "list-clients" | "lsc" => {
@@ -3856,9 +3968,7 @@ fn dispatch_control_command(
             } else {
                 let _ = tx.send(CtrlReq::ListClients(rtx));
             }
-            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(text);
-            }
+            forward_control_response(cmd, rrx, &resp_tx, Duration::from_secs(5));
             true
         }
         "detach-client" | "detach" => {
@@ -3887,29 +3997,29 @@ fn dispatch_control_command(
                 // No flags from CLI: detach all clients of this session.
                 let _ = tx.send(CtrlReq::DetachAllClients(kill_parent));
             }
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "kill-session" => {
             let _ = tx.send(CtrlReq::KillSession);
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "kill-server" => {
             let _ = tx.send(CtrlReq::KillServer);
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "select-layout" | "selectl" => {
             if let Some(layout) = args.first() {
                 let _ = tx.send(CtrlReq::SelectLayout(layout.to_string()));
             }
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "next-layout" | "nextl" => {
             let _ = tx.send(CtrlReq::NextLayout);
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "resize-pane" | "resizep" => {
@@ -3937,7 +4047,7 @@ fn dispatch_control_command(
                     else { "D" };
                 let _ = tx.send(CtrlReq::ResizePane(dir.to_string(), amount));
             }
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "swap-pane" | "swapp" => {
@@ -3972,7 +4082,7 @@ fn dispatch_control_command(
                     let _ = tx.send(CtrlReq::SwapPane(direction));
                 }
             }
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "bind-key" | "bind" => {
@@ -3997,7 +4107,7 @@ fn dispatch_control_command(
                 let command = requote_command_tail(&args[i + 1..]);
                 let _ = tx.send(CtrlReq::BindKey(table_name, key, command, repeat));
             }
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "unbind-key" | "unbind" => {
@@ -4039,14 +4149,14 @@ fn dispatch_control_command(
                     let _ = tx.send(CtrlReq::UnbindKey(key.to_string(), table));
                 }
             }
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "source-file" | "source" => {
             if let Some(path) = args.first() {
                 let _ = tx.send(CtrlReq::SourceFile(path.trim_matches('"').to_string()));
             }
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "set-environment" | "setenv" => {
@@ -4060,15 +4170,13 @@ fn dispatch_control_command(
             } else if positional.len() >= 2 {
                 let _ = tx.send(CtrlReq::SetEnvironment(positional[0].to_string(), positional[1].to_string()));
             }
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "show-environment" | "showenv" => {
             let (rtx, rrx) = mpsc::channel::<String>();
             let _ = tx.send(CtrlReq::ShowEnvironment(rtx));
-            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(text);
-            }
+            forward_control_response(cmd, rrx, &resp_tx, Duration::from_secs(5));
             true
         }
         "set-hook" => {
@@ -4089,75 +4197,67 @@ fn dispatch_control_command(
                     let _ = tx.send(CtrlReq::SetHook(name, command));
                 }
             }
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "show-hooks" => {
             let (rtx, rrx) = mpsc::channel::<String>();
             let _ = tx.send(CtrlReq::ShowHooks(rtx));
-            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(text);
-            }
+            forward_control_response(cmd, rrx, &resp_tx, Duration::from_secs(5));
             true
         }
         "server-info" | "info" => {
             let (rtx, rrx) = mpsc::channel::<String>();
             let _ = tx.send(CtrlReq::ServerInfo(rtx));
-            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(text);
-            }
+            forward_control_response(cmd, rrx, &resp_tx, Duration::from_secs(5));
             true
         }
         "list-commands" | "lscm" => {
             let (rtx, rrx) = mpsc::channel::<String>();
             let _ = tx.send(CtrlReq::ListCommands(rtx));
-            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(text);
-            }
+            forward_control_response(cmd, rrx, &resp_tx, Duration::from_secs(5));
             true
         }
         "dump-state" | "dump" => {
             let (rtx, rrx) = mpsc::channel::<String>();
             let _ = tx.send(CtrlReq::DumpState(rtx, false, client_id));
-            if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(text);
-            }
+            forward_control_response(cmd, rrx, &resp_tx, Duration::from_secs(5));
             true
         }
         "zoom-pane" | "resizep -Z" => {
             let _ = tx.send(CtrlReq::ZoomPane);
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "last-window" | "last" => {
             let _ = tx.send(CtrlReq::LastWindow);
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "last-pane" | "lastp" => {
             let _ = tx.send(CtrlReq::LastPane);
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "next-window" | "next" => {
             let _ = tx.send(CtrlReq::NextWindow);
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "previous-window" | "prev" => {
             let _ = tx.send(CtrlReq::PrevWindow);
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "rotate-window" | "rotatew" => {
             let upward = args.iter().any(|a| *a == "-U");
             let _ = tx.send(CtrlReq::RotateWindow(upward));
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "break-pane" | "breakp" => {
             let _ = tx.send(CtrlReq::BreakPane);
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "respawn-pane" | "respawnp" => {
@@ -4170,7 +4270,7 @@ fn dispatch_control_command(
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
             let _ = tx.send(CtrlReq::RespawnPane(workdir, kill, command, empty));
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "wait-for" | "wait" => {
@@ -4181,7 +4281,7 @@ fn dispatch_control_command(
             if let Some(channel) = args.iter().find(|a| !a.starts_with('-')) {
                 let _ = tx.send(CtrlReq::WaitFor(channel.to_string(), op));
             }
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "refresh-client" | "refresh" => {
@@ -4272,12 +4372,14 @@ fn dispatch_control_command(
                                 });
                             }
                             Err(error) => {
-                                let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", error));
+                                let _ = resp_tx.send(ControlCommandResponse::error(error));
                                 return true;
                             }
                         },
                         None => {
-                            let _ = resp_tx.send("\u{0001}ERR\u{0001}missing size argument".to_string());
+                            let _ = resp_tx.send(ControlCommandResponse::error(
+                                "missing size argument",
+                            ));
                             return true;
                         }
                     }
@@ -4286,32 +4388,28 @@ fn dispatch_control_command(
                 }
                 i += 1;
             }
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "run-command" | "runcmd" => {
             let full_cmd = args.join(" ");
             let (rtx, rrx) = mpsc::channel::<String>();
             let _ = tx.send(CtrlReq::RunCommand(full_cmd, rtx));
-            if let Ok(resp) = rrx.recv_timeout(Duration::from_secs(15)) {
-                let _ = resp_tx.send(resp);
-            } else {
-                let _ = resp_tx.send("timeout".to_string());
-            }
+            forward_control_response(cmd, rrx, &resp_tx, Duration::from_secs(15));
             true
         }
         // iTerm2 sends "phony-command" as a tmux ping/keepalive on entering
         // gateway mode (see iTerm2 TmuxController.m kickOffTmuxForRestoration).
         // Real tmux returns success with no output; we mimic that.
         "phony-command" => {
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         // Copy mode in tmux control sessions is a no-op for iTerm2 — iTerm
         // implements its own copy mode locally on captured pane content.
         // Returning success keeps iTerm's command pipeline alive.
         "copy-mode" => {
-            let _ = resp_tx.send(String::new());
+            let _ = resp_tx.send(ControlCommandResponse::empty());
             true
         }
         "resize-window" | "resizew" => {
@@ -4330,19 +4428,19 @@ fn dispatch_control_command(
             };
             match response {
                 Ok(()) => {
-                    let _ = resp_tx.send(String::new());
+                    let _ = resp_tx.send(ControlCommandResponse::empty());
                 }
                 Err(error) => {
-                    let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", error));
+                    let _ = resp_tx.send(ControlCommandResponse::error(error));
                 }
             }
             true
         }
         _ => {
-            // Unknown command — emit %error like tmux does, not %end.
-            // The leading "\u{0001}ERR\u{0001}" sentinel tells the dispatch
-            // wrapper to use format_error instead of format_end.
-            let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}unknown command: {}", cmd));
+            let _ = resp_tx.send(ControlCommandResponse::error(format!(
+                "unknown command: {}",
+                cmd
+            )));
             true
         }
     }
@@ -4355,3 +4453,11 @@ mod tests_issue476_bindkey_quoting;
 #[cfg(test)]
 #[path = "../../tests-rs/test_send_keys_literal_byte.rs"]
 mod tests_send_keys_literal_byte;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_control_mode_liveness.rs"]
+mod tests_control_mode_liveness;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_capture_pane_wait_bound.rs"]
+mod tests_capture_pane_wait_bound;

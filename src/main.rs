@@ -4432,9 +4432,16 @@ fn run_control_mode(mode: u8) -> io::Result<()> {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
                     if let Some(ref mut f) = log_file {
+                        // Truncate on a char boundary: a byte slice at 200 can
+                        // land inside a multi-byte glyph (TUI box drawing) and
+                        // panic, killing the whole control client.
+                        let mut cut = line.len().min(200);
+                        while cut > 0 && !line.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
                         let _ = writeln!(f, "[{:>8.3}s] OUT ({} bytes): {:?}",
                             start.elapsed().as_secs_f64(), line.len(),
-                            &line[..line.len().min(200)]);
+                            &line[..cut]);
                     }
                     let mut out = stdout.lock();
                     let _ = out.write_all(line.as_bytes());
@@ -4739,3 +4746,7 @@ mod readiness_tests {
         assert!(!detached_list_windows_ready("ERROR: Invalid session key\n"));
     }
 }
+
+#[cfg(test)]
+#[path = "../tests-rs/test_client_debug_log_truncation.rs"]
+mod tests_client_debug_log_truncation;

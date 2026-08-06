@@ -410,7 +410,18 @@ pub fn warm_pane_is_live(wp: &mut crate::types::WarmPane) -> bool {
 /// its reader thread already running — by the time the user creates a new window
 /// (typically 500ms+), pwsh will have fully loaded its profile and the prompt
 /// is ready.
-pub fn spawn_warm_pane(pty_system: &dyn portable_pty::PtySystem, app: &mut AppState) -> io::Result<crate::types::WarmPane> {
+pub(crate) struct WarmPaneSpawnSpec {
+    size: PtySize,
+    shell_cmd: CommandBuilder,
+    pane_id: usize,
+    history_limit: usize,
+    allow_alternate_screen: bool,
+}
+
+/// Snapshot every `AppState` value needed by a warm-pane spawn. This runs on
+/// the server thread; the resulting owned spec can safely cross to a worker
+/// without giving that worker access to mutable session state.
+pub(crate) fn prepare_warm_pane_spawn(app: &mut AppState) -> io::Result<WarmPaneSpawnSpec> {
     if !app.warm_enabled {
         return Err(io::Error::new(io::ErrorKind::Other, "warm panes disabled"));
     }
@@ -418,9 +429,6 @@ pub fn spawn_warm_pane(pty_system: &dyn portable_pty::PtySystem, app: &mut AppSt
     let rows = if area.height > 1 { area.height } else { 30 }.max(MIN_PANE_DIM);
     let cols = if area.width > 1 { area.width } else { 120 }.max(MIN_PANE_DIM);
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
-    let pair = pty_system
-        .openpty(size)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
     // Expand format variables like #{pane_current_path} at spawn time (#111).
     let expanded_shell = crate::format::expand_format(&app.default_shell, app);
     let mut shell_cmd = if !expanded_shell.is_empty() {
@@ -433,13 +441,37 @@ pub fn spawn_warm_pane(pty_system: &dyn portable_pty::PtySystem, app: &mut AppSt
     set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
     set_host_colors_env(&mut shell_cmd, app.host_colors.as_ref());
     apply_user_environment(&mut shell_cmd, &app.environment);
-    let child = pair.slave
+    Ok(WarmPaneSpawnSpec {
+        size,
+        shell_cmd,
+        pane_id,
+        history_limit: app.history_limit,
+        allow_alternate_screen: app.allow_alternate_screen,
+    })
+}
+
+/// Perform only the OS-facing portion of a warm-pane spawn. The input is an
+/// immutable snapshot, so this function may run on a worker thread.
+pub(crate) fn spawn_warm_pane_from_spec(
+    pty_system: &dyn portable_pty::PtySystem,
+    spec: WarmPaneSpawnSpec,
+) -> io::Result<crate::types::WarmPane> {
+    let WarmPaneSpawnSpec {
+        size,
+        shell_cmd,
+        pane_id,
+        history_limit,
+        allow_alternate_screen,
+    } = spec;
+    let pair = pty_system
+        .openpty(size)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
+    let mut child = pair.slave
         .spawn_command(shell_cmd)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
     drop(pair.slave);
-    let scrollback = app.history_limit as u32;
-    let mut parser = vt100::Parser::new(rows, cols, scrollback as usize);
-    parser.screen_mut().set_allow_alternate_screen(app.allow_alternate_screen);
+    let mut parser = vt100::Parser::new(size.rows, size.cols, history_limit);
+    parser.screen_mut().set_allow_alternate_screen(allow_alternate_screen);
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(parser));
     let term_reader = term.clone();
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -452,16 +484,39 @@ pub fn spawn_warm_pane(pty_system: &dyn portable_pty::PtySystem, app: &mut AppSt
     let cpr_writer = cpr_pending.clone();
     let color_query_pending = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let cq_writer = color_query_pending.clone();
-    let reader = pair.master
-        .try_clone_reader()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
+    let reader = match pair.master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            child.kill().ok();
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("clone reader error: {error}"),
+            ));
+        }
+    };
     let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<u8>::new()));
-    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), pane_id);
     let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
-    let mut pty_writer = pair.master.take_writer()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
+    let mut pty_writer = match pair.master.take_writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            child.kill().ok();
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("take writer error: {error}"),
+            ));
+        }
+    };
+    spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), pane_id);
     conpty_preemptive_dsr_response(&mut *pty_writer);
-    Ok(crate::types::WarmPane { master: pair.master, writer: pty_writer, child, term, data_version, cursor_shape, bell_pending, cpr_pending, color_query_pending, child_pid, pane_id, rows, cols, output_ring })
+    Ok(crate::types::WarmPane { master: pair.master, writer: pty_writer, child, term, data_version, cursor_shape, bell_pending, cpr_pending, color_query_pending, child_pid, pane_id, rows: size.rows, cols: size.cols, output_ring })
+}
+
+pub fn spawn_warm_pane(
+    pty_system: &dyn portable_pty::PtySystem,
+    app: &mut AppState,
+) -> io::Result<crate::types::WarmPane> {
+    let spec = prepare_warm_pane_spawn(app)?;
+    spawn_warm_pane_from_spec(pty_system, spec)
 }
 
 pub fn split_active(app: &mut AppState, kind: LayoutKind) -> io::Result<()> {
