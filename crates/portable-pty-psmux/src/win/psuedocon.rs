@@ -395,3 +395,7 @@ mod tests {
         assert_ne!(base_flags() & PSEUDOCONSOLE_WIN32_INPUT_MODE, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "../../../../tests-rs/test_conpty_env_flags.rs"]
+mod tests_conpty_env_flags;
