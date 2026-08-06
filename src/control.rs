@@ -660,3 +660,11 @@ mod tests {
         assert_eq!(line, "%subscription-changed test_sub $1 @2 3 %4 : ");
     }
 }
+
+#[cfg(test)]
+#[path = "../tests-rs/test_control_slow_client_backlog.rs"]
+mod tests_control_slow_client_backlog;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_control_output_chunking.rs"]
+mod tests_control_output_chunking;

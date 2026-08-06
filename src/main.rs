@@ -4746,3 +4746,7 @@ mod readiness_tests {
         assert!(!detached_list_windows_ready("ERROR: Invalid session key\n"));
     }
 }
+
+#[cfg(test)]
+#[path = "../tests-rs/test_client_debug_log_truncation.rs"]
+mod tests_client_debug_log_truncation;
