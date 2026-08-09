@@ -1345,29 +1345,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     }
                 }
             }
-            // Issue #473: answer terminal color queries (OSC 4/10/11, CSI ?996n)
-            // detected in pane output, so pane applications can discover the
-            // terminal palette.  Colors come from the attached client's report
-            // of its host terminal, else the Campbell defaults.
-            if crate::types::COLOR_QUERY_PENDING.swap(false, std::sync::atomic::Ordering::AcqRel) {
-                let colors = app.host_colors.clone()
-                    .unwrap_or_else(crate::types::HostColors::campbell);
-                for win in &mut app.windows {
-                    helpers::drain_color_queries(&mut win.root, &colors);
-                    for fp in win.floating.iter_mut() {
-                        let bits = fp.pane.color_query_pending.swap(0, std::sync::atomic::Ordering::AcqRel);
-                        if bits != 0 {
-                            helpers::answer_color_queries(bits, &mut *fp.pane.writer, fp.pane.child_pid, &colors);
-                        }
-                    }
-                }
-                if let Mode::PopupMode { popup_pane: Some(ref mut pane), .. } = app.mode {
-                    let bits = pane.color_query_pending.swap(0, std::sync::atomic::Ordering::AcqRel);
-                    if bits != 0 {
-                        helpers::answer_color_queries(bits, &mut *pane.writer, pane.child_pid, &colors);
-                    }
-                }
-            }
+            // Issue #473 color-query answering removed: answering OSC 4/10/11
+            // / CSI ?996n queries from pane apps races yazi's startup probe —
+            // the response lands after yazi's probe window closes, gets
+            // re-parsed as an interactive `shell` action, and a "Shell:" popup
+            // appears with "rgb:0c0c/0c0c/0c0c\" in it. Unanswered, apps fall
+            // back to their defaults (yazi, nvim, fzf all do). The scanning/
+            // answering helpers remain as dead code for a future fix that
+            // answers synchronously within the probe window.
         }
         // When a popup PTY or a floating pane is active, always push frames so
         // interactive content (fzf, shell prompts) updates in real-time.
