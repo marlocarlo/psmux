@@ -228,12 +228,20 @@ psmux supports a multi-line status bar using the `status-format[]` array. Set th
 # Enable a 2-line status bar
 set -g status 2
 
-# Configure each line (0-indexed)
-set -g status-format[0] "#[align=left]#S #[align=right]%H:%M"
-set -g status-format[1] "#[align=left]#{W:#I:#W }"
+# Line 0 carries the window list. #[range=window|N] is what makes each tab a
+# click target -- see "Clickable window tabs" below.
+set -g status-format[0] "#[align=left]#{W:#[range=window|#{e|-:#{window_index}#,1}]  #I #W  #[norange]}"
+set -g status-format[1] "#[align=left]#S #[align=right]%H:%M"
 ```
 
 The first line (`status-format[0]`) replaces the default status bar content. Additional lines stack below (or above, depending on `status-position`).
+
+**Clickable window tabs.** With a custom `status-format[0]`, tab click targets come from that line's `#[range=window|N]` markers and nothing else. A window list written without them renders correctly but cannot be clicked, with no warning. Two things to get right:
+
+- **`N` is zero-based.** `base-index` is added back when the click is resolved, so with the default `base-index 1` the marker needs `#{window_index}` minus one: `#[range=window|#{e|-:#{window_index}#,1}]`.
+- **Escape commas inside `#{W:...}`.** A comma separates the `inactive,current` arguments of the loop, so any other comma within it must be written `#,` — including the one in `#{e|-:a,b}`. For the same reason write styles as `#[fg=green]#[bold]` rather than `#[fg=green,bold]`.
+
+Today only line 0's ranges are collected, and only the first status row is hit-tested, so a window list on line 1 or later cannot be clicked at all — put it on line 0. See [#593](https://github.com/psmux/psmux/issues/593).
 
 ### Pane Border Labels
 
