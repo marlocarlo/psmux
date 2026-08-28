@@ -456,6 +456,52 @@ pub fn conpty_needs_mouse_record_bypass() -> bool {
     windows_build_number().map_or(false, |b| b < CONPTY_MOUSE_MIN_BUILD)
 }
 
+/// Environment override for the #598 wheel gate (issue #613).
+///
+/// That gate forwards a wheel report only into a pane whose application asked
+/// for the mouse, and on Windows it accepts two answers: a DECSET attributed
+/// to a confirmed foreground (`mouse_proto_owner`), or `ENABLE_MOUSE_INPUT` on
+/// the child console right now.  Neither survives an unrelated child process.
+/// Console input mode belongs to the CONSOLE, not to the process that set it,
+/// and a child entering raw mode overwrites the whole mode word instead of
+/// clearing single bits: libuv writes `ENABLE_WINDOW_INPUT |
+/// ENABLE_VIRTUAL_TERMINAL_INPUT` and drops the mouse bit as a side effect,
+/// without restoring the previous mode on exit.  One `node` child anywhere in
+/// the pane's process tree therefore strips the gate's authorization for good,
+/// and because the console outlives the process, restarting the pane's
+/// application does not earn it back — only a new window does.
+///
+/// An application that registers through NEITHER signal can never earn it at
+/// all.  Measured on Claude Code (#613): it consumes SGR wheel reports fine —
+/// setting the console bit by hand makes it scroll instantly — but emits no
+/// DECSET, so `mouse_proto_owner` has nothing to attribute.
+///
+/// `PSMUX_FORCE_WHEEL=1` authorizes the wheel for every pane on this server
+/// regardless of either signal; `=0`, an unrecognised value and unset all keep
+/// the gate, which is the safe side.
+///
+/// Deliberately NOT routed through [`forced_mouse_setting`], for the same
+/// reason [`conpty_needs_mouse_record_bypass`] is not: `PSMUX_FORCE_MOUSE` is
+/// the CLIENT to terminal direction (may psmux write mouse DECSET out), while
+/// this is whether a report psmux ALREADY holds may be delivered into a pane.
+///
+/// This is a server-wide escape hatch, so it re-exposes the #598 damage on
+/// panes that genuinely do not read the mouse: htop reads the raw report as
+/// keystrokes and fills its search prompt with the digits.  It stays opt-in
+/// and off by default for exactly that reason.
+pub const FORCE_WHEEL_ENV: &str = "PSMUX_FORCE_WHEEL";
+
+/// Whether [`FORCE_WHEEL_ENV`] authorizes the wheel past the #598 gate.
+///
+/// Accepts the same spellings as [`forced_mouse_setting`], but collapses to a
+/// plain `bool`: there is no third state to express, since "keep the gate" is
+/// already what every non-affirmative value means.
+pub fn wheel_gate_forced() -> bool {
+    std::env::var(FORCE_WHEEL_ENV).map_or(false, |raw| {
+        matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes")
+    })
+}
+
 /// Whether the local-console keep-alive may re-assert `ENABLE_MOUSE_INPUT`
 /// on this host (issue #597).
 ///
@@ -2025,6 +2071,10 @@ mod tests_issue457_ssh_mouse_build_gate;
 #[cfg(test)]
 #[path = "../tests-rs/test_issue573_mouse_force_override.rs"]
 mod tests_issue573_mouse_force_override;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue613_wheel_gate_override.rs"]
+mod tests_issue613_wheel_gate_override;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue597_mouse_keepalive_reassert.rs"]

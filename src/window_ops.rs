@@ -574,7 +574,14 @@ pub(crate) fn inject_mouse_combined(pane: &mut Pane, col: i16, row: i16, vt_butt
         // it is only run for the wheel, and only after the cheap
         // `mouse_proto_owner` check has already failed.  Clicks, drags and
         // motion never reach it.
+        //
+        // Both signals live outside psmux's control and a third party can
+        // destroy signal 2 (any child entering raw mode rewrites the console
+        // mode word), so `PSMUX_FORCE_WHEEL` exists as an opt-in override for
+        // panes that can never satisfy either — see `wheel_gate_forced` for
+        // the measurement and why it is not `PSMUX_FORCE_MOUSE` (#613).
         if _event_flags & mouse_inject::MOUSE_WHEELED != 0
+            && !crate::ssh_input::wheel_gate_forced()
             && !matches!(pane.mouse_proto_owner, Some((_, true)))
             && !detect_mouse_input(pane)
         {
