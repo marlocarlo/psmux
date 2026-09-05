@@ -35,6 +35,7 @@ mod ssh_input;
 mod debug_log;
 mod control;
 mod resize_window;
+mod kill_window;
 mod proxy_pane;
 mod cross_session;
 mod cross_session_server;
@@ -749,6 +750,18 @@ fn run_main() -> io::Result<()> {
             crate::cli::normalize_flag_equals(env::args().collect()),
         ),
     );
+    let command_index = process_command_index(&args);
+    // Reject malformed kill-window arguments before cleanup, probing, or any
+    // server connection.
+    let kill_window_command = command_index
+        .and_then(|index| {
+            crate::kill_window::KillWindowCommand::parse(
+                &args[index],
+                args[index + 1..].iter(),
+            )
+        })
+        .transpose()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     
     // Set console code page to UTF-8 early so ALL output paths (CLI commands
     // like capture-pane, list-sessions, display-message, etc.) correctly
@@ -822,7 +835,6 @@ fn run_main() -> io::Result<()> {
     // $TMUX-based resolution below so a stale PSMUX_TARGET_SESSION inherited from
     // the pane environment (e.g. a warm-pool shell frozen at `__warm__`) can never
     // hijack the current session. See issue #485.
-    let command_index = process_command_index(&args);
     let target_position = command_index.and_then(|index| process_target_position(&args, index));
     let strip_target_position = command_index
         .filter(|index| !matches!(args[*index].as_str(), "detach-client" | "detach"))
@@ -847,10 +859,17 @@ fn run_main() -> io::Result<()> {
     } else {
         None
     };
-    let explicit_target = if is_set_option_command {
-        set_option_target.as_ref().or(precommand_target.as_ref())
+    let kill_window_target = kill_window_command
+        .as_ref()
+        .and_then(|command| command.effective_target(precommand_target.as_deref()));
+    let explicit_target: Option<&str> = if kill_window_command.is_some() {
+        kill_window_target.as_deref()
+    } else if is_set_option_command {
+        set_option_target.as_deref().or(precommand_target.as_deref())
     } else {
-        target_position.and_then(|position| args.get(position + 1))
+        target_position
+            .and_then(|position| args.get(position + 1))
+            .map(String::as_str)
     };
     let mut explicit_session_target = false;
     if let Some(target) = explicit_target {
@@ -2699,26 +2718,16 @@ fn run_main() -> io::Result<()> {
             }
             // kill-window - Kill a window
             "kill-window" | "killw" => {
-                let mut cmd = "kill-window".to_string();
-                let mut i = 1;
-                while i < cmd_args.len() {
-                    match cmd_args[i].as_str() {
-                        "-t" => {
-                            if let Some(t) = cmd_args.get(i + 1) {
-                                cmd.push_str(&format!(" -t {}", t));
-                                i += 1;
-                            }
-                        }
-                        "-a" => { cmd.push_str(" -a"); }
-                        _ => {}
-                    }
-                    i += 1;
-                }
-                cmd.push('\n');
+                let command = kill_window_command.as_ref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "kill-window command was not parsed",
+                    )
+                })?;
                 // #559: the server already answers "ERROR: can't find window"
                 // for a bad -t, but the fire-and-forget send discarded it and
                 // exited 0 — a silent no-op (tmux exits 1). Read the reply.
-                let resp = send_control_with_response(cmd)?;
+                let resp = send_control_with_response(command.to_wire_command())?;
                 if !resp.trim().is_empty() {
                     eprint!("{}", resp);
                     std::process::exit(1);

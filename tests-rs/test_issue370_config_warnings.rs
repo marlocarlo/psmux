@@ -53,6 +53,30 @@ fn routed_commands_do_not_warn() {
         "valid routed directives must not warn, got: {:?}", a.config_warnings);
 }
 
+#[test]
+fn kill_window_missing_target_warns_before_storing_deferred_commands() {
+    let mut a = app();
+
+    crate::config::parse_config_content(
+        &mut a,
+        "kill-window -t\nbind-key x killw -t\nset-hook pane-died kill-window -t\n",
+    );
+
+    assert_eq!(
+        a.config_warnings
+            .iter()
+            .filter(|warning| warning.contains("-t expects an argument"))
+            .count(),
+        3
+    );
+    assert!(a.key_tables.get("prefix").is_none_or(|bindings| {
+        bindings
+            .iter()
+            .all(|binding| binding.key.0 != crossterm::event::KeyCode::Char('x'))
+    }));
+    assert!(!a.hooks.contains_key("pane-died"));
+}
+
 // ---- Unknown options ----
 
 #[test]

@@ -90,7 +90,7 @@ fn auth_debug(msg: &str) {
         }
     }
 }
-use crate::commands::parse_command_line;
+use crate::commands::{parse_command_line, requote_command_tail};
 use super::helpers::TMUX_COMMANDS;
 
 /// Split a command line on top-level `;` separators, respecting single and
@@ -238,20 +238,48 @@ fn flag_value(args: &[&str], flag: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == flag).map(|w| w[1].to_string())
 }
 
-fn requote_command_tail(args: &[&str]) -> String {
-    args.iter().map(|t| {
-        if t.is_empty() {
-            "''".to_string()
-        } else if *t == ";" || *t == "\\;" {
-            t.to_string()
-        } else if t.contains('\'') {
-            format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\""))
-        } else if t.chars().any(|c| c.is_whitespace() || c == '"') {
-            format!("'{}'", t)
-        } else {
-            t.to_string()
+fn parse_and_validate_ingress(
+    command: &str,
+    args: &[&str],
+) -> Result<Option<crate::kill_window::KillWindowCommand>, String> {
+    let parsed = crate::kill_window::KillWindowCommand::parse(
+        command,
+        args.iter().copied(),
+    )
+    .transpose()
+    .map_err(|error| error.to_string())?;
+
+    crate::commands::validate_deferred_command(command, args)?;
+
+    Ok(parsed)
+}
+
+fn dispatch_kill_window(
+    tx: &mpsc::Sender<CtrlReq>,
+    target: Option<&str>,
+) -> Result<(), String> {
+    let parsed = target.map(parse_target);
+    let (window, window_is_id, name) = match parsed {
+        Some(target) => (target.window, target.window_is_id, target.window_name),
+        None => (None, false, None),
+    };
+    if window.is_some() || name.is_some() {
+        // Resolve explicitly instead of focusing then issuing a bare kill:
+        // a missing target must error rather than kill the active window.
+        let (response_tx, response_rx) = mpsc::channel();
+        let _ = tx.send(CtrlReq::KillWindowTarget {
+            win: window,
+            win_is_id: window_is_id,
+            name,
+            resp: response_tx,
+        });
+        if let Ok(result) = response_rx.recv_timeout(Duration::from_secs(5)) {
+            result?;
         }
-    }).collect::<Vec<String>>().join(" ")
+    } else {
+        let _ = tx.send(CtrlReq::KillWindow);
+    }
+    Ok(())
 }
 
 /// The positional `shell-command` operand of `respawn-pane` / `respawn-window`
@@ -784,6 +812,20 @@ if control_echo || control_noecho {
         } else {
             (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
         };
+        let kill_window = match parse_and_validate_ingress(cmd_name, &cmd_args) {
+            Ok(command) => command,
+            Err(error) => {
+                let mut ws = write_lock.lock().unwrap();
+                if control_echo {
+                    let _ = writeln!(ws, "{}", trimmed);
+                }
+                let _ = writeln!(ws, "{}", control::format_begin(ts, cmd_counter));
+                let _ = writeln!(ws, "psmux: {}", error);
+                let _ = writeln!(ws, "{}", control::format_error(ts, cmd_counter));
+                let _ = ws.flush();
+                continue;
+            }
+        };
 
         // Parse -t from command args
         let mut ctrl_target_win: Option<usize> = None;
@@ -800,7 +842,11 @@ if control_echo || control_noecho {
             matches!(cmd_name, "set-window-option" | "setw");
         let ctrl_set_args = ctrl_set_option
             .then(|| parse_set_option_args(&cmd_args));
-        if let Some(parsed_set) = ctrl_set_args.as_ref() {
+        if let Some(command) = kill_window.as_ref() {
+            ctrl_raw_target = command
+                .effective_target(None)
+                .map(|target| crate::cli::strip_exact_match_prefix(&target).to_string());
+        } else if let Some(parsed_set) = ctrl_set_args.as_ref() {
             if let Some(value) = parsed_set.target {
                 ctrl_raw_target =
                     Some(crate::cli::strip_exact_match_prefix(value).to_string());
@@ -860,7 +906,8 @@ if control_echo || control_noecho {
         // swap-window/switch-client resolve their own targets (or name a
         // destination that need not exist yet), so temp-focusing here would
         // either undo the change (#483) or misdirect it (#442) for
-        // control-mode clients exactly as it did for one-shot ones.
+        // control-mode clients exactly as it did for one-shot ones. kill-window
+        // resolves explicitly so a miss never falls through to a bare kill.
         let skip_target_focus = matches!(cmd_name, "join-pane" | "joinp" | "move-pane" | "movep"
             | "move-window" | "movew" | "swap-window" | "swapw"
             | "switch-client" | "switchc" | "resize-window" | "resizew"
@@ -1080,6 +1127,18 @@ loop {
     } else {
         (raw_cmd, parsed.iter().skip(1).map(|s| s.as_str()).collect())
     };
+    let kill_window = match parse_and_validate_ingress(cmd, &args) {
+        Ok(command) => command,
+        Err(error) => {
+            let _ = writeln!(write_stream, "psmux: {}", error);
+            let _ = write_stream.flush();
+            if !persistent {
+                break;
+            }
+            line.clear();
+            continue;
+        }
+    };
 
 // Parse -t argument from command line (takes precedence over global TARGET)
 let mut target_win: Option<usize> = global_target_win;
@@ -1094,7 +1153,11 @@ let set_option_command = matches!(
     cmd,
     "set-option" | "set" | "set-window-option" | "setw"
 );
-if set_option_command {
+if let Some(command) = kill_window.as_ref() {
+    raw_target = command
+        .effective_target(global_raw_target.as_deref())
+        .map(|target| crate::cli::strip_exact_match_prefix(&target).to_string());
+} else if set_option_command {
     if let Some(value) = parse_set_option_args(&args).target {
         raw_target = Some(crate::cli::strip_exact_match_prefix(value).to_string());
         let parsed_target = parse_target(value);
@@ -1165,6 +1228,8 @@ let is_focus_cmd = matches!(cmd, "select-window" | "selectw" | "select-pane" | "
 // switch-client resolves the window/pane target itself (#483) and makes the
 // change PERMANENT; letting the generic block issue a temporary focus here
 // would restore the old focus after the batch and silently undo the switch.
+// kill-window resolves its target before dispatch so a miss cannot leave
+// the previous window focused and then kill it with a bare request.
 // detach-client's -t is a CLIENT spec (numeric id, %ID, or tty name) that
 // its handler resolves itself — it must never be validated as a pane/window
 // target (a client id shaped like %N would be rejected whenever no pane %N
@@ -1864,28 +1929,12 @@ match cmd {
         if !persistent { break; }
     }
     "kill-window" | "killw" => {
-        // Resolve the -t target server-side. The generic temp-focus block is
-        // skipped for kill-window (see skip_target_focus): focusing a target
-        // that fails to resolve silently left the PREVIOUS window focused and
-        // the bare KillWindow then killed it — `kill-window -t sess:typo`
-        // destroyed whatever was active (tmux: "can't find window", no kill).
-        if target_win.is_some() || target_win_name.is_some() {
-            let (resp_s, resp_r) = mpsc::channel();
-            let _ = tx.send(CtrlReq::KillWindowTarget {
-                win: target_win,
-                win_is_id: target_win_is_id,
-                name: target_win_name.clone(),
-                resp: resp_s,
-            });
-            if let Ok(Err(e)) = resp_r.recv_timeout(Duration::from_secs(5)) {
-                if !persistent {
-                    let _ = writeln!(write_stream, "ERROR: {}", e);
-                    let _ = write_stream.flush();
-                }
-                // persistent clients see it in the status bar (set server-side)
+        if let Err(error) = dispatch_kill_window(&tx, raw_target.as_deref()) {
+            if !persistent {
+                let _ = writeln!(write_stream, "ERROR: {}", error);
+                let _ = write_stream.flush();
             }
-        } else {
-            let _ = tx.send(CtrlReq::KillWindow);
+            // Persistent clients see the server-side status message.
         }
     }
     "kill-session" | "kill-ses" => {
@@ -4299,28 +4348,13 @@ fn dispatch_control_command(
             true
         }
         "kill-window" | "killw" => {
-            // Resolve any -t target server-side and error on a miss instead
-            // of killing the active window (same fix as the one-shot path).
-            let parsed = raw_target.map(parse_target);
-            let (t_win, t_win_is_id, t_name) = match parsed {
-                Some(pt) => (pt.window, pt.window_is_id, pt.window_name),
-                None => (None, false, None),
-            };
-            if t_win.is_some() || t_name.is_some() {
-                let (resp_s, resp_r) = mpsc::channel();
-                let _ = tx.send(CtrlReq::KillWindowTarget {
-                    win: t_win,
-                    win_is_id: t_win_is_id,
-                    name: t_name,
-                    resp: resp_s,
-                });
-                match resp_r.recv_timeout(Duration::from_secs(5)) {
-                    Ok(Err(e)) => { let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", e)); }
-                    _ => { let _ = resp_tx.send(String::new()); }
+            match dispatch_kill_window(tx, raw_target) {
+                Ok(()) => {
+                    let _ = resp_tx.send(String::new());
                 }
-            } else {
-                let _ = tx.send(CtrlReq::KillWindow);
-                let _ = resp_tx.send(String::new());
+                Err(error) => {
+                    let _ = resp_tx.send(format!("\u{0001}ERR\u{0001}{}", error));
+                }
             }
             true
         }
@@ -5108,6 +5142,10 @@ mod tests_send_keys_literal_byte;
 #[cfg(test)]
 #[path = "../../tests-rs/test_refresh_client_flags.rs"]
 mod tests_refresh_client_flags;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_kill_window_parser_ingress.rs"]
+mod tests_kill_window_parser_ingress;
 
 #[cfg(test)]
 #[path = "../../tests-rs/test_set_option_control.rs"]

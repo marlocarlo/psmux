@@ -146,3 +146,63 @@ fn bare_session_target_kills_the_active_window() {
 
     assert_eq!(window_names(&app), vec!["beta"]);
 }
+
+#[test]
+fn missing_target_value_fails_before_local_mutation() {
+    let mut app = app_with_windows(&["alpha", "beta"]);
+
+    let error = execute_command_string(&mut app, "kill-window -t").unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(error.to_string(), "-t expects an argument");
+    assert_eq!(window_names(&app), vec!["alpha", "beta"]);
+    assert_eq!(
+        app.status_message.as_ref().map(|message| message.0.as_str()),
+        Some("-t expects an argument")
+    );
+}
+
+#[test]
+fn missing_target_value_rejects_local_deferred_commands() {
+    let mut app = app_with_windows(&["alpha", "beta"]);
+
+    for command in [
+        "confirm-before kill-window -t",
+        "confirm-before 'kill-window -t'",
+        "bind-key x kill-window -t",
+        "set-hook pane-died killw -t",
+    ] {
+        let error = execute_command_string(&mut app, command).unwrap_err();
+        assert_eq!(error.to_string(), "-t expects an argument");
+    }
+    assert!(!matches!(app.mode, Mode::ConfirmMode { .. }));
+    assert!(app.key_tables.get("prefix").is_none_or(|bindings| {
+        bindings
+            .iter()
+            .all(|binding| binding.key.0 != crossterm::event::KeyCode::Char('x'))
+    }));
+    assert!(!app.hooks.contains_key("pane-died"));
+}
+
+#[test]
+fn repeated_targets_use_the_last_value() {
+    let mut app = app_with_windows(&["alpha", "beta", "gamma"]);
+
+    execute_command_string(&mut app, "kill-window -t @1 -t@2").unwrap();
+
+    assert_eq!(window_names(&app), vec!["alpha", "beta"]);
+}
+
+#[test]
+fn deferred_command_nesting_is_bounded() {
+    let mut app = app_with_windows(&["alpha", "beta"]);
+    let command = format!("{}kill-window", "confirm-before ".repeat(65));
+
+    let error = execute_command_string(&mut app, &command).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "command nesting exceeds 64 levels"
+    );
+    assert_eq!(window_names(&app), vec!["alpha", "beta"]);
+}
