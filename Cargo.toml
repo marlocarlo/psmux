@@ -67,6 +67,10 @@ name = "test_pr469_osc_command_safety"
 path = "tests-rs/test_pr469_osc_command_safety.rs"
 
 [[test]]
+name = "test_kill_window_cli_error"
+path = "tests-rs/test_kill_window_cli_error.rs"
+
+[[test]]
 name = "test_issue494_copymode_freeze"
 path = "tests-rs/test_issue494_copymode_freeze.rs"
 
@@ -117,6 +121,7 @@ regex = "1.13.1"
 glob = "0.3.4"
 anyhow = "1.0.104"
 base64 = "0.23.1"
+lexopt = "0.3.2"
 
 [profile.release]
 opt-level = 3

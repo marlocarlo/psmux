@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::types::{AppState, Action, Bind};
-use crate::commands::parse_command_to_action;
+use crate::commands::{parse_command_to_action, validate_command_sequence};
 
 // Track the current config file being parsed (for #{current_file}, #{d:current_file})
 thread_local! {
@@ -763,6 +763,10 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
                     cmd
                 }
             };
+            if let Err(error) = validate_command_sequence(&cmd) {
+                warn_config(app, error);
+                return;
+            }
             if append {
                 // -a/-ga: append to existing hook list (tmux multi-handler).
                 // Dedup identical commands so a re-sourced config does not
@@ -793,6 +797,10 @@ pub fn parse_config_line(app: &mut AppState, line: &str) {
         }
     }
     else {
+        if let Err(error) = validate_command_sequence(l) {
+            warn_config(app, error);
+            return;
+        }
         // Unrecognized directive. Warn only when the first token is not a known
         // command (a known-but-unrouted command like `new-window` stays silent
         // to match prior behavior; a genuine typo like `bnid-key` is surfaced).
@@ -1652,6 +1660,10 @@ pub fn parse_bind_key(app: &mut AppState, line: &str) {
     
     if i >= parts.len() { return; }
     let command = parts[i..].join(" ");
+    if let Err(error) = validate_command_sequence(&command) {
+        warn_config(app, error);
+        return;
+    }
     
     // Split on `\;` or `;` to support command chaining (like tmux `bind x split-window \; select-pane -D`)
     let sub_commands: Vec<String> = split_chained_commands(&command);

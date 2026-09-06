@@ -632,6 +632,89 @@ pub fn parse_command_to_action(cmd: &str) -> Option<Action> {
     }
 }
 
+/// Joins tokens into a command string while preserving ordinary token
+/// boundaries; `;` and `\;` remain command-chain separators.
+pub fn requote_command_tail<S: AsRef<str>>(args: &[S]) -> String {
+    args.iter()
+        .map(|token| {
+            let token = token.as_ref();
+            if token.is_empty() {
+                "''".to_string()
+            } else if token == ";" || token == "\\;" {
+                token.to_string()
+            } else if token.contains('\'') {
+                format!(
+                    "\"{}\"",
+                    token.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            } else if token.chars().any(|c| c.is_whitespace() || c == '"') {
+                format!("'{}'", token)
+            } else {
+                token.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Validates nested `kill-window` syntax in bindings, hooks, and confirmation
+/// commands, returning `Err` when nesting exceeds `MAX_DEFERRED_COMMAND_DEPTH`.
+pub fn validate_deferred_command<S: AsRef<str>>(
+    command: &str,
+    args: &[S],
+) -> Result<(), String> {
+    validate_deferred_command_at_depth(command, args, 0)
+}
+
+// Maliciously nested config/binding commands would otherwise recurse until
+// the process stack overflows.
+const MAX_DEFERRED_COMMAND_DEPTH: usize = 64;
+
+fn validate_deferred_command_at_depth<S: AsRef<str>>(
+    command: &str,
+    args: &[S],
+    depth: usize,
+) -> Result<(), String> {
+    let Some(start) = crate::cli::deferred_command_start(command, args) else {
+        return Ok(());
+    };
+    if depth >= MAX_DEFERRED_COMMAND_DEPTH {
+        return Err(format!(
+            "command nesting exceeds {MAX_DEFERRED_COMMAND_DEPTH} levels"
+        ));
+    }
+    let nested = if args[start..].len() == 1 {
+        // Quoted deferred commands arrive as one already-unquoted token.
+        args[start].as_ref().to_string()
+    } else {
+        requote_command_tail(&args[start..])
+    };
+    validate_command_sequence_at_depth(&nested, depth + 1)
+}
+
+/// Validates `kill-window` syntax and nested deferred commands in a chain.
+pub fn validate_command_sequence(command: &str) -> Result<(), String> {
+    validate_command_sequence_at_depth(command, 0)
+}
+
+fn validate_command_sequence_at_depth(command: &str, depth: usize) -> Result<(), String> {
+    for command in crate::config::split_chained_commands_pub(command) {
+        let tokens = parse_command_line(&command);
+        let Some(name) = tokens.first() else {
+            continue;
+        };
+        let args = &tokens[1..];
+        if let Some(parsed) = crate::kill_window::KillWindowCommand::parse(
+            name,
+            args.iter(),
+        ) {
+            parsed.map_err(|error| error.to_string())?;
+        }
+        validate_deferred_command_at_depth(name, args, depth)?;
+    }
+    Ok(())
+}
+
 /// Format an Action back to a command string
 pub fn format_action(action: &Action) -> String {
     match action {
@@ -972,7 +1055,73 @@ pub fn execute_command_string(app: &mut AppState, cmd: &str) -> io::Result<()> {
     execute_command_string_single(app, cmd)
 }
 
+/// Applies a parsed `kill-window` command in process without removing the
+/// session's final window.
+fn execute_kill_window(app: &mut AppState, command: &crate::kill_window::KillWindowCommand) {
+    let mut removed_pos = Some(app.active_idx);
+    if let Some(target) = command.target() {
+        let parsed = crate::cli::parse_target(target);
+        // A named target that does not resolve must not fall back to the active
+        // window; tmux reports "can't find window" and leaves state unchanged.
+        removed_pos = if let Some(window) = parsed.window {
+            if parsed.window_is_id {
+                app.windows.iter().position(|candidate| candidate.id == window)
+            } else {
+                app.win_pos(window)
+            }
+        } else if let Some(name) = parsed.window_name {
+            app.windows
+                .iter()
+                .position(|candidate| candidate.name == name)
+        } else {
+            // A bare session target means the active window, matching tmux.
+            Some(app.active_idx)
+        };
+        if removed_pos.is_none() {
+            app.status_message = Some((
+                format!("can't find window: {target}"),
+                std::time::Instant::now(),
+                None,
+            ));
+        }
+    }
+    if let Some(pos) = removed_pos {
+        if app.windows.len() > 1 && pos < app.windows.len() {
+            let mut window = app.windows.remove(pos);
+            kill_all_children(&mut window.root);
+            app.on_window_removed(pos);
+            if app.active_idx > pos {
+                app.active_idx -= 1;
+            }
+            if app.active_idx >= app.windows.len() {
+                app.active_idx = app.windows.len() - 1;
+            }
+        }
+    }
+}
+
 fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()> {
+    let parsed = parse_command_line(cmd);
+    if let Some(name) = parsed.first() {
+        if let Err(error) = validate_deferred_command(name, &parsed[1..]) {
+            app.status_message = Some((error.clone(), std::time::Instant::now(), None));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, error));
+        }
+        if let Some(command) = crate::kill_window::KillWindowCommand::parse(
+            name,
+            parsed.iter().skip(1),
+        ) {
+            let command = command.map_err(|error| {
+                let message = error.to_string();
+                app.status_message =
+                    Some((message.clone(), std::time::Instant::now(), None));
+                io::Error::new(io::ErrorKind::InvalidInput, message)
+            })?;
+            execute_kill_window(app, &command);
+            return Ok(());
+        }
+    }
+
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     if parts.is_empty() { return Ok(()); }
     
@@ -995,48 +1144,6 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "kill-pane" => {
             let _ = kill_active_pane(app);
-        }
-        "kill-window" | "killw" => {
-            // Resolve an explicit -t here; an unresolvable target is an error,
-            // not a fallback to the active window (tmux: "can't find window").
-            let mut removed_pos = Some(app.active_idx);
-            if let Some(t_pos) = parts.iter().position(|p| *p == "-t") {
-                if let Some(t) = parts.get(t_pos + 1) {
-                    let pt = crate::cli::parse_target(t);
-                    removed_pos = if let Some(w) = pt.window {
-                        if pt.window_is_id {
-                            app.windows.iter().position(|x| x.id == w)
-                        } else {
-                            app.win_pos(w)
-                        }
-                    } else if let Some(ref n) = pt.window_name {
-                        app.windows.iter().position(|x| x.name == *n)
-                    } else {
-                        // Bare session target: the active window, like tmux.
-                        Some(app.active_idx)
-                    };
-                    if removed_pos.is_none() {
-                        app.status_message = Some((
-                            format!("can't find window: {}", t),
-                            std::time::Instant::now(),
-                            None,
-                        ));
-                    }
-                }
-            }
-            if let Some(pos) = removed_pos {
-                if app.windows.len() > 1 && pos < app.windows.len() {
-                    let mut win = app.windows.remove(pos);
-                    kill_all_children(&mut win.root);
-                    app.on_window_removed(pos);
-                    if app.active_idx > pos {
-                        app.active_idx -= 1;
-                    }
-                    if app.active_idx >= app.windows.len() {
-                        app.active_idx = app.windows.len() - 1;
-                    }
-                }
-            }
         }
         "next-window" | "next" => {
             if !app.windows.is_empty() {
