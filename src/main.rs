@@ -719,9 +719,9 @@ mod process_command_arg_tests {
 /// Never hide a live warm registration by renaming its port file client-side.
 fn try_claim_warm_session(namespace: Option<&str>, name: &str) -> io::Result<bool> {
     let warm = crate::paths::storage_base(namespace, "__warm__");
-    let endpoint = match crate::session::read_session_endpoint(&warm) {
-        Ok(endpoint) => endpoint,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+    let endpoint = match crate::registry::read_warm_claim_endpoint(&warm) {
+        Ok(Some(endpoint)) => endpoint,
+        Ok(None) => return Ok(false),
         Err(e) => return Err(e),
     };
     if crate::session::registry_pid_anchor_alive(&warm) == Some(false) { return Ok(false); }

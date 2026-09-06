@@ -2273,55 +2273,47 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 || crate::config::is_warm_disabled_by_config();
             let claimed_warm = if !warm_disabled && initial_command.is_none() && start_dir.is_none() && env_vars.is_empty() {
                 let warm_base = crate::paths::storage_base(app.socket_name.as_deref(), "__warm__");
-                let warm_port_path = crate::paths::port_file(&warm_base);
-                if std::path::Path::new(&warm_port_path).exists() {
-                    if let Ok(warm_port_str) = std::fs::read_to_string(&warm_port_path) {
-                        if let Ok(warm_port) = warm_port_str.trim().parse::<u16>() {
-                            let warm_addr = format!("127.0.0.1:{}", warm_port);
-                            if std::net::TcpStream::connect_timeout(
-                                &warm_addr.parse().unwrap(),
-                                std::time::Duration::from_millis(100),
-                            ).is_ok() {
-                                let warm_key = crate::session::read_session_key(&warm_base).unwrap_or_default();
-                                if !warm_key.is_empty() {
-                                    // In-TUI new-session runs inside psmux, so the
-                                    // resolve reads this server's own environment and
-                                    // config rather than a user shell. Sending it is
-                                    // still right: a session created from the TUI
-                                    // should land on the same class as the psmux the
-                                    // user is sitting in, not on the standby's stale
-                                    // one (#608).
-                                    let claim_prio = crate::platform::claim_priority_arg();
-                                    let claim_cmd = format!("claim-session {} -p {}\n", crate::util::quote_arg(&name), crate::util::quote_arg(&claim_prio));
-                                    match crate::session::send_auth_cmd_response(
-                                        &warm_addr, &warm_key,
-                                        claim_cmd.as_bytes(),
-                                    ) {
-                                        Ok(resp) if resp.contains("OK") => {
-                                            if let Some(ref wn) = window_name {
-                                                let new_key = crate::session::read_session_key(&port_file_base).unwrap_or_default();
-                                                let _ = crate::session::send_auth_cmd(
-                                                    &warm_addr, &new_key,
-                                                    format!("rename-window {}\n", crate::util::quote_arg(wn)).as_bytes(),
-                                                );
-                                            }
-                                            // Apply -e environment variables to the claimed warm session
-                                            if !env_vars.is_empty() {
-                                                let new_key = crate::session::read_session_key(&port_file_base).unwrap_or_default();
-                                                for (k, v) in &env_vars {
-                                                    let _ = crate::session::send_auth_cmd(
-                                                        &warm_addr, &new_key,
-                                                        format!("set-environment {} {}\n", crate::util::quote_arg(k), crate::util::quote_arg(v)).as_bytes(),
-                                                    );
-                                                }
-                                            }
-                                            true
-                                        }
-                                        _ => false,
+                if let Ok(Some((warm_port, warm_key))) = crate::registry::read_warm_claim_endpoint(&warm_base) {
+                    let warm_addr = format!("127.0.0.1:{}", warm_port);
+                    if std::net::TcpStream::connect_timeout(
+                        &warm_addr.parse().unwrap(),
+                        std::time::Duration::from_millis(100),
+                    ).is_ok() {
+                        // In-TUI new-session runs inside psmux, so the
+                        // resolve reads this server's own environment and
+                        // config rather than a user shell. Sending it is
+                        // still right: a session created from the TUI
+                        // should land on the same class as the psmux the
+                        // user is sitting in, not on the standby's stale
+                        // one (#608).
+                        let claim_prio = crate::platform::claim_priority_arg();
+                        let claim_cmd = format!("claim-session {} -p {}\n", crate::util::quote_arg(&name), crate::util::quote_arg(&claim_prio));
+                        match crate::session::send_auth_cmd_response(
+                            &warm_addr, &warm_key,
+                            claim_cmd.as_bytes(),
+                        ) {
+                            Ok(resp) if resp.contains("OK") => {
+                                if let Some(ref wn) = window_name {
+                                    let new_key = crate::session::read_session_key(&port_file_base).unwrap_or_default();
+                                    let _ = crate::session::send_auth_cmd(
+                                        &warm_addr, &new_key,
+                                        format!("rename-window {}\n", crate::util::quote_arg(wn)).as_bytes(),
+                                    );
+                                }
+                                // Apply -e environment variables to the claimed warm session
+                                if !env_vars.is_empty() {
+                                    let new_key = crate::session::read_session_key(&port_file_base).unwrap_or_default();
+                                    for (k, v) in &env_vars {
+                                        let _ = crate::session::send_auth_cmd(
+                                            &warm_addr, &new_key,
+                                            format!("set-environment {} {}\n", crate::util::quote_arg(k), crate::util::quote_arg(v)).as_bytes(),
+                                        );
                                     }
-                                } else { false }
-                            } else { false }
-                        } else { false }
+                                }
+                                true
+                            }
+                            _ => false,
+                        }
                     } else { false }
                 } else { false }
             } else { false };

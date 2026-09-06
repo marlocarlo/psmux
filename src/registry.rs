@@ -29,6 +29,22 @@ pub fn read_manifest(base: &str) -> io::Result<Option<RegistryManifest>> {
     read_manifest_at(&manifest_path(base))
 }
 
+/// Warm claims must run on a server with the current registration protocol.
+/// A legacy standby remains untouched; callers can cold-start the new binary.
+/// Named-session connections still use the legacy-compatible endpoint reader.
+pub fn read_warm_claim_endpoint(base: &str) -> io::Result<Option<(u16, String)>> {
+    read_warm_claim_endpoint_at(&manifest_path(base))
+}
+
+fn read_warm_claim_endpoint_at(path: &Path) -> io::Result<Option<(u16, String)>> {
+    let Some(manifest) = read_manifest_at(path)? else { return Ok(None); };
+    if crate::session::validate_auth_key(&manifest.key).is_none() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid warm session authentication key"));
+    }
+    // Read both endpoint fields from one generation, never legacy satellites.
+    Ok(Some((manifest.port, manifest.key)))
+}
+
 fn read_manifest_at(path: &Path) -> io::Result<Option<RegistryManifest>> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -238,6 +254,46 @@ mod reliability_registry_tests {
     }
     fn owner(generation: &str) -> RegistryOwner { RegistryOwner { pid: std::process::id(),
         creation_time: crate::platform::process_kill::process_creation_time(std::process::id()).unwrap(), generation: generation.into() } }
+    #[test]
+    fn warm_claim_compatibility_preserves_legacy_standby() {
+        let d = temp();
+        let port = d.join("__warm__.port"); let key = d.join("__warm__.key");
+        std::fs::write(&port, "1234").unwrap();
+        std::fs::write(&key, "legacy-key").unwrap();
+        assert_eq!(read_warm_claim_endpoint_at(&d.join("__warm__.registry.json")).unwrap(), None);
+        assert_eq!(std::fs::read_to_string(port).unwrap(), "1234");
+        assert_eq!(std::fs::read_to_string(key).unwrap(), "legacy-key");
+        std::fs::remove_dir_all(d).unwrap();
+    }
+    #[test]
+    fn warm_claim_compatibility_accepts_matching_manifest() {
+        let d = temp(); let o = owner("warm-generation");
+        o.publish_at(&d, "__warm__", 2345, "manifest-key", 1).unwrap();
+        assert_eq!(read_warm_claim_endpoint_at(&d.join("__warm__.registry.json")).unwrap(),
+            Some((2345, "manifest-key".into())));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+    #[test]
+    fn warm_claim_compatibility_uses_one_generation() {
+        let d = temp(); let o = owner("warm-generation");
+        o.publish_at(&d, "__warm__", 2345, "manifest-key", 1).unwrap();
+        std::fs::write(d.join("__warm__.port"), "3456").unwrap();
+        std::fs::write(d.join("__warm__.key"), "other-generation").unwrap();
+        assert_eq!(read_warm_claim_endpoint_at(&d.join("__warm__.registry.json")).unwrap(),
+            Some((2345, "manifest-key".into())));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+    #[test]
+    fn warm_claim_compatibility_rejects_invalid_manifest() {
+        let d = temp(); let path = d.join("__warm__.registry.json");
+        std::fs::write(&path, b"{\"pid\":").unwrap();
+        assert!(read_warm_claim_endpoint_at(&path).is_err());
+        let manifest = RegistryManifest { pid: 1, creation_time: 1, generation: "generation".into(),
+            port: 1234, key: "invalid\nkey".into(), sid: 1 };
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(read_warm_claim_endpoint_at(&path).is_err());
+        std::fs::remove_dir_all(d).unwrap();
+    }
     #[test]
     fn ownership_prevents_old_generation_cleanup() {
         let d = temp(); let first = owner("first"); let second = owner("second");
