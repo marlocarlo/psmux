@@ -22,11 +22,7 @@
 use std::process::Command;
 
 fn main() {
-    // Rebuild whenever HEAD moves (new commit, checkout, etc.) so the embedded
-    // hash never goes stale. These files may not exist in a tarball build; the
-    // rerun hints are harmless if absent.
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/refs");
+    watch_git_inputs();
 
     embed_windows_resources();
 
@@ -47,6 +43,29 @@ fn main() {
     println!("cargo:rustc-env=PSMUX_GIT_HASH_FULL={full}");
     println!("cargo:rustc-env=PSMUX_GIT_DIRTY={dirty}");
     println!("cargo:rustc-env=PSMUX_GIT_DATE={date}");
+}
+
+/// Cargo stops scanning package inputs once a build script emits an explicit
+/// rerun hint. Watch tracked files too: changing src/main.rs rebuilds the crate,
+/// but would otherwise reuse the previous build script's clean/dirty value.
+/// Resolve Git's metadata paths instead of assuming .git is a directory; in a
+/// linked worktree HEAD/index are private and refs/packed-refs are shared.
+fn watch_git_inputs() {
+    if let Some(files) = git(&["ls-files", "-z"]) {
+        for path in files.split('\0').filter(|path| !path.is_empty()) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    for name in ["HEAD", "index", "refs", "packed-refs"] {
+        if let Some(path) = git(&["rev-parse", "--git-path", name]) {
+            // A missing optional file would make Cargo rerun on every build.
+            // Packing refs also removes a watched loose ref; unpacking one
+            // changes the watched refs directory, so both transitions refresh.
+            if std::path::Path::new(&path).exists() {
+                println!("cargo:rerun-if-changed={path}");
+            }
+        }
+    }
 }
 
 /// Embed the icon and the VS_VERSIONINFO block (Windows hosts only).
@@ -126,7 +145,14 @@ fn packed_version(version: &str) -> u64 {
 /// Run `git <args>` and return trimmed stdout on success, or `None` if git is
 /// missing or the command failed.
 fn git(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
+    // `status` normally refreshes the index as a side effect. Since the index
+    // is a watched input, that would cause an otherwise idle build to rerun
+    // forever. Build metadata queries must leave Git's files unchanged.
+    let output = Command::new("git")
+        .arg("--no-optional-locks")
+        .args(args)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
