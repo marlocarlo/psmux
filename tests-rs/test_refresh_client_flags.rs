@@ -24,7 +24,7 @@ use std::time::Duration;
 const TEST_KEY: &str = "unit-test-key";
 
 /// Serve one connection through the real one-shot handler.
-fn spawn_handler(listener: TcpListener, tx: mpsc::Sender<CtrlReq>) -> JoinHandle<()> {
+fn spawn_handler(listener: TcpListener, tx: crate::types::ControlSender) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let (stream, _) = listener.accept().expect("handler: accept");
         handle_connection(
@@ -55,7 +55,7 @@ fn connect_authenticated(addr: std::net::SocketAddr) -> TcpStream {
 fn control_only_flags_are_rejected_with_the_tmux_error_text() {
     for flag in ["-C", "-B", "-A", "-f"] {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let (tx, _rx) = mpsc::channel::<CtrlReq>();
+        let (tx, _rx) = crate::types::control_channel();
         let handler = spawn_handler(listener.try_clone().unwrap(), tx);
 
         let mut client = connect_authenticated(listener.local_addr().unwrap());
@@ -79,21 +79,25 @@ fn control_only_flags_are_rejected_with_the_tmux_error_text() {
 #[test]
 fn flag_free_refresh_client_is_forwarded_to_the_server() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let (tx, rx) = mpsc::channel::<CtrlReq>();
+    let (tx, rx) = crate::types::control_channel();
     let handler = spawn_handler(listener.try_clone().unwrap(), tx);
 
     let mut client = connect_authenticated(listener.local_addr().unwrap());
     write!(client, "refresh-client\n").unwrap();
     client.shutdown(Shutdown::Write).unwrap();
 
+    let request = match rx.recv_timeout(Duration::from_secs(2)).expect("request forwarded") {
+        CtrlReq::CommandRequest(request, completion) => {
+            completion.send(Ok(())).unwrap();
+            *request
+        }
+        _ => panic!("network requests must carry their own completion"),
+    };
     let mut resp = String::new();
     client.read_to_string(&mut resp).expect("read response");
     handler.join().expect("handler thread");
 
     assert_eq!(resp, "", "flag-free refresh-client must produce no error");
-    let request = rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("the request must reach the server loop");
     assert!(
         matches!(request, CtrlReq::RefreshClient),
         "flag-free refresh-client must be forwarded unchanged"
@@ -105,18 +109,24 @@ fn flag_free_refresh_client_is_forwarded_to_the_server() {
 #[test]
 fn non_control_flags_are_not_rejected() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let (tx, rx) = mpsc::channel::<CtrlReq>();
+    let (tx, rx) = crate::types::control_channel();
     let handler = spawn_handler(listener.try_clone().unwrap(), tx);
 
     let mut client = connect_authenticated(listener.local_addr().unwrap());
     write!(client, "refresh-client -S\n").unwrap();
     client.shutdown(Shutdown::Write).unwrap();
 
+    let request = match rx.recv_timeout(Duration::from_secs(2)).expect("request forwarded") {
+        CtrlReq::CommandRequest(request, completion) => {
+            completion.send(Ok(())).unwrap();
+            *request
+        }
+        _ => panic!("network requests must carry their own completion"),
+    };
     let mut resp = String::new();
     client.read_to_string(&mut resp).expect("read response");
     handler.join().expect("handler thread");
 
     assert_eq!(resp, "", "-S must not be rejected as control-only");
-    let request = rx.recv_timeout(Duration::from_secs(2)).expect("request forwarded");
     assert!(matches!(request, CtrlReq::RefreshClient));
 }

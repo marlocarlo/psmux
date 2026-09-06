@@ -644,11 +644,7 @@ pub(crate) fn apply_set_option(
                     wp.child.kill().ok();
                 }
                 // Kill the background warm server process
-                let warm_base = if let Some(ref sn) = app.socket_name {
-                    format!("{}____warm__", sn)
-                } else {
-                    "__warm__".to_string()
-                };
+                let warm_base = crate::paths::storage_base(app.socket_name.as_deref(), "__warm__");
                 let warm_port_path = crate::paths::port_file(&warm_base);
                 if let Ok(port_str) = std::fs::read_to_string(&warm_port_path) {
                     if let Ok(port) = port_str.trim().parse::<u16>() {
@@ -662,9 +658,8 @@ pub(crate) fn apply_set_option(
                         );
                     }
                 }
-                let _ = std::fs::remove_file(&warm_port_path);
-                let warm_key_path = crate::paths::key_file(&warm_base);
-                let _ = std::fs::remove_file(&warm_key_path);
+                // The warm server removes its own registration on confirmed
+                // shutdown. A failed/slow command must not unpublish it.
             }
         }
         "claude-code-fix-tty" => {

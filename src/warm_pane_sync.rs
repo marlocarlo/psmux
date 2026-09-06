@@ -257,27 +257,15 @@ fn apply_patch_to_existing_panes(app: &mut AppState, patch: &WarmPanePatch) {
     }
 }
 
-fn respawn(app: &mut AppState, pty_system: &dyn portable_pty::PtySystem) {
+fn respawn(app: &mut AppState, _pty_system: &dyn portable_pty::PtySystem) {
     // Always kill any existing warm pane first — there is no in-place
     // way to swap shell binaries or environment blocks.
-    if let Some(mut old) = app.warm_pane.take() {
-        old.child.kill().ok();
+    if let Some(old) = app.warm_pane.take() {
+        crate::pane::retire_warm_pane(old);
     }
-    // Honour warm_enabled: a config-disabled warm pane must not come
-    // back to life after a Respawn — the user opted out.
-    if !app.warm_enabled {
-        return;
-    }
-    match crate::pane::spawn_warm_pane(pty_system, app) {
-        Ok(wp) => {
-            app.warm_pane = Some(wp);
-        }
-        Err(_) => {
-            // Best-effort: if a respawn fails (e.g. transient PTY
-            // creation error) we leave warm_pane = None and the next
-            // consume path falls back to a synchronous cold spawn.
-        }
-    }
+    // The event loop owns one WarmPaneTask and replenishes from a fresh
+    // configuration snapshot. Never run OpenConsole/CreateProcess here: a
+    // resize or set-option must not block every pending control request.
 }
 
 /// Helper for warm-pane consume sites in `pane.rs`.  When a warm

@@ -95,7 +95,7 @@ fn modified_keys_resolve() {
 #[test]
 fn send_keys_x_bindings_are_queued_with_their_arguments_intact() {
     let mut a = app_vi();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crate::types::control_channel();
     a.control_tx = Some(tx);
     bind_copy_key(&mut a, "copy-mode-vi", "y", "send-keys -X copy-pipe-and-cancel \"clip.exe\"");
 
@@ -125,7 +125,7 @@ fn send_keys_x_bindings_are_queued_with_their_arguments_intact() {
 #[test]
 fn a_quoted_argument_with_spaces_survives() {
     let mut a = app_vi();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crate::types::control_channel();
     a.control_tx = Some(tx);
     bind_copy_key(
         &mut a,

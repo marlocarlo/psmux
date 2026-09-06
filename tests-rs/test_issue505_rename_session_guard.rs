@@ -185,7 +185,7 @@ fn claiming_a_warm_server_guards_the_claimed_name() {
 
 #[test]
 #[cfg(windows)]
-fn rekey_onto_a_name_owned_elsewhere_runs_unguarded_instead_of_dying() {
+fn rekey_collision_preserves_original_guard() {
     let old = key("busy-old");
     let busy = key("busy-target");
 
@@ -205,12 +205,10 @@ fn rekey_onto_a_name_owned_elsewhere_runs_unguarded_instead_of_dying() {
     let mut guard = crate::platform::acquire_session_mutex(&old);
     assert!(guard.is_some(), "setup: should have acquired '{}'", old);
 
-    rekey_session_guard(&mut guard, &busy);
-
-    // The rename already happened, so a refused acquire must degrade to running
-    // unguarded rather than take the session down.
-    assert!(guard.is_none(), "must not claim a name a live owner holds");
-    assert!(name_is_free(&old), "old name '{}' must still be released", old);
+    assert!(rekey_session_guard(&mut guard, &busy).is_err());
+    assert!(guard.is_some(), "collision must preserve the original guard");
+    assert!(!name_is_free(&old), "old name must remain guarded after collision");
+    assert!(!name_is_free(&busy), "destination must remain guarded by its owner");
 
     release_tx.send(()).unwrap();
     holder.join().unwrap();

@@ -304,17 +304,7 @@ fn fetch_authed_response_caps_runaway_response() {
         Duration::from_millis(500),
     );
     let elapsed = start.elapsed();
-    // Either we get None (no newline ever found before EOF/cap) or we get
-    // a "valid" giant string of X's bounded by the cap. What we MUST NOT do
-    // is buffer past the cap or hang past the read timeout.
-    if let Some(payload) = info.as_ref() {
-        assert!(
-            payload.len() <= MAX_AUTHED_RESPONSE_BYTES as usize,
-            "payload {} bytes exceeded cap {}",
-            payload.len(),
-            MAX_AUTHED_RESPONSE_BYTES
-        );
-    }
+    assert!(info.is_none(), "a truncated line at the byte cap must never count as a valid response");
     assert!(
         elapsed < Duration::from_millis(1500),
         "should finish within ~1.5x read_timeout, took {:?}",

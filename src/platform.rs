@@ -343,18 +343,15 @@ impl Drop for SessionMutex {
 /// logon session, matching the per-user scope of the data directory.
 #[cfg(windows)]
 pub fn session_mutex_name(base: &str) -> String {
-    let sanitized: String = base.chars().map(|c| if c == '\\' || c == '/' { '_' } else { c }).collect();
+    let sanitized: String = base.to_lowercase().chars().map(|c| if c == '\\' || c == '/' { '_' } else { c }).collect();
     format!("Local\\psmux-session-{}-{}", crate::paths::data_root_tag(), sanitized)
 }
 
-/// Acquire the single-server lock for session `name` (P0: kill the duplicate-
-/// same-name-server race). Returns `Some(guard)` when this process MAY run as
-/// the server — because it now owns the mutex, or a previous owner died and left
-/// it abandoned, or the FFI was unavailable (**fail-open**, so a legitimate start
-/// is never blocked). Returns `None` ONLY when another LIVE process already owns
-/// the name, i.e. this is a duplicate cold-spawn that must exit.
+/// Acquire the single-server lock for this data root and session storage name.
+/// Some means ownership was acquired (including an abandoned mutex); None means
+/// another owner holds it. OS errors are returned, never treated as ownership.
 #[cfg(windows)]
-pub fn acquire_session_mutex(name: &str) -> Option<SessionMutex> {
+pub fn acquire_session_mutex_strict(name: &str) -> std::io::Result<Option<SessionMutex>> {
     #[link(name = "kernel32")]
     extern "system" {
         fn CreateMutexW(attrs: *const std::ffi::c_void, initial_owner: i32, name: *const u16) -> *mut std::ffi::c_void;
@@ -369,14 +366,23 @@ pub fn acquire_session_mutex(name: &str) -> Option<SessionMutex> {
     unsafe {
         let h = CreateMutexW(std::ptr::null(), 0, wide.as_ptr());
         if h.is_null() {
-            return Some(SessionMutex { handle: std::ptr::null_mut() }); // fail-open
+            return Err(std::io::Error::last_os_error());
         }
         match WaitForSingleObject(h, 0) {
-            WAIT_OBJECT_0 | WAIT_ABANDONED => Some(SessionMutex { handle: h }),
-            WAIT_TIMEOUT => { CloseHandle(h as isize); None }
-            _ => Some(SessionMutex { handle: h }), // unknown -> fail-open
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Some(SessionMutex { handle: h })),
+            WAIT_TIMEOUT => { CloseHandle(h as isize); Ok(None) }
+            _ => {
+                let error = std::io::Error::last_os_error();
+                CloseHandle(h as isize);
+                Err(error)
+            }
         }
     }
+}
+
+#[cfg(windows)]
+pub fn acquire_session_mutex(name: &str) -> Option<SessionMutex> {
+    acquire_session_mutex_strict(name).ok().flatten()
 }
 
 #[cfg(not(windows))]
@@ -385,6 +391,9 @@ pub struct SessionMutex;
 /// legitimate start). psmux's duplicate-server race is a Windows-only concern.
 #[cfg(not(windows))]
 pub fn acquire_session_mutex(_name: &str) -> Option<SessionMutex> { Some(SessionMutex) }
+
+#[cfg(not(windows))]
+pub fn acquire_session_mutex_strict(_name: &str) -> std::io::Result<Option<SessionMutex>> { Ok(Some(SessionMutex)) }
 
 /// Enable virtual terminal processing on Windows Console Host.
 /// This is required for ANSI color codes to work in conhost.exe (legacy console).
@@ -2429,6 +2438,67 @@ pub mod mouse_inject {
 
 #[cfg(windows)]
 pub mod process_kill {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ProcessIdentity { Alive(u64), Exited, Unknown }
+
+    /// Read identity and liveness on the SAME handle. Access denial or query
+    /// failure is uncertainty, never evidence of process death.
+    pub fn process_identity(pid: u32) -> ProcessIdentity {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn WaitForSingleObject(handle: *mut std::ffi::c_void, timeout: u32) -> u32;
+            fn GetLastError() -> u32;
+        }
+        unsafe {
+            let handle = OpenProcess(0x1000 | 0x0010_0000, 0, pid);
+            if handle == 0 || handle == INVALID_HANDLE {
+                return if pid != 0 && GetLastError() == 87 { ProcessIdentity::Exited } else { ProcessIdentity::Unknown };
+            }
+            let state = match WaitForSingleObject(handle as *mut _, 0) {
+                0 => ProcessIdentity::Exited,
+                258 => {
+                    let mut creation: FILETIME = std::mem::zeroed();
+                    let mut exit: FILETIME = std::mem::zeroed();
+                    let mut kernel: FILETIME = std::mem::zeroed();
+                    let mut user: FILETIME = std::mem::zeroed();
+                    if GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) != 0 {
+                        ProcessIdentity::Alive(filetime_to_u64(creation))
+                    } else { ProcessIdentity::Unknown }
+                }
+                _ => ProcessIdentity::Unknown,
+            };
+            CloseHandle(handle);
+            state
+        }
+    }
+
+    pub fn verified_process_dead(pid: u32, creation: u64) -> bool {
+        match process_identity(pid) {
+            ProcessIdentity::Exited => true,
+            ProcessIdentity::Alive(actual) => creation != 0 && actual != creation,
+            ProcessIdentity::Unknown => false,
+        }
+    }
+
+    /// Explicit user-requested termination, pinned to one process generation.
+    /// Validate and terminate using one retained handle so PID reuse cannot
+    /// redirect a previously authorized kill to a replacement process.
+    pub fn terminate_server_pid_exact(pid: u32, expected_creation: u64) -> bool {
+        if expected_creation == 0 { return false; }
+        unsafe {
+            let handle = OpenProcess(0x1000 | PROCESS_TERMINATE, 0, pid);
+            if handle == 0 || handle == INVALID_HANDLE { return false; }
+            let mut creation: FILETIME = std::mem::zeroed();
+            let mut exit: FILETIME = std::mem::zeroed();
+            let mut kernel: FILETIME = std::mem::zeroed();
+            let mut user: FILETIME = std::mem::zeroed();
+            let matched = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) != 0
+                && filetime_to_u64(creation) == expected_creation;
+            let result = matched && TerminateProcess(handle, 0) != 0;
+            CloseHandle(handle);
+            result
+        }
+    }
     const TH32CS_SNAPPROCESS: u32 = 0x00000002;
     const PROCESS_TERMINATE: u32 = 0x0001;
     const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
@@ -2997,6 +3067,11 @@ pub mod process_kill {
 
 #[cfg(not(windows))]
 pub mod process_kill {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ProcessIdentity { Alive(u64), Exited, Unknown }
+    pub fn process_identity(_pid: u32) -> ProcessIdentity { ProcessIdentity::Unknown }
+    pub fn verified_process_dead(_pid: u32, _creation: u64) -> bool { false }
+    pub fn terminate_server_pid_exact(_pid: u32, _creation: u64) -> bool { false }
     /// On non-Windows, fall back to simple kill (no wait — let the reaper handle it).
     pub fn kill_process_tree(child: &mut Box<dyn portable_pty::Child>) {
         let _ = child.kill();

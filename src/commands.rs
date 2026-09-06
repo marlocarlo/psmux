@@ -9,7 +9,7 @@ use crate::tree::{compute_rects, kill_all_children, get_active_pane_id};
 use crate::pane::{create_window, split_active, kill_active_pane};
 use crate::copy_mode::{enter_copy_mode, scroll_copy_up, switch_with_copy_save, paste_latest,
     capture_active_pane, save_latest_buffer};
-use crate::session::{send_control_to_port, list_all_sessions_tree};
+use crate::session::{enqueue_control, list_all_sessions_tree};
 use crate::window_ops::{toggle_zoom, unzoom_if_zoomed};
 
 /// Parse a popup dimension spec: "80" (absolute) or "95%" (percentage of term_dim).
@@ -979,13 +979,13 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
     match parts[0] {
         "new-window" | "neww" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             }
         }
         "split-window" | "splitw" | "split-pane" | "splitp" => {
             if let Some(port) = app.control_port {
                 // Forward the full command string to preserve -c, -d, -p etc. flags
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else if parts.iter().any(|p| *p == "-Z") {
                 let kind = if parts.iter().any(|p| *p == "-h") { LayoutKind::Horizontal } else { LayoutKind::Vertical };
                 unzoom_if_zoomed(app);
@@ -1177,7 +1177,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 }
                 // Forward to server so external queries (display-message, list-windows) see the new name
                 if let Some(port) = app.control_port {
-                    let _ = send_control_to_port(port, &format!("rename-window {}\n", crate::util::quote_arg(&name)), &app.session_key);
+                    enqueue_control(app, port, &format!("rename-window {}\n", crate::util::quote_arg(&name)))?;
                 }
             }
         }
@@ -1320,7 +1320,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             if parts.iter().any(|p| *p == "-Z") {
                 toggle_zoom(app);
             } else if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else {
                 // Local resize
                 let amount = parts.windows(2).find(|w| w[0] == "-x" || w[0] == "-y")
@@ -1349,7 +1349,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             if let (Some(src), Some(tgt)) = (source.as_ref(), target.as_ref()) {
                 if let Some(port) = app.control_port {
                     let d = if detach { " -d" } else { "" };
-                    let _ = send_control_to_port(port, &format!("swap-pane{} -s {} -t {}\n", d, src, tgt), &app.session_key);
+                    enqueue_control(app, port, &format!("swap-pane{} -s {} -t {}\n", d, src, tgt))?;
                 } else {
                     match (resolve_swap_pane_target_path(app, src), resolve_swap_pane_target_path(app, tgt)) {
                         (Some(sp), Some(dp)) => { crate::window_ops::swap_pane_between(app, sp, dp, detach); }
@@ -1358,7 +1358,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 }
             } else if let Some(tgt) = target {
                 if let Some(port) = app.control_port {
-                    let _ = send_control_to_port(port, &format!("swap-pane -t {}\n", tgt), &app.session_key);
+                    enqueue_control(app, port, &format!("swap-pane -t {}\n", tgt))?;
                 } else {
                     let path = resolve_swap_pane_target_path(app, &tgt);
                     if let Some(path) = path {
@@ -1372,7 +1372,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                     else if parts.iter().any(|p| *p == "-L") { "-L" }
                     else if parts.iter().any(|p| *p == "-R") { "-R" }
                     else { "-D" };
-                let _ = send_control_to_port(port, &format!("swap-pane {}\n", dir), &app.session_key);
+                enqueue_control(app, port, &format!("swap-pane {}\n", dir))?;
             } else {
                 let dir = if parts.iter().any(|p| *p == "-L") { FocusDir::Left }
                     else if parts.iter().any(|p| *p == "-R") { FocusDir::Right }
@@ -1384,21 +1384,21 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         "rotate-window" | "rotatew" => {
             if let Some(port) = app.control_port {
                 let flag = if parts.iter().any(|p| *p == "-D") { "-D" } else { "" };
-                let _ = send_control_to_port(port, &format!("rotate-window {}\n", flag), &app.session_key);
+                enqueue_control(app, port, &format!("rotate-window {}\n", flag))?;
             } else {
                 crate::window_ops::rotate_panes(app, !parts.iter().any(|p| *p == "-D"));
             }
         }
         "break-pane" | "breakp" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "break-pane\n", &app.session_key);
+                enqueue_control(app, port, "break-pane\n")?;
             } else {
                 crate::window_ops::break_pane_to_window(app);
             }
         }
         "respawn-pane" | "respawnp" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else {
                 let empty = parts.iter().any(|p| *p == "-E");
                 let kill = parts.iter().any(|p| *p == "-k") || empty;
@@ -1417,21 +1417,21 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             // Always apply locally first (fix #179: TCP server drops these)
             crate::config::parse_config_line(app, cmd);
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             }
         }
         "bind-key" | "bind" => {
             // Always apply locally first (fix #179: TCP server drops these)
             crate::config::parse_config_line(app, cmd);
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             }
         }
         "unbind-key" | "unbind" => {
             // Always apply locally first (fix #179: TCP server drops these)
             crate::config::parse_config_line(app, cmd);
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             }
         }
         "source-file" | "source" => {
@@ -1441,12 +1441,12 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 crate::config::source_file(app, path);
             }
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             }
         }
         "send-keys" | "send" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else {
                 // Local: write key text directly to active pane
                 let literal = parts.iter().any(|p| *p == "-l");
@@ -1562,7 +1562,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                             if let Some(win) = app.windows.get_mut(app.active_idx) {
                                 if let Some(p) = crate::tree::active_pane_mut(&mut win.root, &win.active_path) {
                                     // DECCKM app-cursor mode: SS3, not CSI (see crate::input::write_key_seq).
-                                    crate::input::write_key_seq(p, expanded.as_bytes());
+                                    crate::input::write_key_seq(p, expanded.as_bytes())?;
                                     let _ = p.writer.flush();
                                 }
                             }
@@ -1579,13 +1579,13 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 app.session_name = name.to_string();
                 // Forward to server so external queries see the new session name
                 if let Some(port) = app.control_port {
-                    let _ = send_control_to_port(port, &format!("rename-session {}\n", crate::util::quote_arg(name)), &app.session_key);
+                    enqueue_control(app, port, &format!("rename-session {}\n", crate::util::quote_arg(name)))?;
                 }
             }
         }
         "select-layout" | "selectl" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else {
                 let layout = parts.get(1).unwrap_or(&"tiled");
                 crate::layout::apply_layout(app, layout);
@@ -1593,14 +1593,14 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "next-layout" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "next-layout\n", &app.session_key);
+                enqueue_control(app, port, "next-layout\n")?;
             } else {
                 crate::layout::cycle_layout(app);
             }
         }
         "pipe-pane" | "pipep" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             }
         }
         "choose-tree" | "choose-window" | "choose-session" => {
@@ -1701,7 +1701,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "clear-history" | "clearhist" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "clear-history\n", &app.session_key);
+                enqueue_control(app, port, "clear-history\n")?;
             } else {
                 let allow_alt = app.allow_alternate_screen;
                 let history_limit = app.history_limit;
@@ -1717,12 +1717,12 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "kill-session" | "kill-ses" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "kill-session\n", &app.session_key);
+                enqueue_control(app, port, "kill-session\n")?;
             }
         }
         "kill-server" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "kill-server\n", &app.session_key);
+                enqueue_control(app, port, "kill-server\n")?;
             }
         }
         "has-session" | "has" => {
@@ -1767,7 +1767,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         "show-options" | "show" | "show-window-options" | "showw"
         | "show-option" | "show-window-option" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else {
                 let output = generate_show_options(app);
                 show_output_popup(app, "show-options", output);
@@ -1781,7 +1781,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                 } else {
                     cmd.to_string()
                 };
-                let _ = send_control_to_port(port, &format!("{}\n", effective_cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", effective_cmd))?;
             } else {
                 // Local: expand format string and show as status message
                 // Parse flags from parts (same as CLI/server):
@@ -1818,14 +1818,14 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "show-messages" | "showmsgs" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else {
                 show_output_popup(app, "show-messages", "(no messages)\n".to_string());
             }
         }
         "set-environment" | "setenv" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else {
                 let has_u = parts.iter().any(|p| *p == "-u");
                 let non_flag: Vec<&str> = parts[1..].iter().filter(|p| !p.starts_with('-')).copied().collect();
@@ -1845,7 +1845,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "show-environment" | "showenv" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else {
                 let mut output = String::new();
                 for (key, value) in &app.environment {
@@ -1857,7 +1857,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "set-hook" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else {
                 let has_unset = parts.iter().any(|p| *p == "-u" || *p == "-gu" || *p == "-ug");
                 let has_append = parts.iter().any(|p| *p == "-a" || *p == "-ga" || *p == "-ag");
@@ -1893,7 +1893,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "send-prefix" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "send-prefix\n", &app.session_key);
+                enqueue_control(app, port, "send-prefix\n")?;
             } else {
                 // Send the prefix key to the active pane as if typed
                 let prefix = app.prefix_key;
@@ -1916,7 +1916,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "if-shell" | "if" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else {
                 // Re-parse with quote-aware tokenizer so quoted args are handled
                 let parsed = parse_command_line(cmd);
@@ -1958,13 +1958,13 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "wait-for" | "wait" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             }
             // Local wait-for is a no-op (requires server coordination)
         }
         "find-window" | "findw" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else {
                 let pattern = parts[1..].iter().find(|p| !p.starts_with('-')).unwrap_or(&"");
                 let mut output = String::new();
@@ -1979,7 +1979,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "move-window" | "movew" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else {
                 // Same shared resolver the server path uses, so the command
                 // prompt and a config `move-window` agree with the CLI on what
@@ -1998,7 +1998,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "swap-window" | "swapw" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else {
                 let src = parts.windows(2).find(|w| w[0] == "-s").map(|w| w[1].to_string());
                 let dst = parts.windows(2).find(|w| w[0] == "-t").map(|w| w[1].to_string())
@@ -2033,7 +2033,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "link-window" | "linkw" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else {
                 // Intra-session link-window: parse -s and -t flags
                 let src_idx = parts.windows(2).find(|w| w[0] == "-s")
@@ -2066,7 +2066,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "unlink-window" | "unlinkw" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else if app.windows.len() > 1 {
                 let removed_pos = app.active_idx;
                 let mut win = app.windows.remove(removed_pos);
@@ -2080,7 +2080,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "move-pane" | "movep" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else {
                 let horizontal = parts[1..].iter().any(|a| *a == "-h");
                 let mut src_win: Option<usize> = None;
@@ -2122,7 +2122,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "join-pane" | "joinp" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             } else {
                 let horizontal = parts[1..].iter().any(|a| *a == "-h");
                 let mut src_win: Option<usize> = None;
@@ -2164,19 +2164,19 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "resize-window" | "resizew" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             }
             // resize-window depends on terminal size, only meaningful on server
         }
         "respawn-window" | "respawnw" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             }
             // respawn-window requires PTY system from server context
         }
         "previous-layout" | "prevl" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "previous-layout\n", &app.session_key);
+                enqueue_control(app, port, "previous-layout\n")?;
             } else {
                 crate::layout::cycle_layout_reverse(app);
             }
@@ -2189,7 +2189,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "server-info" | "info" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "server-info\n", &app.session_key);
+                enqueue_control(app, port, "server-info\n")?;
             } else {
                 let output = format!("psmux {}\nSession: {}\nWindows: {}\nActive: {}\n",
                     crate::types::VERSION, app.session_name, app.windows.len(), app.active_idx);
@@ -2242,11 +2242,8 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             let name = session_name.unwrap_or_else(|| crate::session::next_session_name(ns_prefix));
 
             // Build port file base (with namespace prefix if applicable)
-            let port_file_base = if let Some(ref sn) = app.socket_name {
-                format!("{}__{}", sn, name)
-            } else {
-                name.clone()
-            };
+            crate::paths::validate_registry_base(app.socket_name.as_deref(), &name)?;
+            let port_file_base = crate::paths::storage_base(app.socket_name.as_deref(), &name);
 
             // Check if session already exists
             let port_path = crate::paths::port_file(&port_file_base);
@@ -2263,68 +2260,60 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                         }
                     }
                 }
-                // Stale port file, remove it
-                let _ = std::fs::remove_file(&port_path);
+                if crate::session::registry_pid_anchor_alive(&port_file_base) != Some(false) {
+                    return Err(io::Error::new(io::ErrorKind::AlreadyExists,
+                        format!("session '{}' exists but is not responding; registry preserved", name)));
+                }
+                // Only the new server's ownership transaction may replace a
+                // positively dead record; clients never delete registry files.
             }
 
             // Try to claim a warm server first (fast path)
             let warm_disabled = std::env::var("PSMUX_NO_WARM").map(|v| v == "1" || v == "true").unwrap_or(false)
                 || crate::config::is_warm_disabled_by_config();
             let claimed_warm = if !warm_disabled && initial_command.is_none() && start_dir.is_none() && env_vars.is_empty() {
-                let warm_base = if let Some(ref sn) = app.socket_name {
-                    format!("{}____warm__", sn)
-                } else {
-                    "__warm__".to_string()
-                };
-                let warm_port_path = crate::paths::port_file(&warm_base);
-                if std::path::Path::new(&warm_port_path).exists() {
-                    if let Ok(warm_port_str) = std::fs::read_to_string(&warm_port_path) {
-                        if let Ok(warm_port) = warm_port_str.trim().parse::<u16>() {
-                            let warm_addr = format!("127.0.0.1:{}", warm_port);
-                            if std::net::TcpStream::connect_timeout(
-                                &warm_addr.parse().unwrap(),
-                                std::time::Duration::from_millis(100),
-                            ).is_ok() {
-                                let warm_key = crate::session::read_session_key(&warm_base).unwrap_or_default();
-                                if !warm_key.is_empty() {
-                                    // In-TUI new-session runs inside psmux, so the
-                                    // resolve reads this server's own environment and
-                                    // config rather than a user shell. Sending it is
-                                    // still right: a session created from the TUI
-                                    // should land on the same class as the psmux the
-                                    // user is sitting in, not on the standby's stale
-                                    // one (#608).
-                                    let claim_prio = crate::platform::claim_priority_arg();
-                                    let claim_cmd = format!("claim-session {} -p {}\n", crate::util::quote_arg(&name), crate::util::quote_arg(&claim_prio));
-                                    match crate::session::send_auth_cmd_response(
-                                        &warm_addr, &warm_key,
-                                        claim_cmd.as_bytes(),
-                                    ) {
-                                        Ok(resp) if resp.contains("OK") => {
-                                            if let Some(ref wn) = window_name {
-                                                let new_key = crate::session::read_session_key(&port_file_base).unwrap_or_default();
-                                                let _ = crate::session::send_auth_cmd(
-                                                    &warm_addr, &new_key,
-                                                    format!("rename-window {}\n", crate::util::quote_arg(wn)).as_bytes(),
-                                                );
-                                            }
-                                            // Apply -e environment variables to the claimed warm session
-                                            if !env_vars.is_empty() {
-                                                let new_key = crate::session::read_session_key(&port_file_base).unwrap_or_default();
-                                                for (k, v) in &env_vars {
-                                                    let _ = crate::session::send_auth_cmd(
-                                                        &warm_addr, &new_key,
-                                                        format!("set-environment {} {}\n", crate::util::quote_arg(k), crate::util::quote_arg(v)).as_bytes(),
-                                                    );
-                                                }
-                                            }
-                                            true
-                                        }
-                                        _ => false,
+                let warm_base = crate::paths::storage_base(app.socket_name.as_deref(), "__warm__");
+                if let Ok(Some((warm_port, warm_key))) = crate::registry::read_warm_claim_endpoint(&warm_base) {
+                    let warm_addr = format!("127.0.0.1:{}", warm_port);
+                    if std::net::TcpStream::connect_timeout(
+                        &warm_addr.parse().unwrap(),
+                        std::time::Duration::from_millis(100),
+                    ).is_ok() {
+                        // In-TUI new-session runs inside psmux, so the
+                        // resolve reads this server's own environment and
+                        // config rather than a user shell. Sending it is
+                        // still right: a session created from the TUI
+                        // should land on the same class as the psmux the
+                        // user is sitting in, not on the standby's stale
+                        // one (#608).
+                        let claim_prio = crate::platform::claim_priority_arg();
+                        let claim_cmd = format!("claim-session {} -p {}\n", crate::util::quote_arg(&name), crate::util::quote_arg(&claim_prio));
+                        match crate::session::send_auth_cmd_response(
+                            &warm_addr, &warm_key,
+                            claim_cmd.as_bytes(),
+                        ) {
+                            Ok(resp) if resp.contains("OK") => {
+                                if let Some(ref wn) = window_name {
+                                    let new_key = crate::session::read_session_key(&port_file_base).unwrap_or_default();
+                                    let _ = crate::session::send_auth_cmd(
+                                        &warm_addr, &new_key,
+                                        format!("rename-window {}\n", crate::util::quote_arg(wn)).as_bytes(),
+                                    );
+                                }
+                                // Apply -e environment variables to the claimed warm session
+                                if !env_vars.is_empty() {
+                                    let new_key = crate::session::read_session_key(&port_file_base).unwrap_or_default();
+                                    for (k, v) in &env_vars {
+                                        let _ = crate::session::send_auth_cmd(
+                                            &warm_addr, &new_key,
+                                            format!("set-environment {} {}\n", crate::util::quote_arg(k), crate::util::quote_arg(v)).as_bytes(),
+                                        );
                                     }
-                                } else { false }
-                            } else { false }
-                        } else { false }
+                                }
+                                true
+                            }
+                            _ => false,
+                        }
                     } else { false }
                 } else { false }
             } else { false };
@@ -2389,7 +2378,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
                     // Switch to the new session
                     if let Some(port) = app.control_port {
                         let switch_cmd = format!("switch-client -t {}\n", crate::util::quote_arg(&name));
-                        let _ = send_control_to_port(port, &switch_cmd, &app.session_key);
+                        enqueue_control(app, port, &switch_cmd)?;
                     }
                 }
                 app.status_message = Some((format!("created session '{}'", name), Instant::now(), None));
@@ -2399,20 +2388,20 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         }
         "lock-client" | "lockc" | "lock-server" | "lock" | "lock-session" | "locks" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "lock-server\n", &app.session_key);
+                enqueue_control(app, port, "lock-server\n")?;
             }
             app.status_message = Some(("lock: not available on Windows".to_string(), Instant::now(), None));
         }
         "refresh-client" | "refresh" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "refresh-client\n", &app.session_key);
+                enqueue_control(app, port, "refresh-client\n")?;
             }
             // Trigger redraw in all modes
             app.status_message = Some(("client refreshed".to_string(), Instant::now(), None));
         }
         "suspend-client" | "suspendc" => {
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "suspend-client\n", &app.session_key);
+                enqueue_control(app, port, "suspend-client\n")?;
             }
             app.status_message = Some(("suspend: not available on Windows".to_string(), Instant::now(), None));
         }
@@ -2422,7 +2411,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
         "customize-mode" => {
             // tmux 3.2+ customize-mode: interactive options editor
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, "customize-mode\n", &app.session_key);
+                enqueue_control(app, port, "customize-mode\n")?;
             } else {
                 // In-process fallback: build option list directly
                 let options = crate::server::option_catalog::build_option_list(app);
@@ -2548,7 +2537,7 @@ fn execute_command_string_single(app: &mut AppState, cmd: &str) -> io::Result<()
             }
             // Also forward unknown commands to server (catch-all for tmux compat)
             if let Some(port) = app.control_port {
-                let _ = send_control_to_port(port, &format!("{}\n", cmd), &app.session_key);
+                enqueue_control(app, port, &format!("{}\n", cmd))?;
             }
         }
     }

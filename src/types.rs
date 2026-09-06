@@ -756,7 +756,7 @@ pub struct AppState {
     pub key_tables: std::collections::HashMap<String, Vec<Bind>>,
     /// Current key table for switch-client -T (None = normal mode)
     pub current_key_table: Option<String>,
-    pub control_rx: Option<mpsc::Receiver<CtrlReq>>,
+    pub control_rx: Option<ControlReceiver>,
     /// Sender for the same channel `control_rx` receives on, so code already
     /// running ON the server loop can queue follow-up work for a later
     /// iteration instead of recursing.
@@ -768,7 +768,7 @@ pub struct AppState {
     /// routing back out through `execute_command_string` would make the server
     /// open a TCP connection to itself while the loop is blocked doing so —
     /// a deadlock. Queueing costs one loop iteration and cannot deadlock.
-    pub control_tx: Option<mpsc::Sender<CtrlReq>>,
+    pub control_tx: Option<ControlSender>,
     pub control_port: Option<u16>,
     pub session_key: String,
     /// Receiver for async run-shell results (title, output).
@@ -1630,7 +1630,9 @@ impl AppState {
             format_job_rx: None,
             format_job_tx: None,
             session_name,
-            session_id: crate::session::allocate_session_id(),
+            // Temporary in-memory identity; run_server assigns the persistent ID.
+            session_id: { static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) },
             socket_name: None,
             attached_clients: 0,
             client_sizes: std::collections::HashMap::new(),
@@ -1758,11 +1760,7 @@ impl AppState {
     /// When socket_name is set (via -L flag), files are stored as `{socket_name}__{session_name}`.
     /// Otherwise, just the session_name is used.
     pub fn port_file_base(&self) -> String {
-        if let Some(ref sn) = self.socket_name {
-            format!("{}__{}", sn, self.session_name)
-        } else {
-            self.session_name.clone()
-        }
+        crate::paths::storage_base(self.socket_name.as_deref(), &self.session_name)
     }
 }
 
@@ -1861,7 +1859,13 @@ pub enum WindowDumpFormat {
     PreviewState,
 }
 
+#[path = "request_queue.rs"]
+mod request_queue;
+pub use request_queue::{control_channel, ControlReceiver, ControlSender};
+
 pub enum CtrlReq {
+    /// The acknowledgement belongs to this command and this connection only.
+    CommandRequest(Box<CtrlReq>, mpsc::Sender<Result<(), String>>),
     NewWindow(Option<String>, Option<String>, bool, Option<String>, Option<String>, bool, Vec<(String, String)>),  // cmd, name, detached, start_dir, title (-T), empty (-E), env (-e, #489)
     NewWindowPrint(Option<String>, Option<String>, bool, Option<String>, Option<String>, mpsc::Sender<String>, Option<String>, bool, Vec<(String, String)>),  // cmd, name, detached, start_dir, format, resp, title (-T), empty (-E), env (-e, #489)
     SplitWindow(LayoutKind, Option<String>, bool, Option<String>, Option<(u16, bool)>, mpsc::Sender<String>, Option<String>, Vec<(String, String)>, bool),  // kind, cmd, detached, start_dir, size (value, is_percent), error_resp, title (-T), env (-e, #489), zoom (-Z)
@@ -2337,7 +2341,7 @@ pub enum CtrlReq {
         window_id: Option<usize>,
         size: Option<(u16, u16)>,
     },
-    RespawnWindow(Option<String>, Option<String>),  // optional workdir (-c), optional shell-command operand
+    RespawnWindow(Option<String>, bool, Option<String>),  // workdir (-c), kill (-k), command
     FocusIn,
     FocusOut,
     CommandPrompt(String),
@@ -2396,6 +2400,9 @@ pub enum CtrlReq {
 /// Global flag set by PTY reader threads when new output arrives.
 /// The server loop checks this to use a shorter recv_timeout, reducing
 /// keystroke-to-display latency for nested shells (e.g. WSL inside pwsh).
+pub static CONTROL_CLIENTS_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static CONTROL_OUTPUT_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub static PTY_DATA_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Set by the parser thread when any pane's `cpr_pending` flag is raised.
@@ -2569,24 +2576,6 @@ pub fn parse_x11_color(s: &str) -> Option<(u8, u8, u8)> {
     Some((out[0], out[1], out[2]))
 }
 
-/// Issue #440: `pipe-pane` output routing.
-///
-/// A pane's PTY reader thread tees every raw output chunk to any pipe writer
-/// registered under its `pane_id`, so `pipe-pane -o '<cmd>'` actually receives
-/// the pane transcript on the child's stdin (previously the child was spawned
-/// with a piped stdin that nothing ever wrote to, so it blocked on an empty
-/// pipe forever and the sink stayed 0 bytes).
-///
-/// `PIPE_PANE_COUNT` is a cheap gate: it lets every reader thread skip the mutex
-/// entirely in the overwhelmingly common case where no pipe is active, so panes
-/// that are not being piped pay nothing. The server handler (`CtrlReq::PipePane`)
-/// pushes/removes `(pane_id, child_stdin)` entries and keeps the count in sync.
-pub static PIPE_PANE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// Writers are boxed so the same tee path serves both pipe-pane child stdins
-/// and cross-session forward tunnels (TcpStream) without a second reader
-/// competing for the ConPTY output pipe.
-pub static PIPE_WRITERS: Mutex<Vec<(usize, Box<dyn std::io::Write + Send>)>> = Mutex::new(Vec::new());
-
 /// Tracked persistent client TCP streams.
 /// Connection handlers register clones here so the server can explicitly
 /// `shutdown()` them before `process::exit(0)`.  Without this, Windows
@@ -2715,13 +2704,13 @@ pub fn deregister_frame_channel(client_id: u64) {
 /// Per-client directive channels (queued, not overwritten like frame slots).
 /// Used for sending commands/directives (e.g. SWITCH) to specific persistent clients
 /// without risk of being overwritten by frame pushes.
-static DIRECTIVE_CHANNELS: std::sync::Mutex<Vec<(u64, std::sync::mpsc::Sender<String>)>> =
+static DIRECTIVE_CHANNELS: std::sync::Mutex<Vec<(u64, std::sync::mpsc::SyncSender<String>)>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Register a directive channel for a persistent client. Returns the receiver
 /// for the writer thread to poll.
 pub fn register_directive_channel(client_id: u64) -> std::sync::mpsc::Receiver<String> {
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<String>(64);
     if let Ok(mut v) = DIRECTIVE_CHANNELS.lock() {
         v.push((client_id, tx));
     }
@@ -2730,23 +2719,22 @@ pub fn register_directive_channel(client_id: u64) -> std::sync::mpsc::Receiver<S
 
 /// Send a directive to a specific persistent client. Returns true if sent.
 pub fn send_directive_to_client(client_id: u64, directive: &str) -> bool {
-    if let Ok(channels) = DIRECTIVE_CHANNELS.lock() {
-        for (cid, tx) in channels.iter() {
-            if *cid == client_id {
-                return tx.send(directive.to_string()).is_ok();
-            }
-        }
-    }
-    false
+    let sent = DIRECTIVE_CHANNELS.lock().ok().and_then(|channels|
+        channels.iter().find(|(cid, _)| *cid == client_id)
+            .map(|(_, tx)| directive.len() <= 16 * 1024 && tx.try_send(directive.to_string()).is_ok()))
+        .unwrap_or(false);
+    // Do not discard an ordered SWITCH/DETACH directive. Disconnect a slow
+    // consumer so it cannot keep operating with a silently divergent state.
+    if !sent { shutdown_client_stream(client_id); }
+    sent
 }
 
 /// Send a directive to ALL persistent clients.
 pub fn send_directive_to_all_clients(directive: &str) {
-    if let Ok(channels) = DIRECTIVE_CHANNELS.lock() {
-        for (_, tx) in channels.iter() {
-            let _ = tx.send(directive.to_string());
-        }
-    }
+    let failed = DIRECTIVE_CHANNELS.lock().map(|channels| channels.iter()
+        .filter_map(|(id, tx)| (directive.len() > 16 * 1024 || tx.try_send(directive.to_string()).is_err()).then_some(*id))
+        .collect::<Vec<_>>()).unwrap_or_default();
+    for id in failed { shutdown_client_stream(id); }
 }
 
 /// Remove a client's directive channel (called on disconnect).

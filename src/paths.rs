@@ -116,7 +116,107 @@ pub fn psmux_dir() -> String {
 /// folded, because Windows treats `C:/Foo` and `c:\foo` as one directory and
 /// anything keyed on the root must treat them as one too.
 fn normalized_data_root() -> String {
-    psmux_dir().replace('/', "\\").to_lowercase()
+    let root = psmux_dir();
+    // Resolve junctions and dot components before naming a kernel lock. Two
+    // spellings of the same registry must never acquire different locks.
+    std::fs::canonicalize(&root).unwrap_or_else(|_| root.into())
+        .to_string_lossy().trim_start_matches(r"\\?\").replace('/', "\\").to_lowercase()
+}
+
+const ENCODED_BASE: &str = "~psmux~";
+
+fn plain_component(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let reserved_device = matches!(lower.as_str(), "con" | "prn" | "aux" | "nul")
+        || (lower.len() == 4 && (lower.starts_with("com") || lower.starts_with("lpt"))
+            && matches!(lower.as_bytes()[3], b'1'..=b'9'));
+    !value.is_empty() && !value.contains("__") && !value.starts_with(ENCODED_BASE)
+        && !value.starts_with('_') && !value.ends_with('_')
+        && !reserved_device
+        && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn hex_name(value: &str) -> String {
+    value.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex_name(value: &str) -> Option<String> {
+    if value.len() % 2 != 0 || !value.is_ascii() { return None; }
+    let bytes = (0..value.len()).step_by(2)
+        .map(|i| u8::from_str_radix(&value[i..i+2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// An injective filename encoding for newly created registry entries. Preserve
+/// ordinary legacy names; delimiters and path characters are encoded together
+/// with an explicit default/named-namespace tag.
+pub fn storage_base(namespace: Option<&str>, name: &str) -> String {
+    let ordinary_name = plain_component(name) || name == "__warm__";
+    if ordinary_name && namespace.map_or(true, plain_component) {
+        return namespace.map_or_else(|| name.to_string(), |ns| format!("{ns}__{name}"));
+    }
+    match namespace {
+        None => format!("{ENCODED_BASE}d~{}", hex_name(name)),
+        Some(ns) => format!("{ENCODED_BASE}n~{}~{}", hex_name(ns), hex_name(name)),
+    }
+}
+
+pub fn session_base(namespace: Option<&str>, name: &str) -> String {
+    storage_base(namespace, name)
+}
+
+fn decode_base(base: &str) -> Option<(Option<String>, String)> {
+    let encoded = base.strip_prefix(ENCODED_BASE)?;
+    if let Some(name) = encoded.strip_prefix("d~") {
+        return Some((None, unhex_name(name)?));
+    }
+    let (ns, name) = encoded.strip_prefix("n~")?.split_once('~')?;
+    Some((Some(unhex_name(ns)?), unhex_name(name)?))
+}
+
+pub fn registry_namespace(base: &str) -> Option<String> {
+    if let Some((ns, _)) = decode_base(base) { return ns; }
+    if base == "__warm__" { return None; }
+    base.split_once("__").map(|(ns, _)| ns.to_string())
+}
+
+pub fn registry_session_name(base: &str) -> String {
+    if let Some((_, name)) = decode_base(base) { return name; }
+    if base == "__warm__" { return base.to_string(); }
+    base.split_once("__").map_or(base, |(_, name)| name).to_string()
+}
+
+pub fn registry_visible_from(base: &str, namespace: Option<&str>) -> bool {
+    registry_namespace(base).as_deref() == namespace
+}
+
+/// Keep an encoded registry component within Windows' 255-character limit and
+/// prevent protocol delimiters from entering command/session identifiers.
+pub fn validate_session_name(name: &str) -> std::io::Result<()> {
+    if name.is_empty() || name.chars().any(char::is_control) || name.contains(':') || name.len() > 100 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+            "session name must be 1–100 UTF-8 bytes, without control characters or ':'"));
+    }
+    Ok(())
+}
+
+pub fn validate_namespace(namespace: &str) -> std::io::Result<()> {
+    if namespace.is_empty() || namespace.chars().any(char::is_control) || namespace.len() > 100 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+            "namespace must be 1–100 UTF-8 bytes without control characters"));
+    }
+    Ok(())
+}
+
+pub fn validate_registry_base(namespace: Option<&str>, name: &str) -> std::io::Result<()> {
+    validate_session_name(name)?;
+    if let Some(ns) = namespace { validate_namespace(ns)?; }
+    if storage_base(namespace, name).len() > 235 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+            "combined namespace and session name are too long for the registry"));
+    }
+    Ok(())
 }
 
 /// Stable per-data-root tag for names that live in the machine-wide kernel
@@ -297,3 +397,42 @@ mod tests_issue474_home_resolution;
 #[cfg(test)]
 #[path = "../tests-rs/test_data_dir_override.rs"]
 mod tests_data_dir_override;
+
+#[cfg(test)]
+mod registry_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn identities_round_trip_without_delimiter_or_path_collisions() {
+        let namespaces = [None, Some("a"), Some("a__b"), Some("a_"), Some("a/b"), Some("a\\b")];
+        let names = ["dev", "build__dev", "b__c", "_b", "__warm__", "~psmux~d~61", "a/b", "é", "CON", "nul", "COM1"];
+        let mut bases = std::collections::HashSet::new();
+        for namespace in namespaces {
+            for name in names {
+                let base = storage_base(namespace, name);
+                assert!(bases.insert(base.clone()), "duplicate encoding: {base}");
+                assert_eq!(registry_namespace(&base).as_deref(), namespace);
+                assert_eq!(registry_session_name(&base), name);
+                assert!(registry_visible_from(&base, namespace));
+                assert!(!base.contains(['/', '\\', ':']));
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_legacy_entries_remain_readable() {
+        assert_eq!(storage_base(Some("work"), "dev"), "work__dev");
+        assert_eq!(storage_base(None, "dev"), "dev");
+        assert_eq!(registry_namespace("work____warm__"), Some("work".into()));
+        assert_eq!(registry_session_name("work____warm__"), "__warm__");
+        assert_eq!(registry_namespace("work__build__dev"), Some("work".into()));
+        assert_eq!(registry_session_name("work__build__dev"), "build__dev");
+    }
+
+    #[test]
+    fn unsafe_or_oversized_protocol_names_fail_explicitly() {
+        for name in ["", "bad\nname", "a:b", "a\0b"] { assert!(validate_registry_base(None, name).is_err()); }
+        assert!(validate_registry_base(Some(&"n".repeat(100)), &"_".repeat(100)).is_err());
+        assert!(validate_registry_base(Some("a__b"), "c__d").is_ok());
+    }
+}

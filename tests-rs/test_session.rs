@@ -208,28 +208,28 @@ fn auth_rejected_returns_none() {
 }
 
 #[test]
-fn stale_cleanup_removes_invalid_port_and_key() {
+fn stale_cleanup_preserves_invalid_registry_without_ownership() {
     let dir = temp_psmux_dir("stale_cleanup_invalid");
     let (port_path, key_path, sid_path) = write_registry_files(&dir, "bad", "not-a-port");
 
     cleanup_stale_port_files_in(&dir);
 
-    assert!(!port_path.exists(), "invalid .port file should be removed");
-    assert!(!key_path.exists(), "matching .key file should be removed");
-    assert!(!sid_path.exists(), "matching .sid file should be removed");
+    assert!(port_path.exists(), "unowned cleanup must preserve registry metadata");
+    assert!(key_path.exists(), "unowned cleanup must preserve registry metadata");
+    assert!(sid_path.exists(), "unowned cleanup must preserve registry metadata");
     let _ = fs::remove_dir_all(dir.parent().unwrap());
 }
 
 #[test]
-fn stale_cleanup_removes_registry_only_when_probe_confirms_stale() {
+fn stale_cleanup_preserves_registry_even_if_network_probe_says_stale() {
     let dir = temp_psmux_dir("stale_cleanup_confirmed");
     let (port_path, key_path, sid_path) = write_registry_files(&dir, "dead", "54321");
 
     cleanup_stale_port_files_in_with(&dir, |_, _| PortProbeResult::Stale);
 
-    assert!(!port_path.exists(), "confirmed-stale .port file should be removed");
-    assert!(!key_path.exists(), "matching .key file should be removed");
-    assert!(!sid_path.exists(), "matching .sid file should be removed");
+    assert!(port_path.exists(), "unowned cleanup must preserve registry metadata");
+    assert!(key_path.exists(), "unowned cleanup must preserve registry metadata");
+    assert!(sid_path.exists(), "unowned cleanup must preserve registry metadata");
     let _ = fs::remove_dir_all(dir.parent().unwrap());
 }
 
@@ -278,7 +278,7 @@ fn read_one_line(stream: &mut TcpStream) {
 }
 
 #[test]
-fn stale_cleanup_removes_session_when_port_reused_by_other_server() {
+fn stale_cleanup_preserves_session_when_credentials_are_rejected() {
     // After a crash/reboot the old port can be grabbed by a *different* live
     // psmux server, which rejects our key. A bare TCP connect would call this
     // "alive" and leave the dead session as a "(not responding)" zombie; the
@@ -294,9 +294,9 @@ fn stale_cleanup_removes_session_when_port_reused_by_other_server() {
 
     cleanup_stale_port_files_in(&dir);
 
-    assert!(!port_path.exists(), "key-rejected (reused) .port must be removed");
-    assert!(!key_path.exists(), "matching .key must be removed");
-    assert!(!sid_path.exists(), "matching .sid must be removed");
+    assert!(port_path.exists(), "unowned cleanup must preserve registry metadata");
+    assert!(key_path.exists(), "unowned cleanup must preserve registry metadata");
+    assert!(sid_path.exists(), "unowned cleanup must preserve registry metadata");
     let _ = done.recv_timeout(Duration::from_secs(2));
     let _ = fs::remove_dir_all(dir.parent().unwrap());
 }
@@ -368,7 +368,7 @@ fn liveness_authenticated_server_is_alive() {
 }
 
 #[test]
-fn liveness_auth_rejection_is_dead() {
+fn liveness_auth_rejection_is_unresponsive() {
     // The reboot/reused-port case: a different server rejects our key.
     let (addr, done) = spawn_fake_server(|mut s| {
         drain_client_request(&mut s);
@@ -383,12 +383,12 @@ fn liveness_auth_rejection_is_dead() {
         Duration::from_millis(400),
     );
 
-    assert_eq!(v, SessionLiveness::Dead, "auth rejection must be Dead");
+    assert_eq!(v, SessionLiveness::Unresponsive, "auth rejection is not evidence the process exited");
     let _ = done.recv_timeout(Duration::from_secs(2));
 }
 
 #[test]
-fn liveness_connection_refused_is_dead() {
+fn liveness_connection_refused_is_unresponsive() {
     // Bind then drop so the port is guaranteed free -> connect refused.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind to grab a port");
     let addr = listener.local_addr().unwrap().to_string();
@@ -401,11 +401,11 @@ fn liveness_connection_refused_is_dead() {
         Duration::from_millis(200),
     );
 
-    assert_eq!(v, SessionLiveness::Dead, "refused connect must be Dead");
+    assert_eq!(v, SessionLiveness::Unresponsive, "refused connection is not a process death certificate");
 }
 
 #[test]
-fn liveness_connected_but_silent_is_dead() {
+fn liveness_connected_but_silent_is_unresponsive() {
     // A listener that accepts (via backlog) but never speaks our protocol.
     // Bounded: we wait one read timeout, then declare it Dead (honors
     // "no response within the timeout -> kill"); a real server self-heals.
@@ -420,7 +420,7 @@ fn liveness_connected_but_silent_is_dead() {
         Duration::from_millis(150),
     );
 
-    assert_eq!(v, SessionLiveness::Dead, "silent peer must be Dead after timeout");
+    assert_eq!(v, SessionLiveness::Unresponsive, "silent peer must remain registered after timeout");
     assert!(start.elapsed() < Duration::from_secs(2), "probe must stay bounded, not hang");
     drop(listener);
 }

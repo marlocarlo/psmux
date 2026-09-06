@@ -1154,32 +1154,32 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                             should_close = true;
                         } else {
                             // Forward Escape to the PTY
-                            let _ = pty.writer.write_all(b"\x1b");
+                            pty.writer.write_all(b"\x1b")?;
                         }
                     }
                     KeyCode::Char(c) => {
                         if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
                             let ctrl = (c as u8) & 0x1F;
-                            let _ = pty.writer.write_all(&[ctrl]);
+                            pty.writer.write_all(&[ctrl])?;
                         } else {
                             let mut buf = [0u8; 4];
                             let s = c.encode_utf8(&mut buf);
-                            let _ = pty.writer.write_all(s.as_bytes());
+                            pty.writer.write_all(s.as_bytes())?;
                         }
                     }
-                    KeyCode::Enter => { let _ = pty.writer.write_all(b"\r"); }
-                    KeyCode::Backspace => { let _ = pty.writer.write_all(b"\x7f"); }
-                    KeyCode::Tab => { let _ = pty.writer.write_all(b"\t"); }
-                    KeyCode::BackTab => { let _ = pty.writer.write_all(b"\x1b[Z"); }
-                    KeyCode::Up => { let _ = pty.writer.write_all(b"\x1b[A"); }
-                    KeyCode::Down => { let _ = pty.writer.write_all(b"\x1b[B"); }
-                    KeyCode::Right => { let _ = pty.writer.write_all(b"\x1b[C"); }
-                    KeyCode::Left => { let _ = pty.writer.write_all(b"\x1b[D"); }
-                    KeyCode::Home => { let _ = pty.writer.write_all(b"\x1b[H"); }
-                    KeyCode::End => { let _ = pty.writer.write_all(b"\x1b[F"); }
-                    KeyCode::PageUp => { let _ = pty.writer.write_all(b"\x1b[5~"); }
-                    KeyCode::PageDown => { let _ = pty.writer.write_all(b"\x1b[6~"); }
-                    KeyCode::Delete => { let _ = pty.writer.write_all(b"\x1b[3~"); }
+                    KeyCode::Enter => { pty.writer.write_all(b"\r")?; }
+                    KeyCode::Backspace => { pty.writer.write_all(b"\x7f")?; }
+                    KeyCode::Tab => { pty.writer.write_all(b"\t")?; }
+                    KeyCode::BackTab => { pty.writer.write_all(b"\x1b[Z")?; }
+                    KeyCode::Up => { pty.writer.write_all(b"\x1b[A")?; }
+                    KeyCode::Down => { pty.writer.write_all(b"\x1b[B")?; }
+                    KeyCode::Right => { pty.writer.write_all(b"\x1b[C")?; }
+                    KeyCode::Left => { pty.writer.write_all(b"\x1b[D")?; }
+                    KeyCode::Home => { pty.writer.write_all(b"\x1b[H")?; }
+                    KeyCode::End => { pty.writer.write_all(b"\x1b[F")?; }
+                    KeyCode::PageUp => { pty.writer.write_all(b"\x1b[5~")?; }
+                    KeyCode::PageDown => { pty.writer.write_all(b"\x1b[6~")?; }
+                    KeyCode::Delete => { pty.writer.write_all(b"\x1b[3~")?; }
                     _ => {}
                 }
                 // Check if child exited
@@ -1494,7 +1494,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> io::Result<bool> {
                         app.mode = Mode::Passthrough;
                         let win = &mut app.windows[app.active_idx];
                         if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                            let _ = write!(p.writer, "{}", text);
+                            p.writer.write_all(text.as_bytes())?;
                         }
                     } else {
                         app.mode = Mode::Passthrough;
@@ -2112,7 +2112,7 @@ pub(crate) fn csi_cursor_to_ss3(seq: &[u8], app_cursor: bool) -> Option<[u8; 3]>
 /// form when the pane is in DECCKM application-cursor mode (see csi_cursor_to_ss3).
 /// The transform no-ops on every other sequence, so all named keys route through
 /// this uniformly. Does not flush; callers flush once after the write.
-pub(crate) fn write_key_seq(p: &mut crate::types::Pane, seq: &[u8]) {
+pub(crate) fn write_key_seq(p: &mut crate::types::Pane, seq: &[u8]) -> io::Result<()> {
     let app_cursor = p.term.lock()
         .map(|t| t.screen().application_cursor())
         .unwrap_or(false);
@@ -2156,7 +2156,7 @@ pub(crate) fn win32_input_key_seq(vk: u16, scan: u16, uchar: u16, ctrl_state: u3
 /// ESC byte: that is the only dangling-ESC write psmux makes.  Everything else
 /// it sends is either a complete escape sequence or plain text, and is passed
 /// through untouched — as is every byte on a pane that was never latched.
-pub(crate) fn write_pane_input(p: &mut crate::types::Pane, bytes: &[u8]) {
+pub(crate) fn write_pane_input(p: &mut crate::types::Pane, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
     #[cfg(windows)]
     {
@@ -2164,13 +2164,12 @@ pub(crate) fn write_pane_input(p: &mut crate::types::Pane, bytes: &[u8]) {
             const VK_ESCAPE: u16 = 0x1B;
             let scan = crate::platform::mouse_inject::vk_to_scan(VK_ESCAPE);
             let seq = win32_input_key_seq(VK_ESCAPE, scan, VK_ESCAPE, 0);
-            let _ = p.writer.write_all(seq.as_bytes());
-            let _ = p.writer.flush();
-            return;
+            p.writer.write_all(seq.as_bytes())?;
+            return p.writer.flush();
         }
     }
-    let _ = p.writer.write_all(bytes);
-    let _ = p.writer.flush();
+    p.writer.write_all(bytes)?;
+    p.writer.flush()
 }
 
 /// Record that psmux has just written a win32 input mode sequence to the panes
@@ -2349,7 +2348,7 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
 
                 if app.sync_input {
                     let win = &mut app.windows[app.active_idx];
-                    fn inject_all(node: &mut Node, ctrl: bool, alt: bool, shift: bool) {
+                    fn inject_all(node: &mut Node, ctrl: bool, alt: bool, shift: bool) -> io::Result<()> {
                         match node {
                             Node::Leaf(p) if !p.dead => {
                                 if let Some(pid) = p.child_pid {
@@ -2357,18 +2356,19 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
                                         // Fallback: xterm CSI encoding for non-console apps
                                         let m: u8 = 1 + (shift as u8) + (alt as u8) * 2 + (ctrl as u8) * 4;
                                         let bytes = if m > 1 { format!("\x1b[13;{}~", m).into_bytes() } else { b"\r".to_vec() };
-                                        let _ = p.writer.write_all(&bytes);
-                                        let _ = p.writer.flush();
+                                        p.writer.write_all(&bytes)?;
+                                        p.writer.flush()?;
                                     }
                                 }
                             }
                             Node::Leaf(_) => {}
                             Node::Split { children, .. } => {
-                                for c in children { inject_all(c, ctrl, alt, shift); }
+                                for c in children { inject_all(c, ctrl, alt, shift)?; }
                             }
                         }
+                        Ok(())
                     }
-                    inject_all(&mut win.root, ctrl, alt, shift);
+                    inject_all(&mut win.root, ctrl, alt, shift)?;
                     return Ok(());
                 } else {
                     let win = &mut app.windows[app.active_idx];
@@ -2418,7 +2418,7 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
 
                 if app.sync_input {
                     let win = &mut app.windows[app.active_idx];
-                    fn inject_ctrl_all(node: &mut Node, ch: char, raw: u8, is_ctrl_c: bool) {
+                    fn inject_ctrl_all(node: &mut Node, ch: char, raw: u8, is_ctrl_c: bool) -> io::Result<()> {
                         match node {
                             Node::Leaf(p) if !p.dead => {
                                 // Ctrl+C: consult the interrupt router BEFORE writing the
@@ -2433,8 +2433,8 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
                                         crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
                                     }
                                 }
-                                let _ = p.writer.write_all(&[raw]);
-                                let _ = p.writer.flush();
+                                p.writer.write_all(&[raw])?;
+                                p.writer.flush()?;
                                 #[cfg(windows)]
                                 if !is_ctrl_c {
                                     if let Some(pid) = p.child_pid {
@@ -2446,11 +2446,12 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
                             }
                             Node::Leaf(_) => {}
                             Node::Split { children, .. } => {
-                                for child in children { inject_ctrl_all(child, ch, raw, is_ctrl_c); }
+                                for child in children { inject_ctrl_all(child, ch, raw, is_ctrl_c)?; }
                             }
                         }
+                        Ok(())
                     }
-                    inject_ctrl_all(&mut win.root, inject_char, ctrl_char, is_ctrl_c);
+                    inject_ctrl_all(&mut win.root, inject_char, ctrl_char, is_ctrl_c)?;
                 } else {
                     let win = &mut app.windows[app.active_idx];
                     if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
@@ -2463,8 +2464,8 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
                                     crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
                                 }
                             }
-                            let _ = active.writer.write_all(&[ctrl_char]);
-                            let _ = active.writer.flush();
+                            active.writer.write_all(&[ctrl_char])?;
+                            active.writer.flush()?;
                             #[cfg(windows)]
                             if !is_ctrl_c {
                                 if let Some(pid) = active.child_pid {
@@ -2489,21 +2490,22 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
     if app.sync_input {
         // Fan out to ALL panes in the current window
         let win = &mut app.windows[app.active_idx];
-        fn write_all_panes(node: &mut Node, data: &[u8]) {
+        fn write_all_panes(node: &mut Node, data: &[u8]) -> io::Result<()> {
             match node {
-                Node::Leaf(p) if !p.dead => { let _ = p.writer.write_all(data); let _ = p.writer.flush(); }
+                Node::Leaf(p) if !p.dead => { p.writer.write_all(data)?; p.writer.flush()?; }
                 Node::Leaf(_) => {}
-                Node::Split { children, .. } => { for c in children { write_all_panes(c, data); } }
+                Node::Split { children, .. } => { for c in children { write_all_panes(c, data)?; } }
             }
+            Ok(())
         }
-        write_all_panes(&mut win.root, &encoded);
+        write_all_panes(&mut win.root, &encoded)?;
 
     } else {
         let win = &mut app.windows[app.active_idx];
         if let Some(active) = active_pane_mut(&mut win.root, &win.active_path) {
             if !active.dead {
-                let _ = active.writer.write_all(&encoded);
-                let _ = active.writer.flush();
+                active.writer.write_all(&encoded)?;
+                active.writer.flush()?;
 
             }
         }
@@ -2511,60 +2513,30 @@ pub fn forward_key_to_active(app: &mut AppState, key: KeyEvent) -> io::Result<()
     Ok(())
 }
 
-/// Chunked PTY write for paste delivery.  The PTY pipe can silently
-/// drop bytes when a large payload (140+ lines) is written in a single
-/// call because the OS pipe buffer fills up.  We split the text into
-/// ~2 KiB chunks with small yields between them so the consumer
-/// (shell / PSReadLine / nvim) has time to drain.  Bracket sequences
-/// are tiny and always written in one shot.
-fn write_paste_chunked(writer: &mut dyn std::io::Write, text: &[u8], bracket: bool) {
-    const CHUNK: usize = 512;
-    // Normalize line endings to CR for ConPTY.  Clipboard text may arrive
-    // with LF (\n) or CRLF (\r\n), but ConPTY's input parser expects CR
-    // (\r) for Enter.  Bare LF is misinterpreted by PSReadLine, causing
-    // multi-line pastes to appear in reverse order.
-    let text = {
-        let mut out = Vec::with_capacity(text.len());
-        let mut i = 0;
-        while i < text.len() {
-            if text[i] == b'\r' && i + 1 < text.len() && text[i + 1] == b'\n' {
-                out.push(b'\r');
-                i += 2; // CRLF → CR
-            } else if text[i] == b'\n' {
-                out.push(b'\r');
-                i += 1; // LF → CR
-            } else {
-                out.push(text[i]);
-                i += 1;
-            }
-        }
-        out
-    };
-    let text = &text[..];
-    if bracket { let _ = writer.write_all(b"\x1b[200~"); }
-    let mut offset: usize = 0;
-    while offset < text.len() {
-        let remaining = (text.len() - offset).min(CHUNK);
-        let chunk = &text[offset..offset + remaining];
-        match writer.write(chunk) {
-            Ok(0) => {
-                // Zero bytes written — yield and retry once
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                match writer.write(chunk) {
-                    Ok(n) if n > 0 => { offset += n; }
-                    _ => break, // give up on persistent failure
-                }
-            }
-            Ok(n) => { offset += n; }
-            Err(_) => break,
-        }
-        // Yield between chunks to let the consumer drain the buffer
-        if offset < text.len() {
-            std::thread::sleep(std::time::Duration::from_millis(5));
+/// Normalize and admit a whole paste atomically, including its bracket markers.
+/// The pane's dedicated writer performs bounded writes. Never sleep/retry on the
+/// event loop or leave a child inside bracketed-paste mode after partial admission.
+fn write_paste_chunked(writer: &mut dyn std::io::Write, text: &[u8], bracket: bool) -> io::Result<()> {
+    const MAX_PASTE: usize = 1024 * 1024 - 12;
+    if text.len() > MAX_PASTE {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "paste exceeds the 1 MiB pane input budget; split it into smaller pastes"));
+    }
+    let mut normalized = Vec::with_capacity(text.len() + if bracket { 12 } else { 0 });
+    if bracket { normalized.extend_from_slice(b"\x1b[200~"); }
+    let mut i = 0;
+    while i < text.len() {
+        if text[i] == b'\r' && i + 1 < text.len() && text[i + 1] == b'\n' {
+            normalized.push(b'\r');
+            i += 2;
+        } else {
+            normalized.push(if text[i] == b'\n' { b'\r' } else { text[i] });
+            i += 1;
         }
     }
-    if bracket { let _ = writer.write_all(b"\x1b[201~"); }
-    let _ = writer.flush();
+    if bracket { normalized.extend_from_slice(b"\x1b[201~"); }
+    writer.write_all(&normalized)?;
+    writer.flush()
 }
 
 /// Send pasted text to the active pane, wrapping in bracketed-paste
@@ -2573,104 +2545,40 @@ fn write_paste_chunked(writer: &mut dyn std::io::Write, text: &[u8], bracket: bo
 /// drag-and-drop file paths, ensuring applications like Claude CLI can
 /// distinguish paste/drop from typed input.
 pub fn send_paste_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
-    // In clock mode, any input exits back to passthrough
     if matches!(app.mode, Mode::ClockMode) {
         app.mode = Mode::Passthrough;
         return Ok(());
     }
-    // In copy / copy-search modes, treat like regular text
-    if matches!(app.mode, Mode::CopyMode) {
+    if matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. } | Mode::ConfirmMode { .. }
+        | Mode::MenuMode { .. } | Mode::PaneChooser { .. }) {
         return send_text_to_active(app, text);
     }
-    if matches!(app.mode, Mode::CopySearch { .. }) {
-        return send_text_to_active(app, text);
+    fn paste(pane: &mut Pane, text: &[u8]) -> io::Result<()> {
+        let bracket = pane.term.lock().map(|p| p.screen().bracketed_paste()).unwrap_or(false);
+        write_paste_chunked(&mut pane.writer, text, bracket)
+            .map_err(|error| io::Error::new(error.kind(), format!("pane %{}: {}", pane.id, error)))
     }
-
-    // Check if the child requested bracketed paste mode
-    let use_bracket = {
-        let win = &app.windows[app.active_idx];
-        if let Some(p) = crate::tree::active_pane(&win.root, &win.active_path) {
-            if let Ok(parser) = p.term.lock() {
-                let bp = parser.screen().bracketed_paste();
-                crate::debug_log::input_log("paste", &format!("child bracketed_paste()={}", bp));
-                bp
-            } else {
-                crate::debug_log::input_log("paste", "term lock failed");
-                false
-            }
-        } else {
-            crate::debug_log::input_log("paste", "no active pane");
-            false
-        }
-    };
-    crate::debug_log::input_log("paste", &format!("use_bracket={} text_len={} text_preview={:?}", use_bracket, text.len(), &text.chars().take(100).collect::<String>()));
-
-    // On Windows, bracketed paste delivery is tricky:
-    //
-    // - ConPTY may strip \x1b[200~/201~ from the PTY input pipe (older Windows).
-    // - WriteConsoleInputW can bypass ConPTY, but it sends each byte of the
-    //   bracket sequence as a separate KEY_EVENT record.  Apps that read via
-    //   ReadConsoleInputW (crossterm-based apps like Helix) cannot reassemble
-    //   VT sequences from individual key events, so \x1b[200~ appears as the
-    //   literal characters Esc [ 2 0 0 ~ in the editor (issue #98).
-    // - Apps that read raw bytes via ReadFile (nvim via libuv) CAN parse the
-    //   bracket sequences from console-injected KEY_EVENTs.
-    //
-    // Strategy: try the PTY pipe first with bracket markers.  This works on
-    // newer Windows where ConPTY passes VT input through, and also works for
-    // byte-stream readers (nvim).  If the child uses ReadConsoleInputW
-    // (crossterm), ConPTY converts the VT bytes to KEY_EVENTs anyway, so the
-    // brackets may still not be parsed -- but at least the text content
-    // arrives correctly without stray visible bracket characters.
-    //
-    // For apps where PTY-pipe brackets get stripped by ConPTY, fall back to
-    // console injection for the TEXT ONLY (no bracket markers) so the content
-    // still arrives reliably.
-    #[cfg(windows)]
-    {
-        if app.sync_input {
-            let win = &mut app.windows[app.active_idx];
-            fn write_all_panes(node: &mut crate::types::Node, text: &[u8], bracket: bool) {
-                match node {
-                    crate::types::Node::Leaf(p) => {
-                        write_paste_chunked(&mut p.writer, text, bracket);
-                    }
-                    crate::types::Node::Split { children, .. } => {
-                        for c in children { write_all_panes(c, text, bracket); }
-                    }
+    if let Mode::PopupMode { ref mut popup_pane, .. } = app.mode {
+        if let Some(pane) = popup_pane { paste(pane, text.as_bytes())?; }
+        return Ok(());
+    }
+    let win = &mut app.windows[app.active_idx];
+    if let Some(fi) = win.floating_focus {
+        if let Some(fp) = win.floating.get_mut(fi) { return paste(&mut fp.pane, text.as_bytes()); }
+    }
+    if app.sync_input {
+        fn all(node: &mut Node, text: &[u8]) -> io::Result<()> {
+            match node {
+                Node::Leaf(pane) => paste(pane, text),
+                Node::Split { children, .. } => {
+                    for child in children { all(child, text)?; }
+                    Ok(())
                 }
             }
-            write_all_panes(&mut win.root, text.as_bytes(), use_bracket);
-        } else {
-            let win = &mut app.windows[app.active_idx];
-            if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                write_paste_chunked(&mut p.writer, text.as_bytes(), use_bracket);
-            }
         }
-    }
-
-    // On non-Windows, use standard PTY pipe write with bracket sequences
-    #[cfg(not(windows))]
-    {
-        if app.sync_input {
-            let win = &mut app.windows[app.active_idx];
-            fn write_paste_all_panes(node: &mut Node, text: &[u8], bracket: bool) {
-                match node {
-                    Node::Leaf(p) => {
-                        write_paste_chunked(&mut p.writer, text, bracket);
-                    }
-                    Node::Split { children, .. } => {
-                        for c in children { write_paste_all_panes(c, text, bracket); }
-                    }
-                }
-            }
-            write_paste_all_panes(&mut win.root, text.as_bytes(), use_bracket);
-        } else {
-            let win = &mut app.windows[app.active_idx];
-            if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-                write_paste_chunked(&mut p.writer, text.as_bytes(), use_bracket);
-            }
-        }
+        all(&mut win.root, text.as_bytes())?;
+    } else if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
+        paste(pane, text.as_bytes())?;
     }
     Ok(())
 }
@@ -2691,26 +2599,27 @@ pub fn send_bytes_to_active(app: &mut AppState, bytes: &[u8]) -> io::Result<()> 
         let win = &mut app.windows[app.active_idx];
         if let Some(fi) = win.floating_focus {
             if let Some(fp) = win.floating.get_mut(fi) {
-                let _ = fp.pane.writer.write_all(bytes);
-                let _ = fp.pane.writer.flush();
+                fp.pane.writer.write_all(bytes)?;
+                fp.pane.writer.flush()?;
                 return Ok(());
             }
         }
     }
     if app.sync_input {
         let win = &mut app.windows[app.active_idx];
-        fn write_all_panes(node: &mut Node, data: &[u8]) {
+        fn write_all_panes(node: &mut Node, data: &[u8]) -> io::Result<()> {
             match node {
-                Node::Leaf(p) => { let _ = p.writer.write_all(data); let _ = p.writer.flush(); }
-                Node::Split { children, .. } => { for c in children { write_all_panes(c, data); } }
+                Node::Leaf(p) => { p.writer.write_all(data)?; p.writer.flush()?; }
+                Node::Split { children, .. } => { for c in children { write_all_panes(c, data)?; } }
             }
+            Ok(())
         }
-        write_all_panes(&mut win.root, bytes);
+        write_all_panes(&mut win.root, bytes)?;
     } else {
         let win = &mut app.windows[app.active_idx];
         if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-            let _ = p.writer.write_all(bytes);
-            let _ = p.writer.flush();
+            p.writer.write_all(bytes)?;
+            p.writer.flush()?;
         }
     }
     Ok(())
@@ -2731,8 +2640,8 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
         }
         if let Mode::PopupMode { ref mut popup_pane, .. } = app.mode {
             if let Some(ref mut pty) = popup_pane {
-                let _ = pty.writer.write_all(text.as_bytes());
-                let _ = pty.writer.flush();
+                pty.writer.write_all(text.as_bytes())?;
+                pty.writer.flush()?;
             }
         }
         return Ok(());
@@ -2810,7 +2719,7 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
         let win = &mut app.windows[app.active_idx];
         if let Some(fi) = win.floating_focus {
             if let Some(fp) = win.floating.get_mut(fi) {
-                write_pane_input(&mut fp.pane, text.as_bytes());
+                write_pane_input(&mut fp.pane, text.as_bytes())?;
                 return Ok(());
             }
         }
@@ -2819,17 +2728,18 @@ pub fn send_text_to_active(app: &mut AppState, text: &str) -> io::Result<()> {
     if app.sync_input {
         // Fan out to ALL panes in the current window
         let win = &mut app.windows[app.active_idx];
-        fn write_all_panes(node: &mut Node, text: &[u8]) {
+        fn write_all_panes(node: &mut Node, text: &[u8]) -> io::Result<()> {
             match node {
-                Node::Leaf(p) => write_pane_input(p, text),
-                Node::Split { children, .. } => { for c in children { write_all_panes(c, text); } }
+                Node::Leaf(p) => write_pane_input(p, text)?,
+                Node::Split { children, .. } => { for c in children { write_all_panes(c, text)?; } }
             }
+            Ok(())
         }
-        write_all_panes(&mut win.root, text.as_bytes());
+        write_all_panes(&mut win.root, text.as_bytes())?;
     } else {
         let win = &mut app.windows[app.active_idx];
         if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-            write_pane_input(p, text.as_bytes());
+            write_pane_input(p, text.as_bytes())?;
         }
     }
     Ok(())
@@ -3025,8 +2935,8 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
         if let Some(seq) = seq {
             if let Mode::PopupMode { ref mut popup_pane, .. } = app.mode {
                 if let Some(ref mut pty) = popup_pane {
-                    let _ = pty.writer.write_all(seq.as_bytes());
-                    let _ = pty.writer.flush();
+                    pty.writer.write_all(seq.as_bytes())?;
+                    pty.writer.flush()?;
                 }
             }
         }
@@ -3226,25 +3136,25 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
     }
     
     // Write a named key to a single pane (extracted for sync_input support).
-    fn write_named_key_to_pane(p: &mut crate::types::Pane, k: &str) {
+    fn write_named_key_to_pane(p: &mut crate::types::Pane, k: &str) -> io::Result<()> {
         use std::io::Write as _;
         match k {
-            "enter" => write_key_seq(p, b"\r"),
-            "tab" => write_key_seq(p, b"\t"),
-            "btab" | "backtab" => write_key_seq(p, b"\x1b[Z"),
-            "backspace" => write_key_seq(p, b"\x7f"),
-            "delete" => write_key_seq(p, b"\x1b[3~"),
-            "esc" => write_key_seq(p, b"\x1b"),
-            "up" => write_key_seq(p, b"\x1b[A"),
-            "down" => write_key_seq(p, b"\x1b[B"),
-            "right" => write_key_seq(p, b"\x1b[C"),
-            "left" => write_key_seq(p, b"\x1b[D"),
-            "home" => write_key_seq(p, b"\x1b[H"),
-            "end" => write_key_seq(p, b"\x1b[F"),
-            "pageup" => write_key_seq(p, b"\x1b[5~"),
-            "pagedown" => write_key_seq(p, b"\x1b[6~"),
-            "insert" => write_key_seq(p, b"\x1b[2~"),
-            "space" => write_key_seq(p, b" "),
+            "enter" => write_key_seq(p, b"\r")?,
+            "tab" => write_key_seq(p, b"\t")?,
+            "btab" | "backtab" => write_key_seq(p, b"\x1b[Z")?,
+            "backspace" => write_key_seq(p, b"\x7f")?,
+            "delete" => write_key_seq(p, b"\x1b[3~")?,
+            "esc" => write_key_seq(p, b"\x1b")?,
+            "up" => write_key_seq(p, b"\x1b[A")?,
+            "down" => write_key_seq(p, b"\x1b[B")?,
+            "right" => write_key_seq(p, b"\x1b[C")?,
+            "left" => write_key_seq(p, b"\x1b[D")?,
+            "home" => write_key_seq(p, b"\x1b[H")?,
+            "end" => write_key_seq(p, b"\x1b[F")?,
+            "pageup" => write_key_seq(p, b"\x1b[5~")?,
+            "pagedown" => write_key_seq(p, b"\x1b[6~")?,
+            "insert" => write_key_seq(p, b"\x1b[2~")?,
+            "space" => write_key_seq(p, b" ")?,
             s if s.starts_with("f") && s.len() >= 2 && s.len() <= 3 => {
                 if let Ok(n) = s[1..].parse::<u8>() {
                     let seq = match n {
@@ -3262,7 +3172,7 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                         12 => "\x1b[24~",
                         _ => "",
                     };
-                    if !seq.is_empty() { let _ = write!(p.writer, "{}", seq); }
+                    if !seq.is_empty() { p.writer.write_all(seq.as_bytes())?; }
                 }
             }
             // Ctrl+Shift+<letter>: inject a native KEY_EVENT carrying BOTH the
@@ -3288,14 +3198,14 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                     if !injected {
                         // No child pid / injection failed: fall back to the raw
                         // control byte (Shift unrepresentable, but key still arrives).
-                        let _ = p.writer.write_all(&[ctrl_char]);
+                        p.writer.write_all(&[ctrl_char])?;
                     }
                 }
                 #[cfg(not(windows))]
                 {
                     // Non-Windows: no console-input modifier channel; legacy VT has
                     // no distinct Ctrl+Shift+<letter> encoding, so deliver the byte.
-                    let _ = p.writer.write_all(&[ctrl_char]);
+                    p.writer.write_all(&[ctrl_char])?;
                 }
             }
             // Ctrl+Shift+<punctuation/digit> that collapses to a single C0 byte.
@@ -3313,8 +3223,8 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             {
                 let c = s.chars().nth(4).unwrap();
                 if let Some(byte) = ctrl_char_send_keys_byte(c) {
-                    let _ = p.writer.write_all(&[byte]);
-                    let _ = p.writer.flush();
+                    p.writer.write_all(&[byte])?;
+                    p.writer.flush()?;
                 }
             }
             // Ctrl+Break (issue #454).  The attached client traps the Ctrl+Break
@@ -3370,8 +3280,8 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                         crate::platform::mouse_inject::send_ctrl_c_event(pid, false);
                     }
                 }
-                let _ = p.writer.write_all(&[ctrl_char]);
-                let _ = p.writer.flush();
+                p.writer.write_all(&[ctrl_char])?;
+                p.writer.flush()?;
             }
             s if (s.starts_with("M-") || s.starts_with("m-")) && s.len() == 3 => {
                 let c = s.chars().nth(2).unwrap_or('a');
@@ -3385,7 +3295,7 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 };
                 if !injected {
                     // Fallback: VT encoding (ESC + char) — works for VT-native apps
-                    let _ = write!(p.writer, "\x1b{}", c);
+                    p.writer.write_all(format!("\x1b{}", c).as_bytes())?;
                 }
             }
             s if (s.starts_with("C-M-") || s.starts_with("c-m-")) && s.len() == 5 => {
@@ -3400,7 +3310,7 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 };
                 if !injected {
                     let ctrl_char = (c.to_ascii_lowercase() as u8) & 0x1F;
-                    let _ = p.writer.write_all(&[0x1b, ctrl_char]);
+                    p.writer.write_all(&[0x1b, ctrl_char])?;
                 }
             }
             // Modified Enter: for Ctrl combos, try native console injection
@@ -3432,14 +3342,14 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
                 if !injected {
                     if has_ctrl && !has_shift && !has_alt {
                         // Fallback: plain Ctrl+Enter is LF, matching WT (#409).
-                        let _ = p.writer.write_all(b"\n");
+                        p.writer.write_all(b"\n")?;
                     } else if (has_shift || has_alt) && !has_ctrl {
                         // Fallback: ESC + CR for VT-native apps (Claude Code, etc.)
-                        let _ = p.writer.write_all(b"\x1b\r");
+                        p.writer.write_all(b"\x1b\r")?;
                     } else {
                         // Ctrl+Shift/Ctrl+Alt+Enter and other combos: CSI encoding
                         if let Some(seq) = parse_modified_special_key(s) {
-                            let _ = p.writer.write_all(seq.as_bytes());
+                            p.writer.write_all(seq.as_bytes())?;
                         }
                     }
                 }
@@ -3447,11 +3357,12 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
             // Modifier + special key combos: C-Left, S-Right, C-S-Up, C-M-Home, etc.
             s if parse_modified_special_key(s).is_some() => {
                 let seq = parse_modified_special_key(s).unwrap();
-                let _ = p.writer.write_all(seq.as_bytes());
+                p.writer.write_all(seq.as_bytes())?;
             }
             _ => {}
         }
-        let _ = p.writer.flush();
+        p.writer.flush()?;
+        Ok(())
     }
 
     // A focused floating pane (tmux new-pane) receives the key instead of the
@@ -3460,7 +3371,7 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
         let win = &mut app.windows[app.active_idx];
         if let Some(fi) = win.floating_focus {
             if let Some(fp) = win.floating.get_mut(fi) {
-                write_named_key_to_pane(&mut fp.pane, k);
+                write_named_key_to_pane(&mut fp.pane, k)?;
                 return Ok(());
             }
         }
@@ -3469,19 +3380,20 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
     // Distribute the key to all panes (sync) or just the active pane.
     if app.sync_input {
         let win = &mut app.windows[app.active_idx];
-        fn send_key_all_panes(node: &mut crate::types::Node, k: &str) {
+        fn send_key_all_panes(node: &mut crate::types::Node, k: &str) -> io::Result<()> {
             match node {
-                crate::types::Node::Leaf(p) => write_named_key_to_pane(p, k),
+                crate::types::Node::Leaf(p) => write_named_key_to_pane(p, k)?,
                 crate::types::Node::Split { children, .. } => {
-                    for c in children { send_key_all_panes(c, k); }
+                    for c in children { send_key_all_panes(c, k)?; }
                 }
             }
+            Ok(())
         }
-        send_key_all_panes(&mut win.root, k);
+        send_key_all_panes(&mut win.root, k)?;
     } else {
         let win = &mut app.windows[app.active_idx];
         if let Some(p) = active_pane_mut(&mut win.root, &win.active_path) {
-            write_named_key_to_pane(p, k);
+            write_named_key_to_pane(p, k)?;
         }
     }
     Ok(())
@@ -3490,6 +3402,10 @@ pub fn send_key_to_active(app: &mut AppState, k: &str) -> io::Result<()> {
 #[cfg(test)]
 #[path = "../tests-rs/test_input.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_audit_input_errors.rs"]
+mod tests_audit_input_errors;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue226_ctrl_slash.rs"]
