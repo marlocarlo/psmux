@@ -1,3 +1,4 @@
+// Reliability policy: these historical scenarios now require preserving every live server.
 // Issue #448: harden server cleanup — reap live orphaned servers and store PID.
 //
 // These unit tests exercise the PURE decision logic that drives the reaper
@@ -51,12 +52,12 @@ fn owning_all(candidates: &[ServerCandidate]) -> HashMap<u32, Option<u64>> {
 // ── select_orphan_pids: core policy ──────────────────────────────────────
 
 #[test]
-fn orphan_with_no_registry_reference_is_reaped() {
+fn orphan_with_no_registry_reference_is_preserved() {
     // A live server of OURS on port 5000 that no .port file references -> orphan.
     let cands = vec![cand(1000, &[5000], 100)];
     let got = select_orphan_pids(
         &cands, &ports(&[]), &pids(&[]), &owning_all(&cands), 42, u64::MAX);
-    assert_eq!(got, vec![1000], "untracked live server must be selected for reaping");
+    assert!(got.is_empty(), "a live server must not be terminated merely because registry metadata is missing");
 }
 
 #[test]
@@ -96,12 +97,12 @@ fn young_process_is_skipped_by_grace_window() {
 }
 
 #[test]
-fn old_process_passes_grace_window() {
+fn old_process_is_not_disposable_based_on_age() {
     // creation_ft (100) is at/older than the cutoff (150) -> eligible.
     let cands = vec![cand(1000, &[5000], 100)];
     let got = select_orphan_pids(
         &cands, &ports(&[]), &pids(&[]), &owning_all(&cands), 42, 150);
-    assert_eq!(got, vec![1000], "a process older than the grace window must be reaped");
+    assert!(got.is_empty(), "a live server must not be terminated merely because registry metadata is missing");
 }
 
 #[test]
@@ -115,7 +116,7 @@ fn multi_port_server_kept_if_any_port_tracked() {
 }
 
 #[test]
-fn mixed_fleet_only_orphans_selected() {
+fn mixed_fleet_all_live_sessions_preserved() {
     let cands = vec![
         cand(10, &[6000], 100), // orphan (untracked, ours)
         cand(11, &[6001], 100), // legit (port tracked)
@@ -126,7 +127,7 @@ fn mixed_fleet_only_orphans_selected() {
     let mut got = select_orphan_pids(
         &cands, &ports(&[6001]), &pids(&[12]), &owning_all(&cands), 42, u64::MAX);
     got.sort();
-    assert_eq!(got, vec![10, 13], "exactly the untracked non-self servers must be selected");
+    assert!(got.is_empty(), "a live server must not be terminated merely because registry metadata is missing");
 }
 
 // ── read_tracked_registry: file -> (ports, pids) ─────────────────────────
@@ -179,6 +180,6 @@ fn end_to_end_selection_over_registry_files() {
     // shared .port/.pid entries with the winner's.
     let got = select_orphan_pids(
         &cands, &tp, &tpid, &owned(&[(500, 100), (501, 100)]), 1, u64::MAX);
-    assert_eq!(got, vec![501], "only the orphaned duplicate must be reaped");
+    assert!(got.is_empty(), "a live server must not be terminated merely because registry metadata is missing");
     let _ = std::fs::remove_dir_all(&dir);
 }

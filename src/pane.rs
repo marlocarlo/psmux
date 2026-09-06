@@ -1,6 +1,6 @@
 use std::io;
-use std::sync::{Arc, Condvar, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -9,6 +9,12 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use crate::types::{AppState, Pane, Node, LayoutKind, Window};
 use crate::tree::{replace_leaf_with_split, active_pane_mut, kill_leaf};
 use crate::format::hostname_cached;
+
+mod io_queue;
+pub mod pipe;
+mod staging;
+mod warm;
+pub use warm::{WarmPaneTask, retire_warm_pane};
 
 /// Sentinel value for cursor_shape: means "no DECSCUSR received from child yet".
 /// When ConPTY passthrough mode is unavailable, DECSCUSR sequences from child
@@ -31,68 +37,76 @@ pub fn conpty_preemptive_dsr_response(_writer: &mut dyn std::io::Write) {
     // no-op: reactive CPR responder handles all ESC[6n queries (#313)
 }
 
-/// Non-blocking pane writer: queues bytes to a dedicated flush thread.
-///
-/// The ConPTY input pipe has a fixed 64KB buffer. A pane child that stops
-/// reading stdin (e.g. a TUI busy with a long redraw) makes a direct
-/// `write_all` on the server thread block, wedging every session on the
-/// server. tmux never has this problem because pty writes go through a
-/// libevent bufferevent that buffers in memory and flushes asynchronously;
-/// this queue mirrors that contract: writes always complete immediately,
-/// bytes are delivered in order, and backpressure is absorbed by memory
-/// exactly like tmux's event buffer.
-struct QueuedPaneWriter {
-    tx: std::sync::mpsc::Sender<Vec<u8>>,
-}
-
-impl std::io::Write for QueuedPaneWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        self.tx.send(buf.to_vec()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pane writer thread exited")
-        })?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Wrap a raw PTY writer in a queue drained by a dedicated thread.
-///
-/// The inner writer's lifetime must match the pane's: dropping the ConPTY
-/// master writer closes the child's input pipe, which a shell reads as EOF
-/// and exits on — closing the whole window. A transient write error (e.g.
-/// while a TUI child is tearing down) must therefore NOT end the thread;
-/// it only stops further writes. The thread — and with it the inner
-/// writer — goes away only when the queue side is dropped with the pane.
+/// Wrap a raw PTY writer in a nonblocking 1 MiB admission queue. In-flight
+/// writes remain charged to the budget; saturation returns WouldBlock before
+/// accepting any of a write. A permanent asynchronous error is returned by
+/// subsequent writes/flush without closing an otherwise healthy pane's stdin.
 pub fn spawn_pane_write_queue(
-    mut inner: Box<dyn std::io::Write + Send>,
+    inner: Box<dyn std::io::Write + Send>,
 ) -> Box<dyn std::io::Write + Send> {
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let _ = std::thread::Builder::new()
-        .name("pane-writer".to_string())
-        .spawn(move || {
-            let mut broken = false;
-            while let Ok(mut buf) = rx.recv() {
-                // Coalesce whatever else is already queued into one write.
-                while let Ok(more) = rx.try_recv() {
-                    buf.extend_from_slice(&more);
-                }
-                if broken {
-                    continue;
-                }
-                if inner.write_all(&buf).is_err() {
-                    broken = true;
-                    continue;
-                }
-                let _ = inner.flush();
+    // Retain a raw handle on thread-creation failure as well: returning a
+    // failing writer should not inadvertently deliver EOF to the child.
+    let retained = Arc::new(Mutex::new(Some(inner)));
+    let worker_inner = retained.clone();
+    match io_queue::ByteWriter::spawn("pane-writer", io_queue::INPUT_BYTE_LIMIT, true,
+        move || Ok(worker_inner.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap())) {
+        Ok(writer) => Box::new(writer),
+        Err(error) => {
+            struct FailedWriter {
+                _inner: Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
+                message: String,
             }
-        });
-    Box::new(QueuedPaneWriter { tx })
+            impl std::io::Write for FailedWriter {
+                fn write(&mut self, _: &[u8]) -> io::Result<usize> { Err(io::Error::other(self.message.clone())) }
+                fn flush(&mut self) -> io::Result<()> { Err(io::Error::other(self.message.clone())) }
+            }
+            Box::new(FailedWriter { _inner: retained, message: format!("cannot start pane writer: {}", error) })
+        }
+    }
+}
+
+/// Surface permanent asynchronous input failures even when no further key is
+/// sent. All live pane writers are queues whose flush only inspects status.
+/// Retain at most one previous message per current pane, so this poll neither
+/// grows an event queue nor repeatedly overwrites the status bar for one error.
+pub fn take_input_failures(app: &mut AppState) -> Vec<(usize, String)> {
+    use std::collections::{HashMap, HashSet};
+    static REPORTED: std::sync::OnceLock<Mutex<HashMap<usize, String>>> = std::sync::OnceLock::new();
+    let mut observed = Vec::new();
+    fn inspect(pane: &mut Pane, observed: &mut Vec<(usize, Option<String>)>) {
+        observed.push((pane.id, pane.writer.flush().err().map(|error| error.to_string())));
+    }
+    fn walk(node: &mut Node, observed: &mut Vec<(usize, Option<String>)>) {
+        match node {
+            Node::Leaf(pane) => inspect(pane, observed),
+            Node::Split { children, .. } => for child in children { walk(child, observed); },
+        }
+    }
+    for window in &mut app.windows {
+        walk(&mut window.root, &mut observed);
+        for floating in &mut window.floating { inspect(&mut floating.pane, &mut observed); }
+    }
+    if let Some(warm) = &mut app.warm_pane {
+        observed.push((warm.pane_id, warm.writer.flush().err().map(|error| error.to_string())));
+    }
+    if let crate::types::Mode::PopupMode { popup_pane: Some(pane), .. } = &mut app.mode {
+        inspect(pane, &mut observed);
+    }
+    let mut reported = REPORTED.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock().unwrap_or_else(|e| e.into_inner());
+    let mut failures = Vec::new();
+    let mut seen = HashSet::new();
+    for (id, error) in observed {
+        seen.insert(id);
+        if let Some(message) = error {
+            if reported.get(&id) != Some(&message) {
+                reported.insert(id, message.clone());
+                failures.push((id, message));
+            }
+        } else { reported.remove(&id); }
+    }
+    reported.retain(|id, _| seen.contains(id));
+    failures
 }
 
 /// Cached resolved shell path to avoid repeated `which::which()` PATH scans.
@@ -697,32 +711,39 @@ pub fn spawn_warm_pane(pty_system: &dyn portable_pty::PtySystem, app: &mut AppSt
     if !app.warm_enabled {
         return Err(io::Error::new(io::ErrorKind::Other, "warm panes disabled"));
     }
-    let area = app.client_area;
-    let rows = if area.height > 1 { area.height } else { 30 }.max(MIN_PANE_DIM);
-    let cols = if area.width > 1 { area.width } else { 120 }.max(MIN_PANE_DIM);
+    let config = warm::WarmPaneConfig::capture(app);
+    let pane_id = app.next_pane_id;
+    app.next_pane_id = app.next_pane_id.checked_add(1)
+        .ok_or_else(|| io::Error::other("pane ID space exhausted"))?;
+    spawn_warm_pane_config(pty_system, config, pane_id)
+}
+
+fn spawn_warm_pane_config(
+    pty_system: &dyn portable_pty::PtySystem,
+    config: warm::WarmPaneConfig,
+    pane_id: usize,
+) -> io::Result<crate::types::WarmPane> {
+    let rows = config.rows;
+    let cols = config.cols;
     let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
     let pair = pty_system
         .openpty(size)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
     // Expand format variables like #{pane_current_path} at spawn time (#111).
-    let expanded_shell = crate::format::expand_format(&app.default_shell, app);
-    let mut shell_cmd = if !expanded_shell.is_empty() {
-        build_default_shell(&expanded_shell, app.env_shim, app.allow_predictions)
+    let mut shell_cmd = if !config.shell.is_empty() {
+        build_default_shell(&config.shell, config.env_shim, config.allow_predictions)
     } else {
-        build_command(None, app.env_shim, app.allow_predictions)
+        build_command(None, config.env_shim, config.allow_predictions)
     };
-    let pane_id = app.next_pane_id;
-    app.next_pane_id += 1;
-    set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
-    set_host_colors_env(&mut shell_cmd, app.host_colors.as_ref());
-    apply_user_environment(&mut shell_cmd, &app.environment);
+    set_tmux_env(&mut shell_cmd, pane_id, config.control_port, config.socket_name.as_deref(), &config.session_name, config.fix_tty, config.force_interactive);
+    set_host_colors_env(&mut shell_cmd, config.host_colors.as_ref());
+    apply_user_environment(&mut shell_cmd, &config.environment);
     let child = pair.slave
         .spawn_command(shell_cmd)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
     drop(pair.slave);
-    let scrollback = app.history_limit as u32;
-    let mut parser = vt100::Parser::new(rows, cols, scrollback as usize);
-    parser.screen_mut().set_allow_alternate_screen(app.allow_alternate_screen);
+    let mut parser = vt100::Parser::new(rows, cols, config.history_limit);
+    parser.screen_mut().set_allow_alternate_screen(config.allow_alternate_screen);
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(parser));
     let term_reader = term.clone();
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2515,15 +2536,14 @@ pub fn spawn_reader_thread(
     // client as the visible "sparse cells" / "remnant characters" artifact.
     //
     // Fix:
-    //   • Reader thread: tight loop, ONLY does reader.read() and pushes raw
-    //     bytes into a staging buffer. Never touches the parser mutex, so
-    //     reads cannot be starved by snapshot work.
+    //   • Reader thread: reads into a bounded staging buffer. A slow parser
+    //     applies lossless backpressure to this thread and then to the PTY,
+    //     without making a server request wait for queue capacity.
     //   • Parser thread: waits for staged bytes, then ADAPTIVELY coalesces:
     //     sleeps 1ms; if more bytes arrived, sleeps again; hard cap 8ms total.
-    //     Then locks the parser ONCE and processes the entire batch
-    //     atomically. Multi-chunk frames that arrive within the coalescing
-    //     window land as a single unit — the snapshot can no longer observe
-    //     a partial frame.
+    //     Then locks the parser once for at most 64 KiB. Small multi-chunk
+    //     frames remain atomic; sustained output cannot hold the parser lock
+    //     for an unbounded batch or grow the staging buffer indefinitely.
     //
     // Latency cost: 1ms minimum between byte arrival and render for streaming
     // output, capped at 8ms for sustained streams. Imperceptible to humans
@@ -2531,14 +2551,17 @@ pub fn spawn_reader_thread(
     const COALESCE_TICK_MS: u64 = 1;
     const COALESCE_MAX_MS: u128 = 8;
 
-    let staging: Arc<(Mutex<Vec<u8>>, Condvar)> = Arc::new((Mutex::new(Vec::with_capacity(131072)), Condvar::new()));
-    let reader_done: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let staging = Arc::new(staging::Staging::new(staging::OUTPUT_BYTE_LIMIT));
 
     // ── Reader thread: pure I/O, no parser lock ──
     let staging_r = staging.clone();
-    let reader_done_r = reader_done.clone();
     let output_ring_r = output_ring.clone();
     thread::spawn(move || {
+        struct ReaderDone(Arc<staging::Staging>);
+        impl Drop for ReaderDone {
+            fn drop(&mut self) { self.0.finish_reader(); }
+        }
+        let _done = ReaderDone(staging_r.clone());
         // TEST-ONLY (PSMUX_TEST_READER_DELAY_MS): hold off this reader's first
         // read by a fixed duration. The reader is what drains conhost's startup
         // ESC[6n cursor-position request; with PSEUDOCONSOLE_INHERIT_CURSOR set,
@@ -2567,11 +2590,7 @@ pub fn spawn_reader_thread(
                 Ok(n) if n > 0 => {
                     zero_reads = 0;
                     // Push raw bytes into staging (no parser lock involved).
-                    let (lock, cv) = &*staging_r;
-                    if let Ok(mut buf) = lock.lock() {
-                        buf.extend_from_slice(&local[..n]);
-                        cv.notify_one();
-                    }
+                    if !staging_r.push(&local[..n]) { break; }
                     // Issue #556: answer terminal color queries (OSC 4/10/11,
                     // CSI ?996n, issue #473) HERE, straight off the read,
                     // rather than signaling the server loop.  The old
@@ -2597,39 +2616,20 @@ pub fn spawn_reader_thread(
                     // Append raw output to ring buffer for control mode %output.
                     // This is independent of parser state and must stay live.
                     if let Ok(mut ring) = output_ring_r.lock() {
-                        const MAX_RING: usize = 65536;
+                        const MAX_RING: usize = 1024 * 1024;
                         let space = MAX_RING.saturating_sub(ring.len());
                         if n <= space {
                             ring.extend(&local[..n]);
                         } else {
+                            if crate::types::CONTROL_CLIENTS_ACTIVE.load(Ordering::Acquire) {
+                                crate::types::CONTROL_OUTPUT_LOST.store(true, Ordering::Release);
+                            }
                             let drop_count = (n - space).min(ring.len());
                             ring.drain(..drop_count);
                             ring.extend(&local[..n]);
                         }
                     }
-                    // Issue #440: tee raw pane output to any registered pipe-pane
-                    // writer for this pane. The atomic gate keeps this a single
-                    // relaxed load (no mutex) whenever nothing is being piped,
-                    // which is the common case. When a writer's child has exited
-                    // its pipe write fails; drop that entry and decrement the gate
-                    // so the reader stops trying.
-                    if crate::types::PIPE_PANE_COUNT.load(Ordering::Relaxed) > 0 {
-                        if let Ok(mut writers) = crate::types::PIPE_WRITERS.lock() {
-                            use std::io::Write;
-                            let mut i = 0;
-                            while i < writers.len() {
-                                if writers[i].0 == pane_id {
-                                    let w = &mut writers[i].1;
-                                    if w.write_all(&local[..n]).is_err() || w.flush().is_err() {
-                                        writers.remove(i);
-                                        crate::types::PIPE_PANE_COUNT.fetch_sub(1, Ordering::Relaxed);
-                                        continue;
-                                    }
-                                }
-                                i += 1;
-                            }
-                        }
-                    }
+                    pipe::tee(pane_id, &local[..n]);
                 }
                 Ok(_) => {
                     zero_reads += 1;
@@ -2639,78 +2639,44 @@ pub fn spawn_reader_thread(
                 Err(_) => break,
             }
         }
-        // Issue #440: this pane is gone. Drop any pipe-pane writer still bound
-        // to it so the piped command sees EOF instead of blocking forever on a
-        // stdin that will never fill, and keep the count gate in sync. pane_id
-        // is monotonic and never reused, so this can only match this pane.
-        if crate::types::PIPE_PANE_COUNT.load(Ordering::Relaxed) > 0 {
-            if let Ok(mut writers) = crate::types::PIPE_WRITERS.lock() {
-                let before = writers.len();
-                writers.retain(|(id, _)| *id != pane_id);
-                let removed = before - writers.len();
-                if removed > 0 {
-                    crate::types::PIPE_PANE_COUNT.fetch_sub(removed, Ordering::Relaxed);
-                }
-            }
-        }
+        // Normal EOF drains accepted sink bytes before closing its stdin.
+        pipe::finish_pane(pane_id);
         // Signal end-of-stream and wake parser thread one last time so it
         // can drain remaining bytes and run the alt-screen cleanup.
-        reader_done_r.store(true, Ordering::Release);
-        let (_, cv) = &*staging_r;
-        cv.notify_all();
+        staging_r.finish_reader();
     });
 
     // ── Parser thread: coalesces staged bytes, processes under one lock ──
     thread::spawn(move || {
+        struct ParserDone(Arc<staging::Staging>);
+        impl Drop for ParserDone {
+            fn drop(&mut self) { self.0.finish_parser(); }
+        }
+        let _done = ParserDone(staging.clone());
         let mut cpr_scanner = CprScanner::new();
         loop {
             // Wait for at least one byte (or shutdown).
-            {
-                let (lock, cv) = &*staging;
-                let mut buf = match lock.lock() {
-                    Ok(g) => g,
-                    Err(_) => break,
-                };
-                while buf.is_empty() {
-                    if reader_done.load(Ordering::Acquire) {
-                        // Reader is gone and nothing left to drain — exit
-                        // after running alt-screen cleanup below.
-                        drop(buf);
-                        if let Ok(mut parser) = term_reader.lock() {
-                            if parser.screen().alternate_screen() {
-                                parser.process(b"\x1b[?25h\x1b[?1049l");
-                                cursor_shape.store(0, Ordering::Release);
-                                dv_writer.fetch_add(1, Ordering::Release);
-                                crate::types::PTY_DATA_READY.store(true, Ordering::Release);
-                            }
-                        }
-                        return;
+            if !staging.wait_for_data() {
+                if let Ok(mut parser) = term_reader.lock() {
+                    if parser.screen().alternate_screen() {
+                        parser.process(b"\x1b[?25h\x1b[?1049l");
+                        cursor_shape.store(0, Ordering::Release);
+                        dv_writer.fetch_add(1, Ordering::Release);
+                        crate::types::PTY_DATA_READY.store(true, Ordering::Release);
                     }
-                    let res = cv.wait_timeout(buf, Duration::from_millis(100));
-                    buf = match res {
-                        Ok((g, _)) => g,
-                        Err(_) => return,
-                    };
                 }
-                // First bytes are present — release the lock so the reader can
-                // keep pushing while we run the adaptive coalescing wait.
+                return;
             }
 
             // Adaptive coalescing: keep waiting in 1ms ticks while new bytes
             // are still arriving, hard-capped at 8ms total. This bridges
             // multi-chunk frames into a single atomic parser update.
             let coalesce_start = Instant::now();
-            let mut last_len: usize = {
-                let (lock, _) = &*staging;
-                lock.lock().map(|b| b.len()).unwrap_or(0)
-            };
+            let mut last_len = staging.len();
             loop {
-                if coalesce_start.elapsed().as_millis() >= COALESCE_MAX_MS { break; }
+                if last_len >= staging::PARSE_BATCH_LIMIT || coalesce_start.elapsed().as_millis() >= COALESCE_MAX_MS { break; }
                 thread::sleep(Duration::from_millis(COALESCE_TICK_MS));
-                let cur_len = {
-                    let (lock, _) = &*staging;
-                    lock.lock().map(|b| b.len()).unwrap_or(0)
-                };
+                let cur_len = staging.len();
                 if cur_len == last_len {
                     // No new bytes arrived in the last tick — frame boundary.
                     break;
@@ -2718,14 +2684,8 @@ pub fn spawn_reader_thread(
                 last_len = cur_len;
             }
 
-            // Take the entire staged batch.
-            let bytes = {
-                let (lock, _) = &*staging;
-                match lock.lock() {
-                    Ok(mut buf) => std::mem::take(&mut *buf),
-                    Err(_) => break,
-                }
-            };
+            // A fixed byte budget bounds work while holding the parser lock.
+            let bytes = staging.take(staging::PARSE_BATCH_LIMIT);
             if bytes.is_empty() { continue; }
 
             // Scan for cursor shape and RMCUP on the raw batch BEFORE

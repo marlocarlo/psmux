@@ -1,4 +1,4 @@
-use std::io::{self, Write, BufRead, BufReader};
+use std::io::{self, Write, BufReader};
 use std::time::{Duration, Instant};
 use std::env;
 
@@ -1860,19 +1860,17 @@ fn establish_connection_with_timeout(
     // answers would otherwise block the attach forever with no feedback. The
     // persistent read timeout is (re)set to 2s just below, after auth.
     let _ = reader.get_ref().set_read_timeout(Some(Duration::from_secs(3)));
-    let _ = writer.write_all(format!("AUTH {}\n", key).as_bytes());
-    let _ = writer.flush();
+    let key = crate::session::validate_auth_key(key)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid session key"))?;
+    writer.write_all(format!("AUTH {}\n", key).as_bytes())?;
+    writer.flush()?;
     let mut auth_line = String::new();
-    let read_res = reader.read_line(&mut auth_line);
-    if std::env::var("PSMUX_AUTH_DEBUG").map(|v| v == "1").unwrap_or(false) {
-        eprintln!(
-            "[auth-debug pid={}] establish_connection addr={} key={} read_res={:?} got_line={:?}",
-            std::process::id(), addr, key, read_res.as_ref().map(|n| *n), auth_line
-        );
+    let n = std::io::BufRead::read_line(&mut std::io::Read::take(&mut reader, 4097), &mut auth_line)?;
+    if n == 0 || !auth_line.ends_with('\n') {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete authentication acknowledgement"));
     }
-    read_res?;
-    if !auth_line.trim().starts_with("OK") {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "auth failed"));
+    if auth_line != "OK\n" && auth_line != "OK\r\n" {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "authentication rejected"));
     }
 
     let _ = writer.write_all(b"PERSISTENT\n");
@@ -1901,15 +1899,19 @@ fn establish_connection_with_timeout(
 
     // 2-second read timeout keeps the thread from blocking forever on process exit.
     let _ = reader.get_ref().set_read_timeout(Some(Duration::from_secs(2)));
-    let (frame_tx, frame_rx) = std::sync::mpsc::channel::<String>();
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<String>(4);
     std::thread::spawn(move || {
         let mut reader = reader;
         let mut buf = String::with_capacity(64 * 1024);
         loop {
             buf.clear();
             loop {
-                match reader.read_line(&mut buf) {
+                const MAX_CLIENT_FRAME_BYTES: usize = 16 * 1024 * 1024;
+                if buf.len() > MAX_CLIENT_FRAME_BYTES { return; }
+                let remaining = (MAX_CLIENT_FRAME_BYTES - buf.len() + 1) as u64;
+                match std::io::BufRead::read_line(&mut std::io::Read::take(&mut reader, remaining), &mut buf) {
                     Ok(0) => return,
+                    Ok(_) if buf.len() > MAX_CLIENT_FRAME_BYTES || !buf.ends_with('\n') => return,
                     Ok(_) => break,
                     Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut
                         || e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1966,27 +1968,21 @@ pub(crate) fn no_such_session(name: &str) -> io::Error {
 
 pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input: &crate::ssh_input::InputSource) -> io::Result<()> {
     let name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
-    let path = crate::paths::port_file(&name);
-    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok())
-        .ok_or_else(|| no_such_session(&name))?;
-    let addr = format!("127.0.0.1:{}", port);
-    // The .port file can be visible a beat before the .key has readable
-    // content (servers before the issue #496 fix wrote .port first, and a
-    // just-claimed warm server rewrites its files). Never AUTH with an empty
-    // key — that is guaranteed to fail — poll briefly for the credential.
-    let mut session_key = read_session_key(&name).unwrap_or_default();
-    if session_key.is_empty() {
-        for _ in 0..400 {
-            std::thread::sleep(Duration::from_millis(5));
-            session_key = read_session_key(&name).unwrap_or_default();
-            if !session_key.is_empty() { break; }
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let (port, session_key) = loop {
+        match crate::session::read_session_endpoint(&name) {
+            Ok(endpoint) => break endpoint,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(io::Error::new(error.kind(), format!("cannot read session '{}': {}", crate::paths::registry_session_name(&name), error))),
         }
-    }
-    let session_key = session_key;
+    };
+    let addr = format!("127.0.0.1:{}", port);
     if std::env::var("PSMUX_AUTH_DEBUG").map(|v| v == "1").unwrap_or(false) {
         eprintln!(
-            "[auth-debug pid={}] run_remote name={} port={} key={}",
-            std::process::id(), name, port, session_key
+            "[auth-debug pid={}] run_remote name={} port={}",
+            std::process::id(), name, port
         );
     }
     let last_path = crate::paths::psmux_dir_file("last_session");
@@ -2015,14 +2011,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         match establish_connection_with_timeout(&addr, &session_key, ATTACH_CONNECT_TIMEOUT) {
             Ok(conn) => conn,
             Err(e) => {
-                // Nothing answered on the registered port. Reap the entry so
-                // the next `ls`/`attach` is clean, but only once the pid anchor
-                // agrees the process is gone: a live server that was merely too
-                // slow must keep its registration (it rewrites these files on
-                // its own 5s tick anyway).
-                if crate::session::registry_pid_anchor_alive(&name) != Some(true) {
-                    crate::session::remove_session_registry(&name);
-                }
+                // A failed attach is observational: retain the registration.
                 if std::env::var("PSMUX_AUTH_DEBUG").map(|v| v == "1").unwrap_or(false) {
                     eprintln!(
                         "[auth-debug pid={}] attach connect to {} failed: {} (kind {:?})",
@@ -2723,13 +2712,10 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // TCP connection dropped. If the server already removed its port
-                    // file (all clean-shutdown paths do this before calling
-                    // shutdown_persistent_streams), treat the disconnect as intentional
-                    // and quit immediately instead of burning 5 s of reconnect backoff.
-                    if !quit && !std::path::Path::new(&path).exists() {
-                        quit = true;
-                    } else if reconnect_pending.is_none() && !quit {
+                    // A missing registration can be a rename or interrupted
+                    // repair. Only an explicit DETACH ends the client immediately;
+                    // otherwise try the authenticated endpoint we already own.
+                    if reconnect_pending.is_none() && !quit {
                         let addr_c = addr.clone();
                         let key_c = session_key.clone();
                         let (rtx, rrx) = std::sync::mpsc::channel();
@@ -3606,46 +3592,27 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 popup_rect_last = None;
                                 if choose_tree_preview_default { preview_enabled = true; }
                                 // Query ALL sessions (like tmux choose-tree)
-                                let dir = crate::paths::psmux_dir();
                                 // A -L socket is a separate server in tmux; a client never
                                 // sees another socket's sessions. Same rule `ls` applies
                                 // and the same predicate the session picker uses (ed52715).
                                 let tree_ns = crate::session::session_namespace(&current_session);
-                                if let Ok(entries) = std::fs::read_dir(&dir) {
+                                {
                                     let mut sessions: Vec<(String, Vec<(usize, String, bool, Vec<(usize, String)>, usize)>)> = Vec::new();
-                                    for e in entries.flatten() {
-                                        if let Some(fname) = e.file_name().to_str().map(|s| s.to_string()) {
-                                            if let Some((base, ext)) = fname.rsplit_once('.') {
-                                                if ext == "port" {
-                                                    if crate::session::is_warm_session(base) { continue; }
-                                                    if !crate::session::session_visible_from(base, tree_ns) { continue; }
-                                                    if let Ok(port_str) = std::fs::read_to_string(e.path()) {
-                                                        if let Ok(p) = port_str.trim().parse::<u16>() {
-                                                            let sess_addr = format!("127.0.0.1:{}", p);
-                                                            let sess_key = read_session_key(base).unwrap_or_default();
-                                                            // Centralized AUTH+command helper handles the OK ack race
-                                                            // (issue #250) and bounds the response size.
-                                                            if let Some(tree_line) = crate::session::fetch_authed_response_multi(
-                                                                &sess_addr,
-                                                                &sess_key,
-                                                                b"list-tree\n",
-                                                                Duration::from_millis(50),
-                                                                Duration::from_millis(100),
-                                                            ) {
-                                                                if let Ok(wins) = serde_json::from_str::<Vec<WinTree>>(tree_line.trim()) {
-                                                                    let mut win_data = Vec::new();
-                                                                    for w in &wins {
-                                                                        let panes: Vec<(usize, String)> = w.panes.iter().map(|p| (p.id, p.title.clone())).collect();
-                                                                        win_data.push((w.id, w.name.clone(), w.active, panes, w.idx));
-                                                                    }
-                                                                    sessions.push((base.to_string(), win_data));
-                                                                }
-                                                            }
-                                                        }
+                                    for base in crate::session::list_session_names_ns(tree_ns.as_deref()) {
+                                        let mut win_data = Vec::new();
+                                        if let Ok((port, key)) = crate::session::read_session_endpoint(&base) {
+                                            if let Some(tree_line) = crate::session::fetch_authed_response_multi(
+                                                &format!("127.0.0.1:{}", port), &key, b"list-tree\n",
+                                                Duration::from_millis(100), Duration::from_millis(500)) {
+                                                if let Ok(wins) = serde_json::from_str::<Vec<WinTree>>(tree_line.trim()) {
+                                                    for w in &wins {
+                                                        let panes = w.panes.iter().map(|p| (p.id, p.title.clone())).collect();
+                                                        win_data.push((w.id, w.name.clone(), w.active, panes, w.idx));
                                                     }
                                                 }
                                             }
                                         }
+                                        sessions.push((base, win_data));
                                     }
                                     sessions.sort_by(|a, b| {
                                         if a.0 == current_session { std::cmp::Ordering::Less }
@@ -3726,34 +3693,16 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                 popup_dragging = false;
                                 popup_rect_last = None;
                                 if choose_tree_preview_default { preview_enabled = true; }
-                                let dir = crate::paths::psmux_dir();
-                                // Collect (label, addr, key) for every port file, then run ONE
-                                // bounded liveness probe per session in parallel. This both lists
-                                // and prunes: total wall time is ~one probe window regardless of
-                                // how many sessions exist, so the picker stays responsive (no
-                                // sequential O(N * timeout) cleanup pass).
-                                let mut targets: Vec<(String, String, String)> = Vec::new();
-                                // A -L socket is a separate server in tmux; a client never
-                                // sees another socket's sessions. Same rule `ls` applies.
+                                // Keep every registered session visible, including
+                                // malformed or temporarily unresponsive endpoints.
                                 let picker_ns = crate::session::session_namespace(&current_session);
-                                if let Ok(entries) = std::fs::read_dir(&dir) {
-                                    for e in entries.flatten() {
-                                        if let Some(fname) = e.file_name().to_str() {
-                                            if let Some((base, ext)) = fname.rsplit_once('.') {
-                                                if ext == "port" {
-                                                    if crate::session::is_warm_session(base) { continue; }
-                                                    if !crate::session::session_visible_from(base, picker_ns) { continue; }
-                                                    if let Ok(port_str) = std::fs::read_to_string(e.path()) {
-                                                        if let Ok(p) = port_str.trim().parse::<u16>() {
-                                                            let sess_addr = format!("127.0.0.1:{}", p);
-                                                            let sess_key = read_session_key(base).unwrap_or_default();
-                                                            targets.push((base.to_string(), sess_addr, sess_key));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                                let mut targets = Vec::new();
+                                for base in crate::session::list_session_names_ns(picker_ns.as_deref()) {
+                                    let (addr, key) = match crate::session::read_session_endpoint(&base) {
+                                        Ok((port, key)) => (format!("127.0.0.1:{}", port), key),
+                                        Err(_) => (String::new(), String::new()),
+                                    };
+                                    targets.push((base, addr, key));
                                 }
                                 // Issue #259 (batch D): sort by label so the picker's order is
                                 // deterministic, matching the tree_chooser's established
@@ -3772,21 +3721,9 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                                         crate::session::SessionLiveness::Alive(info) => {
                                             session_entries.push((label, info));
                                         }
-                                        crate::session::SessionLiveness::Dead => {
-                                            // Server gone (crashed, killed by a reboot, or its
-                                            // port reused by another server). Reap it so it never
-                                            // shows as a "(not responding)" zombie. A live-but-slow
-                                            // server self-heals on its next 5s registry tick.
-                                            if crate::debug_log::session_log_enabled() {
-                                                crate::debug_log::session_log("picker",
-                                                    &format!("reaping dead session '{}' from chooser", label));
-                                            }
-                                            crate::session::remove_session_registry(&label);
-                                        }
+                                        crate::session::SessionLiveness::Dead => {},
+                                        crate::session::SessionLiveness::Unresponsive |
                                         crate::session::SessionLiveness::Unreachable => {
-                                            // Could not connect (transient, non-refused). Keep it
-                                            // and show the honest "(not responding)" rather than
-                                            // deleting on an ambiguous failure.
                                             session_entries.push((label.clone(), format!("{}: (not responding)", label)));
                                         }
                                     }

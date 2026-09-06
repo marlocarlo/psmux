@@ -165,7 +165,8 @@ pub fn format_error(timestamp: i64, cmd_number: u64) -> String {
 }
 
 /// Emit a control notification to all connected control mode clients.
-/// Non-blocking: if a client's channel is full, the notification is dropped for that client.
+/// Non-blocking: disconnect a stalled consumer instead of silently losing an
+/// ordered state update or output bytes while presenting a healthy session.
 pub fn emit_notification(app: &AppState, notif: ControlNotification) {
     for client in app.control_clients.values() {
         if let ControlNotification::Output { pane_id, .. } = &notif {
@@ -173,14 +174,22 @@ pub fn emit_notification(app: &AppState, notif: ControlNotification) {
                 continue;
             }
         }
-        let _ = client.notification_tx.try_send(notif.clone());
+        if client.notification_tx.try_send(notif.clone()).is_err() {
+            crate::types::shutdown_client_stream(client.client_id);
+        }
     }
+}
+
+pub fn send_notification_checked(client_id: u64, tx: &std::sync::mpsc::SyncSender<ControlNotification>, notif: ControlNotification) {
+    if tx.try_send(notif).is_err() { crate::types::shutdown_client_stream(client_id); }
 }
 
 /// Send a notification to a single control client by id (no-op if unknown).
 pub fn emit_to_client(app: &AppState, client_id: u64, notif: ControlNotification) {
     if let Some(client) = app.control_clients.get(&client_id) {
-        let _ = client.notification_tx.try_send(notif);
+        if client.notification_tx.try_send(notif).is_err() {
+            crate::types::shutdown_client_stream(client_id);
+        }
     }
 }
 

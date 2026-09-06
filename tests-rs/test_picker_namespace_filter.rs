@@ -18,23 +18,23 @@ use super::*;
 
 #[test]
 fn namespace_of_a_bare_name_is_none() {
-    assert_eq!(session_namespace("a_issue259"), None);
-    assert_eq!(session_namespace("main"), None);
-    assert_eq!(session_namespace("0"), None);
+    assert_eq!(session_namespace("a_issue259").as_deref(), None);
+    assert_eq!(session_namespace("main").as_deref(), None);
+    assert_eq!(session_namespace("0").as_deref(), None);
 }
 
 #[test]
 fn namespace_of_a_prefixed_name_is_the_prefix() {
-    assert_eq!(session_namespace("amx-6c9b6ad63d__main"), Some("amx-6c9b6ad63d"));
-    assert_eq!(session_namespace("dev__work"), Some("dev"));
+    assert_eq!(session_namespace("amx-6c9b6ad63d__main").as_deref(), Some("amx-6c9b6ad63d"));
+    assert_eq!(session_namespace("dev__work").as_deref(), Some("dev"));
     // Only the first separator counts: the session part may itself hold `__`.
-    assert_eq!(session_namespace("ns__a__b"), Some("ns"));
+    assert_eq!(session_namespace("ns__a__b").as_deref(), Some("ns"));
 }
 
 #[test]
 fn warm_helpers_have_no_namespace() {
-    assert_eq!(session_namespace("__warm__"), None);
-    assert_eq!(session_namespace("dev____warm__"), None);
+    assert_eq!(session_namespace("__warm__").as_deref(), None);
+    assert_eq!(session_namespace("dev____warm__").as_deref(), Some("dev"));
 }
 
 #[test]

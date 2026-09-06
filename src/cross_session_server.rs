@@ -128,11 +128,7 @@ pub fn handle_pane_forward_extract(
             let _ = stream.set_nodelay(true);
             match stream.try_clone() {
                 Ok(tcp_writer) => {
-                    if let Ok(mut writers) = crate::types::PIPE_WRITERS.lock() {
-                        writers.push((pane_local_id, Box::new(tcp_writer)));
-                        crate::types::PIPE_PANE_COUNT
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    if crate::pane::pipe::register_tunnel(pane_local_id, Box::new(tcp_writer)).is_err() { return; }
                 }
                 Err(_) => return,
             }

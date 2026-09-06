@@ -1839,7 +1839,10 @@ pub fn handle_pane_scroll(app: &mut AppState, pane_id: usize, up: bool, at: Opti
         mouse_log("  -> legacy pager (more.com), sending Enter x3");
         if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
             for _ in 0..3 {
-                crate::input::write_key_seq(pane, b"\r");
+                if let Err(error) = crate::input::write_key_seq(pane, b"\r") {
+                    app.status_message = Some((format!("pane input: {}", error), std::time::Instant::now(), None));
+                    return;
+                }
             }
             let _ = pane.writer.flush();
         }
@@ -2625,28 +2628,61 @@ pub fn break_pane_to_window(app: &mut AppState) {
     }
 }
 
+pub fn respawn_window(app: &mut AppState, pty_system: &dyn portable_pty::PtySystem, workdir: Option<&str>, kill: bool, command: Option<&str>) -> io::Result<()> {
+    let window = app.windows.get_mut(app.active_idx).ok_or_else(|| io::Error::other("window not found"))?;
+    let mut any_alive = window.floating.iter().any(|fp| !fp.pane.dead);
+    crate::tree::for_each_pane(&window.root, &mut |pane| any_alive |= !pane.dead);
+    if any_alive && !kill { return Err(io::Error::other("window still active")); }
+    let old_path = window.active_path.clone();
+    window.active_path = crate::tree::first_leaf_path(&window.root);
+    if let Err(error) = respawn_active_pane(app, Some(pty_system), workdir, kill, command, false) {
+        app.windows[app.active_idx].active_path = old_path;
+        return Err(error);
+    }
+    let window = &mut app.windows[app.active_idx];
+    let keep_id = crate::tree::get_active_pane_id(&window.root, &window.active_path)
+        .expect("successful respawn retained the first pane");
+    fn retain_respawned(node: Node, keep_id: usize) -> Option<Node> {
+        match node {
+            Node::Leaf(mut pane) => {
+                if pane.id == keep_id { return Some(Node::Leaf(pane)); }
+                crate::platform::process_kill::kill_process_tree(&mut pane.child);
+                None
+            }
+            Node::Split { children, .. } => {
+                let mut keep = None;
+                for child in children {
+                    if let Some(pane) = retain_respawned(child, keep_id) { keep = Some(pane); }
+                }
+                keep
+            }
+        }
+    }
+    let root = std::mem::replace(&mut window.root, Node::Split {
+        kind: LayoutKind::Horizontal, sizes: Vec::new(), children: Vec::new(),
+    });
+    window.root = retain_respawned(root, keep_id).expect("respawned pane belongs to its window");
+    for floating in &mut window.floating { crate::platform::process_kill::kill_process_tree(&mut floating.pane.child); }
+    window.floating.clear();
+    window.floating_focus = None;
+    window.active_path.clear();
+    window.pane_mru = vec![keep_id];
+    window.zoom_saved = None;
+    resize_all_panes(app);
+    Ok(())
+}
+
 pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn portable_pty::PtySystem>, workdir: Option<&str>, kill: bool, command: Option<&str>, empty: bool) -> io::Result<()> {
     // tmux semantics: without -k, respawn only works on dead panes.
     // With -k, kill the running process first and respawn.
     {
-        let win = &app.windows[app.active_idx];
+        let win = app.windows.get(app.active_idx).ok_or_else(|| io::Error::other("window not found"))?;
         if let Some(pane) = crate::tree::active_pane(&win.root, &win.active_path) {
             if !pane.dead && !kill {
                 return Err(io::Error::new(io::ErrorKind::Other, "pane still active"));
             }
         }
     }
-    // If -k and pane is alive, kill the child process first
-    if kill {
-        let win = &mut app.windows[app.active_idx];
-        if let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) {
-            if !pane.dead {
-                crate::platform::process_kill::kill_process_tree(&mut pane.child);
-                pane.dead = true;
-            }
-        }
-    }
-
     // -E: respawn as an EMPTY pane (no command). Replace the pane in place with
     // a childless empty pane, keeping its id/title/size, and return.
     if empty {
@@ -2655,9 +2691,12 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
             let (r, c, id, title) = (pane.last_rows, pane.last_cols, pane.id, pane.title.clone());
             if let Some(mut ep) = crate::popup::create_empty_pane(r.max(1), c.max(1), id) {
                 ep.title = title;
+                if !pane.dead { crate::platform::process_kill::kill_process_tree(&mut pane.child); }
                 *pane = ep;
+            } else {
+                return Err(io::Error::other("could not create empty pane"));
             }
-        }
+        } else { return Err(io::Error::other("pane not found")); }
         return Ok(());
     }
 
@@ -2674,7 +2713,7 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     let expanded_shell = crate::format::expand_format(&app.default_shell, &app);
 
     let win = &mut app.windows[app.active_idx];
-    let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) else { return Ok(()); };
+    let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) else { return Err(io::Error::other("pane not found")); };
     let pane_id = pane.id;
     // tmux spawn.c: a respawn with no command of its own reuses the arguments
     // already stored on the pane ("Replace the stored arguments if there are
@@ -2712,14 +2751,18 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
             .unwrap_or_default();
         let expanded = dir.replace("~/", &format!("{}/", home))
             .replace("~\\", &format!("{}\\", home));
+        if !std::fs::metadata(&expanded)?.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "respawn working directory is not a directory"));
+        }
         shell_cmd.cwd(std::path::Path::new(&expanded));
     }
+    let reader = pair.master.try_clone_reader().map_err(|e| io::Error::other(format!("clone reader error: {e}")))?;
+    let raw_writer = pair.master.take_writer().map_err(|e| io::Error::other(format!("take writer error: {e}")))?;
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
     // Close the slave handle immediately – required for ConPTY.
     drop(pair.slave);
     let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, app.history_limit)));
     let term_reader = term.clone();
-    let reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
     
     let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dv_writer = data_version.clone();
@@ -2738,9 +2781,12 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     crate::pane::spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, cq_writer, output_ring.clone(), pane_id, child_pid);
     pane.output_ring = output_ring;
 
-    let mut pty_writer = crate::pane::spawn_pane_write_queue(pair.master.take_writer().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?);
+    let mut pty_writer = crate::pane::spawn_pane_write_queue(raw_writer);
     crate::pane::conpty_preemptive_dsr_response(&mut *pty_writer);
 
+    // The replacement is now fully prepared. Until this point every failure
+    // leaves the original process, terminal and registration untouched.
+    if !pane.dead { crate::platform::process_kill::kill_process_tree(&mut pane.child); }
     pane.master = pair.master;
     pane.writer = pty_writer;
     pane.child = child;

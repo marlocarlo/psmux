@@ -6,6 +6,7 @@ mod types;
 mod platform;
 mod cli;
 mod session;
+mod registry;
 mod tree;
 mod choose_tree;
 mod style;
@@ -55,9 +56,7 @@ use crossterm::event::{EnableMouseCapture, DisableMouseCapture, EnableBracketedP
 
 use crate::platform::enable_virtual_terminal_processing;
 use crate::cli::{print_help, print_version, print_commands};
-use crate::session::{cleanup_stale_port_files, reap_orphaned_servers, read_session_key, send_control,
-    send_control_with_response, resolve_default_session_name,
-    force_kill_targets, confirms_identity};
+use crate::session::{send_control, send_control_with_response, resolve_default_session_name};
 use crate::rendering::apply_cursor_style;
 use crate::server::run_server;
 use crate::client::run_remote;
@@ -283,11 +282,8 @@ fn cli_sessions_owning_id(ns: Option<&str>, probe: &[u8], id: &str) -> Vec<Strin
 /// Strip the `-L` namespace prefix off a registry base name so the message
 /// names the session the caller can actually type: inside a `-L` namespace the
 /// registry base is `<ns>__<session>` but the user addresses the short name.
-fn cli_display_session_name(ns: Option<&str>, base: &str) -> String {
-    match ns {
-        Some(p) => base.strip_prefix(&format!("{}__", p)).unwrap_or(base).to_string(),
-        None => base.to_string(),
-    }
+fn cli_display_session_name(_ns: Option<&str>, base: &str) -> String {
+    crate::paths::registry_session_name(base)
 }
 
 /// What an unqualified `%N`/`@N` target resolved to across the namespace.
@@ -551,33 +547,12 @@ fn probe_session_alive_strict(session_name: &str) -> bool {
 }
 
 fn probe_session_alive_inner(session_name: &str, connect_failure_means_alive: bool) -> bool {
-    let path = crate::paths::port_file(session_name);
-    let port = match std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()) {
-        Some(p) => p,
-        None => return false, // no port file → gone
-    };
-    let addr: std::net::SocketAddr = match format!("127.0.0.1:{}", port).parse() {
-        Ok(a) => a,
-        Err(_) => return false,
-    };
-    let key = read_session_key(session_name).unwrap_or_default();
-    match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
-        Ok(mut s) => {
-            let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
-            let _ = write!(s, "AUTH {}\n", key);
-            let _ = write!(s, "session-info\n");
-            let _ = s.flush();
-            let mut buf = [0u8; 256];
-            match std::io::Read::read(&mut s, &mut buf) {
-                Ok(n) if n > 0 => String::from_utf8_lossy(&buf[..n]).contains("OK"),
-                // Connected but silent. Something IS listening, so the attach
-                // will at worst report an auth/read failure rather than a
-                // connect error; treat it as alive in both modes.
-                _ => true,
-            }
-        }
-        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => false, // gone
-        Err(_) => connect_failure_means_alive,
+    if !std::path::Path::new(&crate::paths::port_file(session_name)).exists()
+        && !crate::registry::manifest_path(session_name).exists() { return false; }
+    match crate::session::existing_session_state(session_name) {
+        crate::session::SessionLiveness::Alive(_) => true,
+        crate::session::SessionLiveness::Dead => false,
+        _ => connect_failure_means_alive,
     }
 }
 
@@ -740,6 +715,53 @@ mod process_command_arg_tests {
     }
 }
 
+/// The server owns the claim transaction and serializes competing clients.
+/// Never hide a live warm registration by renaming its port file client-side.
+fn try_claim_warm_session(namespace: Option<&str>, name: &str) -> io::Result<bool> {
+    let warm = crate::paths::storage_base(namespace, "__warm__");
+    let endpoint = match crate::session::read_session_endpoint(&warm) {
+        Ok(endpoint) => endpoint,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if crate::session::registry_pid_anchor_alive(&warm) == Some(false) { return Ok(false); }
+    let cwd = std::env::current_dir().ok().and_then(|p| p.to_str().map(str::to_string));
+    let priority = crate::platform::claim_priority_arg();
+    let mut cmd = format!("claim-session {}", crate::util::quote_arg(name));
+    if let Some(cwd) = cwd { cmd.push_str(&format!(" {}", crate::util::quote_arg(&cwd))); }
+    cmd.push_str(&format!(" -p {}\n", crate::util::quote_arg(&priority)));
+    let result = crate::session::query_authed_line(&format!("127.0.0.1:{}", endpoint.0), &endpoint.1,
+        cmd.as_bytes(), Duration::from_millis(500), Duration::from_millis(3000));
+    match result {
+        Ok(reply) if reply == "OK" => Ok(true),
+        // Another client won the warm source. No claim occurred on our behalf.
+        Err(e) if e.to_string().contains("not a warm") => Ok(false),
+        Ok(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "invalid warm claim acknowledgement")),
+        Err(e) => Err(io::Error::new(e.kind(), format!("warm claim was not confirmed; no replacement started: {}", e))),
+    }
+}
+
+fn query_namespace(namespace: Option<&str>, query: &[u8]) -> io::Result<()> {
+    let bases = crate::session::list_session_names_ns(namespace);
+    if bases.is_empty() { return Err(io::Error::new(io::ErrorKind::NotFound, "no server running")); }
+    let mut failures = 0usize;
+    for base in bases {
+        let result = crate::session::read_session_endpoint(&base).and_then(|(port, key)| {
+            crate::session::query_authed_all(&format!("127.0.0.1:{}", port), &key, query,
+                Duration::from_millis(500), Duration::from_millis(2000))
+        });
+        match result {
+            Ok(output) => print!("{}", output),
+            Err(error) => {
+                failures += 1;
+                eprintln!("psmux: {}: {}", crate::paths::registry_session_name(&base), error);
+            }
+        }
+    }
+    if failures == 0 { Ok(()) }
+    else { Err(io::Error::other(format!("incomplete listing: {} session(s) could not be queried", failures))) }
+}
+
 fn run_main() -> io::Result<()> {
     // `-L=foo` first (flag_equals), then `-Lfoo` (attached globals), then
     // command-level `-tname` (attached target): running attached passes
@@ -755,18 +777,8 @@ fn run_main() -> io::Result<()> {
     // render multi-byte Unicode characters instead of mojibake.
     enable_virtual_terminal_processing();
 
-    // Clean up any stale port files at startup
-    cleanup_stale_port_files();
-    // Then drop registry files whose `.port` entry is already gone (issue
-    // #530). The sweep above is the only thing that can reach them, and it
-    // finds entries BY their `.port` file — so a satellite that outlives its
-    // port is invisible to it and accumulates forever.
-    crate::session::prune_orphaned_registry_files();
-    // Then reap any LIVE but orphaned server processes (issue #448): duplicates
-    // or crashed-client headless servers that cleanup_stale_port_files cannot
-    // see because they have no registry file. Bounds the process count so
-    // orphans can't accumulate to the point of exhausting Windows desktop-heap.
-    reap_orphaned_servers();
+    // Startup and observational commands never reclaim registry or processes.
+    // Missing metadata and failed probes are not lifecycle evidence.
 
     // Parse -L flag early (tmux-compatible: names the server socket for namespace isolation)
     // In psmux, -L <name> creates a namespace prefix for session port/key files.
@@ -804,6 +816,15 @@ fn run_main() -> io::Result<()> {
                 break; // hit the subcommand name — stop scanning for global flags
             }
         }
+    }
+
+    l_socket_name = crate::session::effective_namespace(
+        l_socket_name.as_deref(), env::var("PSMUX_SOCKET_NAME").ok().as_deref(),
+        env::var("TMUX").ok().as_deref(), std::path::Path::new(&crate::paths::psmux_dir()),
+    );
+    if let Some(ref namespace) = l_socket_name {
+        crate::paths::validate_namespace(namespace)?;
+        env::set_var("PSMUX_SOCKET_NAME", namespace);
     }
 
     // Set PSMUX_CONFIG_FILE if -f was provided, so load_config() picks it up.
@@ -900,12 +921,12 @@ fn run_main() -> io::Result<()> {
             // already been resolved to the on disk name, which carries the
             // prefix, so do not add it a second time: `-L ns cmd -t $N` used
             // to route to `ns__ns__name`, a server that does not exist.
-            let port_file_base = match l_socket_name {
-                Some(ref l) if !session.starts_with(&format!("{}__", l)) => {
-                    format!("{}__{}", l, session)
+            let port_file_base = if target.trim_start_matches('=').starts_with('$') {
+                if !crate::paths::registry_visible_from(&session, l_socket_name.as_deref()) {
+                    return Err(io::Error::new(io::ErrorKind::NotFound, "session id is outside the selected namespace"));
                 }
-                _ => session.clone(),
-            };
+                session.clone()
+            } else { crate::paths::storage_base(l_socket_name.as_deref(), &session) };
             // If the -t target includes an explicit session name, use it
             // directly. Otherwise (e.g. -t %2, -t :1.0) fall through to
             // the TMUX env var resolution below so we connect to the right
@@ -1085,88 +1106,7 @@ fn run_main() -> io::Result<()> {
     match cmd {
         // kill-server MUST be handled early before any potential fall-through
         "kill-server" => {
-            let psmux_dir = crate::paths::psmux_dir();
-            // Compute namespace prefix for -L filtering (matches list-sessions behavior)
-            let ns_prefix = l_socket_name.as_ref().map(|l| format!("{l}__"));
-            // Snapshot the force-kill candidates from this data dir's .pid files
-            // BEFORE the graceful pass removes them. Scoped to this dir and (with
-            // -L) this namespace, so the fallback can never reach another instance.
-            let fk_targets =
-                force_kill_targets(std::path::Path::new(&psmux_dir), ns_prefix.as_deref());
-            let mut targets: Vec<(std::path::PathBuf, u16, String)> = Vec::new();
-            let mut stale_ports: Vec<std::path::PathBuf> = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(&psmux_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().map(|e| e == "port").unwrap_or(false) {
-                        if let Some(session_name) = path.file_stem().and_then(|s| s.to_str()) {
-                            // Apply -L namespace filtering:
-                            // With -L: only kill sessions under that namespace
-                            // Without -L: kill ALL sessions (tmux behavior)
-                            if let Some(ref pfx) = ns_prefix {
-                                if !session_name.starts_with(pfx.as_str()) { continue; }
-                            }
-                            if let Ok(port_str) = std::fs::read_to_string(&path) {
-                                if let Ok(port) = port_str.trim().parse::<u16>() {
-                                    let sess_key = read_session_key(session_name).unwrap_or_default();
-                                    targets.push((path.clone(), port, sess_key));
-                                }
-                            } else {
-                                stale_ports.push(path.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            // Send kill-server to all sessions in parallel via threads
-            let handles: Vec<std::thread::JoinHandle<()>> = targets.into_iter().map(|(path, port, sess_key)| {
-                std::thread::spawn(move || {
-                    let addr = format!("127.0.0.1:{}", port);
-                    if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
-                        &addr.parse().unwrap(),
-                        Duration::from_millis(500),
-                    ) {
-                        let _ = stream.set_nodelay(true);
-                        let _ = write!(stream, "AUTH {}\n", sess_key);
-                        let _ = stream.flush();
-                        let _ = std::io::Write::write_all(&mut stream, b"kill-server\n");
-                        let _ = stream.flush();
-                        let _ = stream.shutdown(std::net::Shutdown::Write);
-                        // Wait for server to exit (EOF = done)
-                        let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
-                        let mut buf = [0u8; 64];
-                        loop {
-                            match std::io::Read::read(&mut stream, &mut buf) {
-                                Ok(0) => break,
-                                Err(_) => break,
-                                Ok(_) => continue,
-                            }
-                        }
-                    }
-                    // Remove the whole registry set regardless. Deleting only
-                    // port/key/pid used to strand the `.sid`, which no sweep can
-                    // reach once its `.port` is gone (#530).
-                    crate::session::remove_session_registry_files(&path);
-                })
-            }).collect();
-            // Wait for all threads to complete
-            for h in handles { let _ = h.join(); }
-            // Clean up stale registry sets (whole set, including `.sid` — #530)
-            for path in &stale_ports {
-                crate::session::remove_session_registry_files(path);
-            }
-            // Force-kill any wedged server that ignored the graceful kill. The
-            // candidates were read from this data dir's (and, with -L, this
-            // namespace's) own .pid files before the graceful pass removed them,
-            // so nothing outside this instance is ever reached. The identity gate
-            // (exact process-creation-time match) skips any pid that has already
-            // exited or been recycled — no machine-wide, name-based scan.
-            std::thread::sleep(Duration::from_millis(50));
-            for t in fk_targets {
-                if confirms_identity(crate::platform::process_kill::process_creation_time(t.pid), t.creation_time) {
-                    crate::platform::process_kill::terminate_server_pid(t.pid, None);
-                }
-            }
+            crate::session::kill_registered_servers(l_socket_name.as_deref())?;
             return Ok(());
         }
         "ls" | "list-sessions" => {
@@ -1204,150 +1144,49 @@ fn run_main() -> io::Result<()> {
                     }
                 }
                 let dir = crate::paths::psmux_dir();
-                // Compute namespace prefix for -L filtering
-                let ns_prefix = l_socket_name.as_ref().map(|l| format!("{l}__"));
-                // Servers that answered in this namespace, counted BEFORE the
-                // -f filter is applied. tmux exits 1 with `no server running`
-                // when there is nothing to list at all, but a filter that
-                // matches nothing on a live server is an empty listing at
-                // exit 0, and the two must stay distinguishable to scripts.
-                let mut live_servers: usize = 0;
-                if let Ok(entries) = std::fs::read_dir(&dir) {
-                    for e in entries.flatten() {
-                        if let Some(name) = e.file_name().to_str() {
-                            if let Some((base, ext)) = name.rsplit_once('.') {
-                                if ext == "port" {
-                                    // Skip warm (standby) sessions — internal-only
-                                    if crate::session::is_warm_session(base) { continue; }
-                                    // Filter by -L namespace: when -L is given, only show
-                                    // sessions with that prefix; when no -L, only show
-                                    // sessions without any namespace prefix
-                                    if let Some(ref pfx) = ns_prefix {
-                                        if !base.starts_with(pfx.as_str()) { continue; }
-                                    } else {
-                                        if base.contains("__") { continue; }
-                                    }
-                                    // PID-anchor fast path: a dead entry would
-                                    // otherwise cost a full TCP connect timeout
-                                    // here (dead loopback ports can time out
-                                    // rather than refuse on Windows). Reap it
-                                    // and move on without touching the network.
-                                    if crate::session::registry_pid_anchor_alive(base) == Some(false) {
-                                        crate::session::remove_session_registry(base);
-                                        continue;
-                                    }
-                                    if let Ok(port_str) = std::fs::read_to_string(e.path()) {
-                                        if let Ok(_p) = port_str.trim().parse::<u16>() {
-                                            let addr = format!("127.0.0.1:{}", port_str.trim());
-                                            let conn = std::net::TcpStream::connect_timeout(
-                                                &addr.parse().unwrap(),
-                                                Duration::from_millis(200)
-                                            );
-                                            // Only prune a session that ACTIVELY refused (truly dead);
-                                            // a timeout means busy-but-alive and must not be deleted.
-                                            let refused = matches!(&conn, Err(e) if e.kind() == io::ErrorKind::ConnectionRefused);
-                                            if let Ok(mut s) = conn {
-                                                // Format expansion for variables like
-                                                // pane_current_command/pane_current_path can
-                                                // take 40+ ms each (OS process queries), so
-                                                // 50 ms was too tight for multi-variable
-                                                // format strings (e.g. libtmux's 123-field
-                                                // format). 500 ms allows complex formats
-                                                // while still detecting dead sessions quickly.
-                                                let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
-                                                // Read session key and authenticate
-                                                let key_path = crate::paths::key_file(&base);
-                                                if let Ok(key) = std::fs::read_to_string(&key_path) {
-                                                    let _ = std::io::Write::write_all(&mut s, format!("AUTH {}\n", key.trim()).as_bytes());
-                                                }
-                                                // Use -F format if provided, otherwise session-info
-                                                let query = if let Some(ref fmt) = format_str {
-                                                    format!("list-sessions -F {}\n", crate::util::quote_arg(&fmt))
-                                                } else {
-                                                    "session-info\n".to_string()
-                                                };
-                                                let _ = std::io::Write::write_all(&mut s, query.as_bytes());
-                                                let mut br = std::io::BufReader::new(s);
-                                                let mut line = String::new();
-                                                // Skip "OK" response from AUTH
-                                                let _ = br.read_line(&mut line);
-                                                if line.trim() == "OK" {
-                                                    line.clear();
-                                                    let _ = br.read_line(&mut line);
-                                                }
-                                                if line.trim() == "ERROR: Authentication required" {
-                                                    // Auth failed, skip this session
-                                                    continue;
-                                                }
-                                                live_servers += 1;
-                                                // When -F format is provided, the server already
-                                                // expanded it; use the result even if empty (tmux
-                                                // prints an empty line for unknown format vars).
-                                                // Only fall back to display_name when no -F was given.
-                                                if format_str.is_some() || !line.trim().is_empty() {
-                                                    let output = line.trim_end().to_string();
-                                                    // Apply -f filter if provided.
-                                                    // tmux -f accepts format expressions; support
-                                                    // the common #{==:#{session_name},NAME} pattern
-                                                    // as well as a plain substring fallback.
-                                                    if let Some(ref flt) = filter_str {
-                                                        let passes = if let Some(target) = flt
-                                                            .strip_prefix("#{==:#{session_name},")
-                                                            .and_then(|s| s.strip_suffix('}'))
-                                                        {
-                                                            // Compare port-file display name against literal
-                                                            let display_name = if let Some(ref pfx) = ns_prefix {
-                                                                base.strip_prefix(pfx.as_str()).unwrap_or(base)
-                                                            } else {
-                                                                base
-                                                            };
-                                                            display_name == target
-                                                        } else {
-                                                            // Fallback: plain substring match
-                                                            output.contains(flt.as_str())
-                                                        };
-                                                        if !passes { continue; }
-                                                    }
-                                                    println!("{}", output);
-                                                } else {
-                                                    // Strip namespace prefix for display (e.g. "foo__dev" -> "dev")
-                                                    let display_name = if let Some(ref pfx) = ns_prefix {
-                                                        base.strip_prefix(pfx.as_str()).unwrap_or(base)
-                                                    } else {
-                                                        base
-                                                    };
-                                                    if let Some(ref flt) = filter_str {
-                                                        let passes = if let Some(target) = flt
-                                                            .strip_prefix("#{==:#{session_name},")
-                                                            .and_then(|s| s.strip_suffix('}'))
-                                                        {
-                                                            display_name == target
-                                                        } else {
-                                                            display_name.contains(flt.as_str())
-                                                        };
-                                                        if !passes { continue; }
-                                                    }
-                                                    println!("{}", display_name); 
-                                                }
-                                            } else if refused {
-                                                // Actively refused → truly dead. Remove the WHOLE
-                                                // set: dropping the `.port` alone would strand its
-                                                // siblings where no sweep can reach them (#530).
-                                                crate::session::remove_session_registry_files(&e.path());
-                                            }
-                                        }
-                                    }
-                                }
+                let mut live_servers = 0usize;
+                let mut failed_servers = 0usize;
+                let mut candidates = crate::session::list_session_names_ns(l_socket_name.as_deref());
+                candidates.sort();
+                for base in candidates {
+                    let query = if let Some(ref fmt) = format_str {
+                        format!("list-sessions -F {}\n", crate::util::quote_arg(fmt))
+                    } else { "session-info\n".to_string() };
+                    let result = crate::session::read_session_endpoint(&base).and_then(|(port, key)| {
+                        crate::session::query_authed_line(
+                            &format!("127.0.0.1:{}", port), &key, query.as_bytes(),
+                            Duration::from_millis(500), Duration::from_millis(2000),
+                        )
+                    });
+                    match result {
+                        Ok(output) if format_str.is_some() || !output.is_empty() => {
+                            live_servers += 1;
+                            if let Some(ref flt) = filter_str {
+                                let passes = if let Some(target) = flt
+                                    .strip_prefix("#{==:#{session_name},")
+                                    .and_then(|s| s.strip_suffix('}'))
+                                {
+                                    crate::paths::registry_session_name(&base) == target
+                                } else { output.contains(flt) };
+                                if !passes { continue; }
                             }
+                            println!("{}", output);
+                        }
+                        Ok(_) => {
+                            failed_servers += 1;
+                            eprintln!("psmux: list-sessions: {}: empty session-info response", crate::paths::registry_session_name(&base));
+                        }
+                        Err(error) => {
+                            failed_servers += 1;
+                            eprintln!("psmux: list-sessions: {}: {}", crate::paths::registry_session_name(&base), error);
                         }
                     }
                 }
+                if failed_servers != 0 {
+                    // Return usable rows, but report partial listing as failure.
+                    std::process::exit(1);
+                }
                 if live_servers == 0 {
-                    // Nothing answered: no user session in this namespace (a
-                    // `__warm__` standby is not a session). tmux prints
-                    // `no server running on <socket>` and exits 1 here, and
-                    // scripts lean on that code (`tmux ls || start`), so an
-                    // empty listing at exit 0 was a portability trap.
                     match l_socket_name.as_deref() {
                         Some(l) => eprintln!("psmux: no server running on {} (-L {})", dir, l),
                         None => eprintln!("psmux: no server running on {}", dir),
@@ -1380,11 +1219,8 @@ fn run_main() -> io::Result<()> {
                         let session = crate::cli::parse_target(target)
                             .session
                             .unwrap_or_else(|| target.clone());
-                        if let Some(ref l) = l_socket_name {
-                            format!("{}__{}", l, session)
-                        } else {
-                            session
-                        }
+                        if target.trim_start_matches('=').starts_with('$') { session }
+                        else { crate::paths::storage_base(l_socket_name.as_deref(), &session) }
                     })
                     .or_else(|| {
                         // Accept positional argument as target session name
@@ -1392,11 +1228,7 @@ fn run_main() -> io::Result<()> {
                         let t_val_idx = sub_args.iter().position(|a| *a == "-t").map(|i| i + 1);
                         sub_args.iter().enumerate().find_map(|(i, a)| {
                             if !a.starts_with('-') && Some(i) != t_val_idx {
-                                Some(if let Some(ref l) = l_socket_name {
-                                    format!("{}__{}", l, a)
-                                } else {
-                                    (*a).clone()
-                                })
+                                Some(crate::paths::storage_base(l_socket_name.as_deref(), a))
                             } else {
                                 None
                             }
@@ -1406,7 +1238,7 @@ fn run_main() -> io::Result<()> {
                     .or_else(|| crate::session::resolve_last_session_name_ns(l_socket_name.as_deref()))
                     .unwrap_or_else(|| {
                         if let Some(ref l) = l_socket_name {
-                            format!("{}__0", l)
+                            crate::paths::storage_base(Some(l), "0")
                         } else {
                             "0".to_string()
                         }
@@ -1444,18 +1276,9 @@ fn run_main() -> io::Result<()> {
                 // complete means no server, whatever error the OS chose to
                 // report. The lenient reading let a stale registry entry pass
                 // the gate and the raw winsock error surfaced from the client.
-                let shown = l_socket_name
-                    .as_deref()
-                    .and_then(|l| name.strip_prefix(&format!("{}__", l)))
-                    .unwrap_or(&name)
-                    .to_string();
+                let shown = crate::paths::registry_session_name(&name);
                 if !probe_session_alive_strict(&name) {
-                    // Nothing is listening on the registered port. Reap the
-                    // entry so the next `ls`/`attach` does not re-litigate it,
-                    // unless the pid anchor still vouches for a live server.
-                    if crate::session::registry_pid_anchor_alive(&name) != Some(true) {
-                        crate::session::remove_session_registry(&name);
-                    }
+                    // Failed communication does not authorize registry cleanup.
                     // tmux wording: a bare `attach` that finds nothing to attach
                     // to says `no sessions`; only an explicit target names the
                     // session it could not find. The fallback name here was
@@ -1636,10 +1459,11 @@ fn run_main() -> io::Result<()> {
                 });
                 // Compute port file base name: with -L namespace prefix if specified
                 let port_file_base = if let Some(ref l) = l_socket_name {
-                    format!("{}__{}", l, name)
+                    crate::paths::storage_base(Some(l), &name)
                 } else {
-                    name.clone()
+                    crate::paths::storage_base(None, &name)
                 };
+                crate::paths::validate_registry_base(l_socket_name.as_deref(), &name)?;
                 // Check for -- separator: everything after it is a raw command (direct execution)
                 let raw_cmd_args: Option<Vec<String>> = raw_cmd_after_dd.filter(|v| !v.is_empty());
                 // Parse initial command from positional args (legacy mode, no --)
@@ -1650,41 +1474,30 @@ fn run_main() -> io::Result<()> {
                 };
                 
                 // Check if session already exists AND is actually running
-                let psmux_dir = crate::paths::psmux_dir();
                 let port_path = crate::paths::port_file(&port_file_base);
                 // PID of the server we spawn on the cold path (None when we adopt
                 // a warm server or attach to a remote one). The readiness gate
                 // below uses it to fail fast if the freshly spawned server dies.
                 let mut server_pid: Option<u32> = None;
-                if std::path::Path::new(&port_path).exists() {
-                    // Verify server is actually running
-                    let server_alive = if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                        if let Ok(port) = port_str.trim().parse::<u16>() {
-                            let addr = format!("127.0.0.1:{}", port);
-                            std::net::TcpStream::connect_timeout(
-                                &addr.parse().unwrap(),
-                                Duration::from_millis(100)
-                            ).is_ok()
-                        } else { false }
-                    } else { false };
-                    
-                    if server_alive {
-                        if attach_if_exists {
-                            // -A flag: attach to existing session instead of erroring
-                            env::set_var("PSMUX_SESSION_NAME", &port_file_base);
-                            env::set_var("PSMUX_REMOTE_ATTACH", "1");
-                            // Skip server creation, jump straight to attach
-                            // (handled at the bottom of this match block)
-                        } else {
-                            eprintln!("duplicate session: {}", name);
-                            std::process::exit(1);
+                if std::path::Path::new(&port_path).exists() || crate::registry::manifest_path(&port_file_base).exists() {
+                    match crate::session::existing_session_state(&port_file_base) {
+                        crate::session::SessionLiveness::Alive(_) => {
+                            if attach_if_exists {
+                                env::set_var("PSMUX_SESSION_NAME", &port_file_base);
+                                env::set_var("PSMUX_REMOTE_ATTACH", "1");
+                            } else {
+                                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("duplicate session: {}", name)));
+                            }
                         }
-                    } else {
-                        // Stale port file - remove it and continue
-                        let _ = std::fs::remove_file(&port_path);
+                        crate::session::SessionLiveness::Dead => {
+                            // The server reserves the destination before replacing
+                            // this verified old process generation.
+                        }
+                        _ => return Err(io::Error::new(io::ErrorKind::WouldBlock,
+                            format!("session '{}' is registered but is not responding; registration preserved", name))),
                     }
                 }
-                
+
                 // If -A attached to an existing session, skip server creation
                 if env::var("PSMUX_REMOTE_ATTACH").ok().as_deref() == Some("1") {
                     // Already set up for attach — skip server spawn
@@ -1703,115 +1516,16 @@ fn run_main() -> io::Result<()> {
                     || crate::config::is_warm_disabled_by_config();
                 let has_custom_config = f_config_file.is_some() || std::env::var("PSMUX_CONFIG_FILE").is_ok();
                 let claimed_warm = if !warm_disabled && !has_custom_config && initial_cmd.is_none() && raw_cmd_args.is_none() && start_dir.is_none() && env_vars.is_empty() && init_width.is_none() && init_height.is_none() {
-                    let warm_base = if let Some(ref l) = l_socket_name {
-                        format!("{}____warm__", l)
-                    } else {
-                        "__warm__".to_string()
-                    };
-                    let warm_port_path = crate::paths::port_file(&warm_base);
-                    // Atomically CLAIM the warm server before connecting. The
-                    // __warm__.port file is a shared handoff: under rapid
-                    // new-session, several clients could read the SAME file (and
-                    // OS ephemeral-port reuse can make a stale entry point at an
-                    // already-claimed server), which intermittently dropped a
-                    // session. Renaming the port file is atomic on the same dir,
-                    // so exactly one client wins the claim; losers cold-spawn.
-                    let warm_port_opt = std::fs::read_to_string(&warm_port_path)
-                        .ok()
-                        .and_then(|s| s.trim().parse::<u16>().ok());
-                    let claim_path = format!("{}\\{}.claiming.{}", psmux_dir, warm_base, std::process::id());
-                    if let Some(warm_port) = warm_port_opt {
-                        if std::fs::rename(&warm_port_path, &claim_path).is_ok() {
-                            let warm_addr = format!("127.0.0.1:{}", warm_port);
-                            let result = if std::net::TcpStream::connect_timeout(
-                                &warm_addr.parse().unwrap(),
-                                Duration::from_millis(100),
-                            ).is_ok() {
-                                let warm_key = crate::session::read_session_key(&warm_base).unwrap_or_default();
-                                if !warm_key.is_empty() {
-                                    let client_cwd = std::env::current_dir()
-                                        .ok()
-                                        .and_then(|p| p.to_str().map(|s| s.to_string()));
-                                    // -p carries this shell's PSMUX_PRIORITY (or the
-                                    // config value) onto the standby, which set its
-                                    // own class before this shell existed (#608).
-                                    let claim_prio = crate::platform::claim_priority_arg();
-                                    let claim_cmd = if let Some(ref cwd) = client_cwd {
-                                        format!("claim-session {} {} -p {}\n", crate::util::quote_arg(&name), crate::util::quote_arg(cwd), crate::util::quote_arg(&claim_prio))
-                                    } else {
-                                        format!("claim-session {} -p {}\n", crate::util::quote_arg(&name), crate::util::quote_arg(&claim_prio))
-                                    };
-                                    match crate::session::send_auth_cmd_response(
-                                        &warm_addr, &warm_key,
-                                        claim_cmd.as_bytes(),
-                                    ) {
-                                        Ok(resp) if resp.contains("OK") => {
-                                            if let Some(ref wn) = window_name {
-                                                let new_key = crate::session::read_session_key(&port_file_base).unwrap_or_default();
-                                                let _ = crate::session::send_auth_cmd(
-                                                    &warm_addr, &new_key,
-                                                    format!("rename-window {}\n", crate::util::quote_arg(wn)).as_bytes(),
-                                                );
-                                            }
-                                            // Apply -e environment variables to the claimed warm session
-                                            if !env_vars.is_empty() {
-                                                let new_key = crate::session::read_session_key(&port_file_base).unwrap_or_default();
-                                                for (k, v) in &env_vars {
-                                                    let _ = crate::session::send_auth_cmd(
-                                                        &warm_addr, &new_key,
-                                                        format!("set-environment {} {}\n", crate::util::quote_arg(k), crate::util::quote_arg(v)).as_bytes(),
-                                                    );
-                                                }
-                                            }
-                                            true
-                                        }
-                                        // Explicit rejection: the server answered
-                                        // but it is NOT a warm server (e.g. a stale
-                                        // __warm__.port left pointing at an already-
-                                        // claimed session, or OS ephemeral-port reuse
-                                        // routing us to a live non-warm server). This
-                                        // claim will NEVER produce our session, so do
-                                        // NOT commit — fall through to a clean cold
-                                        // spawn. The stale handoff file was already
-                                        // consumed (renamed to .claiming then removed
-                                        // below), so the bad warm pointer self-heals
-                                        // and the next open is fast again. Without
-                                        // this, we would wait the full port-file
-                                        // timeout (~5s) for a session that never
-                                        // appears and then fail the open entirely.
-                                        Ok(resp) if resp.contains("ERR") => false,
-                                        // We have ALREADY atomically claimed this
-                                        // warm (won the .port rename) and sent
-                                        // claim-session to a live server, so it WILL
-                                        // become our session. A slow/missing response
-                                        // here must NOT trigger a cold spawn: doing so
-                                        // would create a SECOND server with the same
-                                        // name (duplicate -> desynced .port/.key ->
-                                        // the session appears lost). Commit to the
-                                        // claim; the post-claim port-wait below
-                                        // verifies completion (and errors cleanly if
-                                        // the warm somehow died mid-claim).
-                                        _ => true,
-                                    }
-                                } else { false }
-                            } else {
-                                // Connect failed: the warm is dead and will NOT become
-                                // our session, so a cold spawn is correct (no duplicate
-                                // is possible because nothing claimed this name).
-                                false
-                            };
-                            // The server writes <session>.port on a successful
-                            // claim; our renamed handoff file is now orphaned
-                            // either way, so remove it. On failure this also
-                            // ensures the dead/stale warm entry does not linger.
-                            let _ = std::fs::remove_file(&claim_path);
-                            result
-                        } else {
-                            // Lost the claim race (another client renamed it
-                            // first) or the file vanished — fall back to cold spawn.
-                            false
+                    let claimed = try_claim_warm_session(l_socket_name.as_deref(), &name)?;
+                    if claimed {
+                        if let Some(ref wn) = window_name {
+                            let (port, key) = crate::session::read_session_endpoint(&port_file_base)?;
+                            crate::session::query_authed_line(&format!("127.0.0.1:{}", port), &key,
+                                format!("rename-window {}\nsession-info\n", crate::util::quote_arg(wn)).as_bytes(),
+                                Duration::from_millis(500), Duration::from_millis(2000))?;
                         }
-                    } else { false }
+                    }
+                    claimed
                 } else { false };
 
                 if !claimed_warm {
@@ -2492,76 +2206,10 @@ fn run_main() -> io::Result<()> {
                 }
 
                 if all_sessions {
-                    // Iterate over all session port files (like list-sessions does)
-                    let dir = crate::paths::psmux_dir();
-                    let ns_prefix = l_socket_name.as_ref().map(|l| format!("{l}__"));
-                    if let Ok(entries) = std::fs::read_dir(&dir) {
-                        for e in entries.flatten() {
-                            if let Some(name) = e.file_name().to_str() {
-                                if let Some((base, ext)) = name.rsplit_once('.') {
-                                    if ext != "port" { continue; }
-                                    if crate::session::is_warm_session(base) { continue; }
-                                    if let Some(ref pfx) = ns_prefix {
-                                        if !base.starts_with(pfx.as_str()) { continue; }
-                                    } else if base.contains("__") { continue; }
-                                    if let Ok(port_str) = std::fs::read_to_string(e.path()) {
-                                        if let Ok(_p) = port_str.trim().parse::<u16>() {
-                                            let addr = format!("127.0.0.1:{}", port_str.trim());
-                                            let conn = std::net::TcpStream::connect_timeout(
-                                                &addr.parse().unwrap(),
-                                                Duration::from_millis(500),
-                                            );
-                                            // Only prune a session that ACTIVELY refused (truly dead);
-                                            // a timeout means busy-but-alive and must not be deleted.
-                                            let refused = matches!(&conn, Err(e) if e.kind() == io::ErrorKind::ConnectionRefused);
-                                            if let Ok(mut s) = conn {
-                                                let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
-                                                let key_path = crate::paths::key_file(&base);
-                                                if let Ok(key) = std::fs::read_to_string(&key_path) {
-                                                    let _ = std::io::Write::write_all(&mut s, format!("AUTH {}\n", key.trim()).as_bytes());
-                                                }
-                                                // Send list-panes -s (all panes in this session) to each server
-                                                let query = if let Some(ref fmt) = format_str {
-                                                    format!("list-panes -s -F {}\n", crate::util::quote_arg(&fmt))
-                                                } else {
-                                                    "list-panes -s\n".to_string()
-                                                };
-                                                let _ = std::io::Write::write_all(&mut s, query.as_bytes());
-                                                let _ = s.flush();
-                                                let mut br = std::io::BufReader::new(s);
-                                                let mut line = String::new();
-                                                let _ = std::io::BufRead::read_line(&mut br, &mut line);
-                                                if line.trim() == "OK" {
-                                                    line.clear();
-                                                    let _ = std::io::BufRead::read_line(&mut br, &mut line);
-                                                }
-                                                if line.trim() == "ERROR: Authentication required" { continue; }
-                                                // Print all lines from this session
-                                                if !line.trim().is_empty() {
-                                                    print!("{}", line);
-                                                }
-                                                loop {
-                                                    let mut next = String::new();
-                                                    match std::io::BufRead::read_line(&mut br, &mut next) {
-                                                        Ok(0) => break,
-                                                        Ok(_) => {
-                                                            if !next.trim().is_empty() {
-                                                                print!("{}", next);
-                                                            }
-                                                        }
-                                                        Err(_) => break,
-                                                    }
-                                                }
-                                            } else if refused {
-                                                // Whole set, not just port+key (#530).
-                                                crate::session::remove_session_registry_files(&e.path());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let query = if let Some(ref fmt) = format_str {
+                        format!("list-panes -s -F {}\n", crate::util::quote_arg(fmt))
+                    } else { "list-panes -s\n".to_string() };
+                    query_namespace(l_socket_name.as_deref(), query.as_bytes())?;
                 } else {
                     // Single session: build command and send to target session
                     let mut cmd = "list-panes".to_string();
@@ -2610,77 +2258,11 @@ fn run_main() -> io::Result<()> {
                 }
 
                 if all_sessions {
-                    // Iterate over all session port files (like list-sessions does)
-                    let dir = crate::paths::psmux_dir();
-                    let ns_prefix = l_socket_name.as_ref().map(|l| format!("{l}__"));
-                    if let Ok(entries) = std::fs::read_dir(&dir) {
-                        for e in entries.flatten() {
-                            if let Some(name) = e.file_name().to_str() {
-                                if let Some((base, ext)) = name.rsplit_once('.') {
-                                    if ext != "port" { continue; }
-                                    if crate::session::is_warm_session(base) { continue; }
-                                    if let Some(ref pfx) = ns_prefix {
-                                        if !base.starts_with(pfx.as_str()) { continue; }
-                                    } else if base.contains("__") { continue; }
-                                    if let Ok(port_str) = std::fs::read_to_string(e.path()) {
-                                        if let Ok(_p) = port_str.trim().parse::<u16>() {
-                                            let addr = format!("127.0.0.1:{}", port_str.trim());
-                                            let conn = std::net::TcpStream::connect_timeout(
-                                                &addr.parse().unwrap(),
-                                                Duration::from_millis(500),
-                                            );
-                                            // Only prune a session that ACTIVELY refused (truly dead);
-                                            // a timeout means busy-but-alive and must not be deleted.
-                                            let refused = matches!(&conn, Err(e) if e.kind() == io::ErrorKind::ConnectionRefused);
-                                            if let Ok(mut s) = conn {
-                                                let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
-                                                let key_path = crate::paths::key_file(&base);
-                                                if let Ok(key) = std::fs::read_to_string(&key_path) {
-                                                    let _ = std::io::Write::write_all(&mut s, format!("AUTH {}\n", key.trim()).as_bytes());
-                                                }
-                                                // Send list-windows to each server (without -a to avoid recursion)
-                                                let query = if let Some(ref fmt) = format_str {
-                                                    format!("list-windows -F {}\n", crate::util::quote_arg(&fmt))
-                                                } else if json_mode {
-                                                    "list-windows -J\n".to_string()
-                                                } else {
-                                                    "list-windows\n".to_string()
-                                                };
-                                                let _ = std::io::Write::write_all(&mut s, query.as_bytes());
-                                                let _ = s.flush();
-                                                let mut br = std::io::BufReader::new(s);
-                                                let mut line = String::new();
-                                                let _ = std::io::BufRead::read_line(&mut br, &mut line);
-                                                if line.trim() == "OK" {
-                                                    line.clear();
-                                                    let _ = std::io::BufRead::read_line(&mut br, &mut line);
-                                                }
-                                                if line.trim() == "ERROR: Authentication required" { continue; }
-                                                if !line.trim().is_empty() {
-                                                    print!("{}", line);
-                                                }
-                                                loop {
-                                                    let mut next = String::new();
-                                                    match std::io::BufRead::read_line(&mut br, &mut next) {
-                                                        Ok(0) => break,
-                                                        Ok(_) => {
-                                                            if !next.trim().is_empty() {
-                                                                print!("{}", next);
-                                                            }
-                                                        }
-                                                        Err(_) => break,
-                                                    }
-                                                }
-                                            } else if refused {
-                                                // Whole set, not just port+key (#530).
-                                                crate::session::remove_session_registry_files(&e.path());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let query = if let Some(ref fmt) = format_str {
+                        format!("list-windows -F {}\n", crate::util::quote_arg(fmt))
+                    } else if json_mode { "list-windows -J\n".to_string() }
+                    else { "list-windows\n".to_string() };
+                    query_namespace(l_socket_name.as_deref(), query.as_bytes())?;
                 } else {
                     // Single session: build command and send to target session
                     let mut cmd = "list-windows".to_string();
@@ -2762,15 +2344,11 @@ fn run_main() -> io::Result<()> {
                 // Apply -L namespace prefix to -s session lookup so users can
                 // target a namespaced session by its short name.
                 let session_for_routing = if let Some(s) = &s_target {
-                    if let Some(ref l) = l_socket_name {
-                        format!("{}__{}", l, s)
-                    } else {
-                        s.clone()
-                    }
+                    crate::paths::storage_base(l_socket_name.as_deref(), s)
                 } else {
                     env::var("PSMUX_TARGET_SESSION").unwrap_or_else(|_| {
                         if let Some(ref l) = l_socket_name {
-                            format!("{}__{}", l, "default")
+                            crate::paths::storage_base(Some(l), &"default")
                         } else {
                             "default".to_string()
                         }
@@ -2847,12 +2425,9 @@ fn run_main() -> io::Result<()> {
                                 // already carries the prefix, so do not add it
                                 // twice: `-L ns kill-session -t $N` used to look
                                 // for `ns__ns__name`, find nothing, and exit 0.
-                                let namespaced = match l_socket_name {
-                                    Some(ref l) if !resolved.starts_with(&format!("{}__", l)) => {
-                                        format!("{}__{}", l, resolved)
-                                    }
-                                    _ => resolved,
-                                };
+                                let namespaced = if t.trim_start_matches('=').starts_with('$') {
+                                    resolved
+                                } else { crate::paths::storage_base(l_socket_name.as_deref(), &resolved) };
                                 target = Some(namespaced);
                                 i += 1;
                             }
@@ -2865,7 +2440,7 @@ fn run_main() -> io::Result<()> {
                     env::var("PSMUX_TARGET_SESSION").unwrap_or_else(|_| {
                         // Apply -L namespace prefix to default
                         if let Some(ref l) = l_socket_name {
-                            format!("{}__{}", l, "default")
+                            crate::paths::storage_base(Some(l), &"default")
                         } else {
                             "default".to_string()
                         }
@@ -2886,23 +2461,18 @@ fn run_main() -> io::Result<()> {
                 // "no port file" as "already gone" and return success, so a
                 // misspelt name, or a script killing a session it never
                 // created, reported OK for a kill that did nothing.
-                let shown = l_socket_name
-                    .as_deref()
-                    .and_then(|l| session_name.strip_prefix(&format!("{}__", l)))
-                    .unwrap_or(&session_name)
-                    .to_string();
+                let shown = crate::paths::registry_session_name(&session_name);
                 if !std::path::Path::new(&port_path).exists() {
                     eprintln!("psmux: can't find session: {}", shown);
                     std::process::exit(1);
                 }
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 let was_alive = probe_session_alive(&session_name);
-                if !was_alive && crate::session::registry_pid_anchor_alive(&session_name) != Some(true) {
+                if !was_alive && crate::session::registry_pid_anchor_alive(&session_name) == Some(false) {
                     // A registry with nobody behind it: the server went away and
                     // left its files. Reap them so the next `ls` does not stall
                     // on them, and tell the caller the truth, which is that
                     // there was no such session to kill.
-                    crate::session::remove_session_registry(&session_name);
                     eprintln!("psmux: can't find session: {}", shown);
                     std::process::exit(1);
                 }
@@ -2918,11 +2488,10 @@ fn run_main() -> io::Result<()> {
                     if !probe_session_alive(&session_name) { gone = true; break; }
                     if std::time::Instant::now() >= deadline { break; }
                 }
-                if gone || refused {
+                if gone || (refused && crate::session::registry_pid_anchor_alive(&session_name) == Some(false)) {
                     // Server is down (killed or actively refused) → remove the
                     // now-stale port file. (Idempotent: the server also removes
                     // its own on a clean exit.)
-                    let _ = std::fs::remove_file(&port_path);
                     return Ok(());
                 }
                 // Still alive after the deadline → genuine failure. Exit non-zero
@@ -2955,59 +2524,22 @@ fn run_main() -> io::Result<()> {
                         i += 1;
                     }
                     // Apply -L namespace prefix for port file lookup
-                    if let Some(ref l) = l_socket_name {
-                        format!("{}__{}", l, t)
-                    } else {
-                        t
-                    }
+                    crate::paths::storage_base(l_socket_name.as_deref(), &t)
                 });
                 // Warm (standby) sessions are internal-only — treat as non-existent
                 if crate::session::is_warm_session(&target) {
                     std::process::exit(1);
                 }
-                let path = crate::paths::port_file(&target);
-                if let Ok(port_str) = std::fs::read_to_string(&path) {
-                    if let Ok(port) = port_str.trim().parse::<u16>() {
-                        let addr = format!("127.0.0.1:{}", port);
-                        // Actually authenticate and query the server to ensure it's healthy
-                        let session_key = read_session_key(&target).unwrap_or_default();
-                        let conn = std::net::TcpStream::connect_timeout(
-                            &addr.parse().unwrap(),
-                            Duration::from_millis(500)
-                        );
-                        // Only prune a session that ACTIVELY refused (truly dead);
-                        // a timeout means busy-but-alive and must not be deleted.
-                        let refused = matches!(&conn, Err(e) if e.kind() == io::ErrorKind::ConnectionRefused);
-                        if let Ok(mut s) = conn {
-                            let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
-                            let _ = write!(s, "AUTH {}\n", session_key);
-                            let _ = write!(s, "session-info\n");
-                            let _ = s.flush();
-                            let mut buf = [0u8; 256];
-                            if let Ok(n) = std::io::Read::read(&mut s, &mut buf) {
-                                if n > 0 {
-                                    let resp = String::from_utf8_lossy(&buf[..n]);
-                                    if resp.contains("OK") {
-                                        std::process::exit(0);
-                                    }
-                                }
-                            }
-                            // Fallback: connection succeeded so session likely exists
-                            std::process::exit(0);
-                        } else if refused
-                            || crate::session::registry_pid_anchor_alive(&target) == Some(false)
-                        {
-                            // Truly dead: it either refused outright, or its PID
-                            // anchor names a process that is gone (a dead loopback
-                            // port can time out rather than refuse on Windows).
-                            // Reap the WHOLE set: dropping the `.port` alone would
-                            // strand its siblings where no sweep can reach them (#530).
-                            crate::session::remove_session_registry(&target);
-                        }
-                        // Anything else (a plain timeout against a live server that
-                        // was merely slow to accept) exits 1 without touching the
-                        // registry: has-session is a predicate, not a reaper (#622).
-                    }
+                let result = crate::session::read_session_endpoint(&target).and_then(|(port, key)| {
+                    crate::session::query_authed_line(
+                        &format!("127.0.0.1:{}", port), &key, b"session-info\n",
+                        Duration::from_millis(500), Duration::from_millis(2000),
+                    )
+                });
+                match result {
+                    Ok(info) if !info.is_empty() => std::process::exit(0),
+                    Ok(_) => eprintln!("psmux: has-session: empty session-info response"),
+                    Err(error) => eprintln!("psmux: has-session: {}", error),
                 }
                 std::process::exit(1);
             }
@@ -4578,27 +4110,19 @@ fn run_main() -> io::Result<()> {
                 // instant.  Also triggers Windows Defender's scan cache on the
                 // binary, eliminating the ~200-400ms first-run penalty.
                 let warm_base = if let Some(ref l) = l_socket_name {
-                    format!("{}____warm__", l)
+                    crate::paths::storage_base(Some(l), "__warm__")
                 } else {
                     "__warm__".to_string()
                 };
                 let warm_port_path = crate::paths::port_file(&warm_base);
-                // Check if warm server is already running
-                let already_running = if std::path::Path::new(&warm_port_path).exists() {
-                    if let Ok(port_str) = std::fs::read_to_string(&warm_port_path) {
-                        if let Ok(port) = port_str.trim().parse::<u16>() {
-                            std::net::TcpStream::connect_timeout(
-                                &format!("127.0.0.1:{}", port).parse().unwrap(),
-                                Duration::from_millis(100),
-                            ).is_ok()
-                        } else { false }
-                    } else { false }
-                } else { false };
-                if already_running {
-                    return Ok(());
+                if std::path::Path::new(&warm_port_path).exists() || crate::registry::manifest_path(&warm_base).exists() {
+                    match crate::session::existing_session_state(&warm_base) {
+                        crate::session::SessionLiveness::Alive(_) => return Ok(()),
+                        crate::session::SessionLiveness::Dead => {},
+                        _ => return Err(io::Error::new(io::ErrorKind::WouldBlock,
+                            "warm server is registered but not responding; registration preserved")),
+                    }
                 }
-                // Clean up stale port file if any
-                let _ = std::fs::remove_file(&warm_port_path);
                 // Spawn the warm server
                 let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
                 let mut server_args: Vec<String> = vec!["server".into(), "-s".into(), "__warm__".into()];
@@ -4819,15 +4343,15 @@ fn run_main() -> io::Result<()> {
     // starts the server and creates a session automatically; we do the same.
 
     if env::var("PSMUX_REMOTE_ATTACH").ok().as_deref() != Some("1") {
-        let psmux_dir = crate::paths::psmux_dir();
         let session_name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| {
             crate::session::next_session_name(l_socket_name.as_deref())
         });
         let port_file_base = if let Some(ref l) = l_socket_name {
-            format!("{}__{}", l, session_name)
+            crate::paths::storage_base(Some(l), &session_name)
         } else {
-            session_name.clone()
+            crate::paths::storage_base(None, &session_name)
         };
+        crate::paths::validate_registry_base(l_socket_name.as_deref(), &session_name)?;
         let port_path = crate::paths::port_file(&port_file_base);
 
         // If a server is ALREADY alive under this exact name (e.g. PSMUX_SESSION_NAME
@@ -4838,14 +4362,14 @@ fn run_main() -> io::Result<()> {
         // empty-scrollback server on every single bare/control-mode connection,
         // silently orphaning the running session. Mirrors the liveness check the
         // explicit `new-session` command path already performs above.
-        let server_already_alive = std::fs::read_to_string(&port_path)
-            .ok()
-            .and_then(|s| s.trim().parse::<u16>().ok())
-            .map(|p| std::net::TcpStream::connect_timeout(
-                &format!("127.0.0.1:{}", p).parse().unwrap(),
-                Duration::from_millis(100),
-            ).is_ok())
-            .unwrap_or(false);
+        let server_already_alive = if std::path::Path::new(&port_path).exists() || crate::registry::manifest_path(&port_file_base).exists() {
+            match crate::session::existing_session_state(&port_file_base) {
+                crate::session::SessionLiveness::Alive(_) => true,
+                crate::session::SessionLiveness::Dead => false,
+                _ => return Err(io::Error::new(io::ErrorKind::WouldBlock,
+                    format!("session '{}' is registered but not responding; registration preserved", session_name))),
+            }
+        } else { false };
 
         // Try warm server claim first (fast path)
         // Skipped when PSMUX_NO_WARM=1 is set or config has 'set -g warm off',
@@ -4853,99 +4377,9 @@ fn run_main() -> io::Result<()> {
         let warm_disabled = server_already_alive
             || std::env::var("PSMUX_NO_WARM").map(|v| v == "1" || v == "true").unwrap_or(false)
             || crate::config::is_warm_disabled_by_config();
-        let warm_base = if let Some(ref l) = l_socket_name {
-            format!("{}____warm__", l)
-        } else {
-            "__warm__".to_string()
+        let warm_claimed = if warm_disabled { false } else {
+            try_claim_warm_session(l_socket_name.as_deref(), &session_name)?
         };
-        let warm_port_path = crate::paths::port_file(&warm_base);
-        let mut warm_claimed = false;
-        // Atomically CLAIM the warm server before connecting (see the detached
-        // path above for the full rationale): renaming the shared __warm__.port
-        // file is atomic, so exactly one concurrent new-session wins a given warm
-        // server and the rest cold-spawn. Prevents the rapid-creation race where
-        // two clients claim the same warm and one session is lost.
-        let warm_port_opt = if warm_disabled { None } else {
-            std::fs::read_to_string(&warm_port_path).ok().and_then(|s| s.trim().parse::<u16>().ok())
-        };
-        let warm_claim_path = format!("{}\\{}.claiming.{}", psmux_dir, warm_base, std::process::id());
-        if let Some(port) = warm_port_opt {
-            if std::fs::rename(&warm_port_path, &warm_claim_path).is_ok() {
-            let warm_key = crate::session::read_session_key(&warm_base).unwrap_or_default();
-            {
-                {
-                    let addr = format!("127.0.0.1:{}", port);
-                    if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
-                        &addr.parse().unwrap(),
-                        Duration::from_millis(500),
-                    ) {
-                        let _ = stream.set_nodelay(true);
-                        let _ = stream.set_read_timeout(Some(Duration::from_millis(3000)));
-                        let _ = write!(stream, "AUTH {}\n", warm_key);
-                        let client_cwd = std::env::current_dir()
-                            .ok()
-                            .and_then(|p| p.to_str().map(|s| s.to_string()));
-                        // See the new-session claim above: -p is what lets a bare
-                        // `psmux` in a shell with PSMUX_PRIORITY set reach a standby
-                        // that was spawned long before that shell (#608).
-                        let claim_prio = crate::platform::claim_priority_arg();
-                        if let Some(ref cwd) = client_cwd {
-                            let _ = write!(stream, "claim-session {} {} -p {}\n", crate::util::quote_arg(&session_name), crate::util::quote_arg(cwd), crate::util::quote_arg(&claim_prio));
-                        } else {
-                            let _ = write!(stream, "claim-session {} -p {}\n", crate::util::quote_arg(&session_name), crate::util::quote_arg(&claim_prio));
-                        }
-                        let _ = stream.flush();
-                        // Committed: we atomically own this warm (won the .port
-                        // rename) and have sent claim-session, so it WILL become our
-                        // session. Set warm_claimed NOW so a slow/missing response
-                        // does not trigger a duplicate cold spawn (the duplicate was
-                        // the residual cause of rapid-creation session loss). The OK
-                        // read below still waits for the rename to finish (issue
-                        // #136), and the port-file wait after this block covers a
-                        // slow response.
-                        warm_claimed = true;
-                        // Use send_auth_cmd_response pattern: read AUTH
-                        // "OK" line first, then read the claim-session
-                        // response.  Previously a single raw read() would
-                        // pick up only the AUTH "OK" and proceed before
-                        // the server finished renaming port/key files,
-                        // causing "auth failed" on the subsequent attach
-                        // (issue #136).
-                        if let Ok(reader_stream) = stream.try_clone() {
-                            let mut br = std::io::BufReader::new(reader_stream);
-                            let mut auth_line = String::new();
-                            if std::io::BufRead::read_line(&mut br, &mut auth_line).unwrap_or(0) > 0
-                                && auth_line.trim().starts_with("OK")
-                            {
-                                // Auth succeeded — now wait for the claim
-                                // response so files are renamed before we
-                                // try to attach.
-                                let mut claim_line = String::new();
-                                let got = std::io::BufRead::read_line(&mut br, &mut claim_line).unwrap_or(0) > 0;
-                                if got && claim_line.contains("OK") {
-                                    warm_claimed = true;
-                                } else if got && claim_line.contains("ERR") {
-                                    // Explicit rejection: this server is NOT a warm
-                                    // server (stale __warm__.port -> already-claimed
-                                    // session, or OS port reuse). Do NOT commit; the
-                                    // handoff file was already consumed above, so the
-                                    // bad warm pointer self-heals. Cold-spawn instead
-                                    // of waiting ~5s for a session that never appears.
-                                    warm_claimed = false;
-                                }
-                                // No/garbled response: leave warm_claimed = true
-                                // (set above) to preserve the rapid-creation race
-                                // fix — we own a live warm that will complete.
-                            }
-                        }
-                    }
-                }
-            }
-            }
-            // Orphaned handoff file: server wrote <session>.port on success.
-            let _ = std::fs::remove_file(&warm_claim_path);
-        }
-
 
         if !warm_claimed && !server_already_alive {
             // Cold path: spawn a new background server

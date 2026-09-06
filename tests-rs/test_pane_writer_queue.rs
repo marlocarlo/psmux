@@ -6,7 +6,7 @@
 // wedging every session. The fix routes every pane write through
 // `spawn_pane_write_queue`: a per-pane queue drained by a dedicated thread,
 // mirroring tmux's libevent bufferevent contract — writes complete
-// immediately, stay ordered, and absorb backpressure in memory. The thread
+// immediately while below the byte limit, and stay ordered. The thread
 // exits cleanly when the queue side is dropped with the pane.
 //
 // These tests wrap a dummy writer (no PTY, no spawn) and observe the queue
@@ -175,7 +175,7 @@ fn pane_close_ends_writer_thread_cleanly() {
 
 /// A burst of writes with no reader must still complete immediately and
 /// deliver every byte once the inner writer catches up — the queue absorbs
-/// unbounded backpressure in memory, like tmux's event buffer.
+/// backpressure up to its documented byte budget.
 #[test]
 fn burst_writes_survive_backpressure_and_arrive_complete() {
     let state = Arc::new((Mutex::new(Vec::new()), Condvar::new()));

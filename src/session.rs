@@ -25,40 +25,24 @@ enum PortProbeResult {
 /// Returns true if this port-file base name belongs to a warm (standby) server.
 /// Warm sessions should be hidden from user-facing lists and never auto-attached.
 pub fn is_warm_session(base: &str) -> bool {
-    base == "__warm__" || base.ends_with("____warm__")
+    crate::paths::registry_session_name(base) == "__warm__"
 }
 
-/// The `-L` socket namespace a registry base name belongs to.
-///
-/// A namespaced session is stored as `<ns>__<name>`, so the namespace is the
-/// text before the first `__`. A bare name has none, and neither does the
-/// default namespace's own warm helper `__warm__` (its `__` is not a
-/// separator). Used to work out which server family a client belongs to from
-/// the full name it was attached with.
-pub fn session_namespace(full: &str) -> Option<&str> {
-    if is_warm_session(full) {
-        return None;
-    }
-    match full.split_once("__") {
-        Some((ns, _)) if !ns.is_empty() => Some(ns),
-        _ => None,
-    }
+pub fn session_namespace(full: &str) -> Option<String> {
+    crate::paths::registry_namespace(full)
 }
 
-/// Whether the registry base `base` is visible from namespace `ns`.
-///
-/// tmux parity: a `-L` socket is a separate server, and a client on one
-/// socket can never see sessions of another. psmux keeps every namespace in
-/// one registry directory, so listings that enumerate `.port` files must
-/// apply this rule. `ls`, `$N` resolution and the reaper already did; the
-/// interactive session and tree choosers did not, and a session from another
-/// namespace (`amx-6c9b6ad63d__main`) sorted itself between the default
-/// namespace's own sessions and shifted every `j`/`k` step in the picker.
 pub fn session_visible_from(base: &str, ns: Option<&str>) -> bool {
-    match ns {
-        Some(n) => base.starts_with(&format!("{}__", n)),
-        None => !base.contains("__"),
-    }
+    crate::paths::registry_visible_from(base, ns)
+}
+
+/// Resolve once for the entire invocation: explicit socket, inherited socket,
+/// then the current pane's registered endpoint, otherwise default namespace.
+pub fn effective_namespace(explicit: Option<&str>, inherited: Option<&str>, tmux: Option<&str>, dir: &Path) -> Option<String> {
+    explicit.or(inherited).map(str::to_string).or_else(|| {
+        tmux.and_then(|value| session_base_owning_tmux_port(value, dir))
+            .and_then(|base| session_namespace(&base))
+    })
 }
 
 /// Find the next available numeric session name (tmux-compatible).
@@ -77,18 +61,8 @@ pub fn next_session_name(ns_prefix: Option<&str>) -> String {
                 if let Some((base, ext)) = fname.rsplit_once('.') {
                     if ext != "port" { continue; }
                     if is_warm_session(base) { continue; }
-                    // Extract the session name part (after namespace prefix if any)
-                    let session_part = if let Some(pfx) = ns_prefix {
-                        let full_pfx = format!("{}__", pfx);
-                        if base.starts_with(&full_pfx) {
-                            &base[full_pfx.len()..]
-                        } else {
-                            continue; // different namespace
-                        }
-                    } else {
-                        if base.contains("__") { continue; } // namespaced session
-                        base
-                    };
+                    if !session_visible_from(base, ns_prefix) { continue; }
+                    let session_part = crate::paths::registry_session_name(base);
                     if let Ok(n) = session_part.parse::<u32>() {
                         used.insert(n);
                     }
@@ -109,69 +83,86 @@ pub fn next_session_name(ns_prefix: Option<&str>) -> String {
 /// either writes back, and hand out duplicate ids.
 static SESSION_ID_ALLOC: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Best-effort cross-process advisory lock backed by an atomically-created lock
-/// file. Separate psmux server processes share the same `next_session_id`
-/// counter, so the in-process mutex alone is not enough; this closes the
-/// read-modify-write gap across processes too. Released on drop. A lock left by
-/// a crashed process is taken over once it is clearly stale; the guarded
-/// critical section is sub-millisecond, so the staleness bound never steals a
-/// live lock.
-struct CounterLock {
-    path: String,
-}
-
+/// Compatibility lock for older executables, protected by a strict named
+/// mutex between current servers. Age alone never authorizes lock theft.
+struct CounterLock { path: String, identity: String }
 impl CounterLock {
-    const STALE_AFTER: Duration = Duration::from_secs(5);
-
-    fn acquire(path: String) -> Self {
-        for _ in 0..2000 {
+    fn acquire(path: String) -> io::Result<Self> {
+        let creation = crate::platform::process_kill::process_creation_time(std::process::id())
+            .ok_or_else(|| io::Error::other("cannot establish counter owner identity"))?;
+        let identity = format!("{}:{}", std::process::id(), creation);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
             match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut f) => {
-                    let _ = write!(f, "{}", std::process::id());
-                    return CounterLock { path };
-                }
-                Err(_) => {
-                    // Take over a stale lock left behind by a crashed holder.
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .map(|t| t.elapsed().map(|d| d >= Self::STALE_AFTER).unwrap_or(false))
-                        .unwrap_or(false);
-                    if stale {
+                Ok(mut file) => {
+                    if let Err(error) = file.write_all(identity.as_bytes()) {
+                        drop(file);
                         let _ = std::fs::remove_file(&path);
-                        continue;
+                        return Err(error);
                     }
-                    std::thread::sleep(Duration::from_millis(1));
+                    return Ok(Self { path, identity });
                 }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    if let Ok(record) = std::fs::read_to_string(&path) {
+                        if let Some((pid, creation)) = parse_pid_file_contents(&record) {
+                            use crate::platform::process_kill::{process_identity, ProcessIdentity};
+                            let dead = match process_identity(pid) {
+                                ProcessIdentity::Exited => true,
+                                ProcessIdentity::Alive(actual) => creation.is_some_and(|old| old != actual),
+                                ProcessIdentity::Unknown => false,
+                            };
+                            if dead && std::fs::read_to_string(&path).ok().as_deref() == Some(record.as_str()) {
+                                std::fs::remove_file(&path)?;
+                                continue;
+                            }
+                        }
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(io::Error::new(ErrorKind::WouldBlock, "session ID counter lock is busy or its owner is uncertain"));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
             }
         }
-        // Never observed in practice (the critical section is microseconds);
-        // proceed rather than hang session creation indefinitely.
-        CounterLock { path }
     }
 }
-
 impl Drop for CounterLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if std::fs::read_to_string(&self.path).ok().as_deref() == Some(self.identity.as_str()) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
-/// Allocate a globally unique session ID by reading and incrementing
-/// the persistent counter file `.psmux/next_session_id`.
-///
-/// The read-modify-write is serialized within the process by `SESSION_ID_ALLOC`
-/// and across processes by an advisory lock file, so concurrent callers can
-/// never observe the same `current` and return duplicate ids.
-pub fn allocate_session_id() -> usize {
+fn increment_session_counter(path: &Path) -> io::Result<usize> {
+    let current = match std::fs::read_to_string(path) {
+        Ok(value) => value.trim().parse::<usize>()
+            .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid session ID counter"))?,
+        Err(error) if error.kind() == ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+    };
+    let next = current.checked_add(1).ok_or_else(|| io::Error::other("session ID counter exhausted"))?;
+    crate::registry::atomic_write(path, next.to_string().as_bytes())?;
+    Ok(current)
+}
+
+/// Reserve an ID only when starting a server; failed allocation aborts startup.
+/// Neither AppState construction nor read-only clients mutate this counter.
+pub fn allocate_session_id() -> io::Result<usize> {
     let _guard = SESSION_ID_ALLOC.lock().unwrap_or_else(|e| e.into_inner());
+    std::fs::create_dir_all(crate::paths::psmux_dir())?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let _named = loop {
+        if let Some(guard) = crate::platform::acquire_session_mutex_strict("~psmux~counter~session")? { break guard; }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(ErrorKind::WouldBlock, "session ID allocator is busy"));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
     let counter_path = crate::paths::psmux_dir_file("next_session_id");
-    let _xlock = CounterLock::acquire(format!("{}.lock", counter_path));
-    let current = std::fs::read_to_string(&counter_path)
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    let _ = std::fs::write(&counter_path, (current + 1).to_string());
-    current
+    let _compatibility = CounterLock::acquire(format!("{}.lock", counter_path))?;
+    increment_session_counter(Path::new(&counter_path))
 }
 
 /// Write a `.sid` file recording the session ID for this session.
@@ -704,39 +695,16 @@ struct ServerCandidate {
 /// `.port` file pointing at it, so it can never be selected even if its `.pid`
 /// file is missing (backward compatibility with servers started before #448).
 fn select_orphan_pids(
-    candidates: &[ServerCandidate],
-    tracked_ports: &std::collections::HashSet<u16>,
-    tracked_pids: &std::collections::HashSet<u32>,
-    owned_pids: &std::collections::HashMap<u32, Option<u64>>,
-    self_pid: u32,
-    age_cutoff_ft: u64,
+    _candidates: &[ServerCandidate],
+    _tracked_ports: &std::collections::HashSet<u16>,
+    _tracked_pids: &std::collections::HashSet<u32>,
+    _owned_pids: &std::collections::HashMap<u32, Option<u64>>,
+    _self_pid: u32,
+    _age_cutoff_ft: u64,
 ) -> Vec<u32> {
-    let mut out = Vec::new();
-    for c in candidates {
-        if c.pid == self_pid { continue; }
-        if tracked_pids.contains(&c.pid) { continue; }
-        if c.ports.iter().any(|p| tracked_ports.contains(p)) { continue; }
-        // Issue #510: reap only what this data dir can positively claim.
-        //
-        // The candidate list is machine-wide, so "no registry entry references
-        // it" covers two very different processes: an orphan we started, and a
-        // perfectly healthy server belonging to another USERPROFILE/HOME. The
-        // old rule could not tell them apart and killed both. An absent
-        // ownership marker now means "not ours, not our business" rather than
-        // "orphan" - unknown must never justify termination.
-        let Some(&recorded_creation) = owned_pids.get(&c.pid) else { continue; };
-        // Same identity gate force_kill_targets applies: without a recorded
-        // creation time there is nothing to distinguish this process from an
-        // unrelated one that inherited the PID, so it is not a candidate.
-        match recorded_creation {
-            Some(ft) if ft == c.creation_ft => {}
-            _ => continue,
-        }
-        // Only reap processes old enough to have finished registering.
-        if age_cutoff_ft != 0 && c.creation_ft > age_cutoff_ft { continue; }
-        out.push(c.pid);
-    }
-    out
+    // Missing metadata cannot establish that a live session is disposable.
+    // Process termination is restricted to explicit kill operations.
+    Vec::new()
 }
 
 /// Read the set of ports referenced by `.port` files and the set of PIDs
@@ -826,7 +794,7 @@ pub fn force_kill_targets(dir: &std::path::Path, ns_prefix: Option<&str>) -> Vec
         if path.extension().map(|e| e == "pid").unwrap_or(false) {
             if let Some(pfx) = ns_prefix {
                 let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                if !stem.starts_with(pfx) { continue; }
+                if !session_visible_from(stem, pfx.strip_suffix("__")) { continue; }
             }
             if let Ok(contents) = std::fs::read_to_string(&path) {
                 // A recorded creation time is required: it is the identity gate.
@@ -838,6 +806,116 @@ pub fn force_kill_targets(dir: &std::path::Path, ns_prefix: Option<&str>) -> Vec
         }
     }
     targets
+}
+
+const SESSION_REGISTRY_EXTENSIONS: &[&str] = &["port", "key", "sid", "pid", "act", "registry.json"];
+
+struct KillRegistrySnapshot {
+    base: String,
+    dir: std::path::PathBuf,
+    identity: Option<PidTarget>,
+    files: Vec<Option<Vec<u8>>>,
+}
+
+fn snapshot_kill_registry(dir: &Path, base: &str) -> io::Result<KillRegistrySnapshot> {
+    use std::io::Read;
+    let mut files = Vec::new();
+    for ext in SESSION_REGISTRY_EXTENSIONS {
+        let path = dir.join(format!("{}.{}", base, ext));
+        let bytes = match std::fs::File::open(path) {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                file.take(16385).read_to_end(&mut bytes)?;
+                if bytes.len() > 16384 { return Err(io::Error::new(ErrorKind::InvalidData, "oversized registry file")); }
+                Some(bytes)
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        files.push(bytes);
+    }
+    let identity = if let Some(bytes) = files[5].as_ref() {
+        let m: crate::registry::RegistryManifest = serde_json::from_slice(bytes).map_err(io::Error::other)?;
+        Some(PidTarget { pid: m.pid, creation_time: m.creation_time })
+    } else {
+        files[3].as_deref().and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(parse_pid_file_contents).and_then(|(pid, creation)| creation.map(|creation_time| PidTarget { pid, creation_time }))
+    };
+    Ok(KillRegistrySnapshot { base: base.to_string(), dir: dir.to_path_buf(), identity, files })
+}
+
+/// Only explicit kill uses this cleanup. Hold the destination name reservation,
+/// prove the snapshotted process generation exited, and compare every sibling
+/// before deleting anything. A new registration always wins this race.
+fn cleanup_killed_registry(snapshot: &KillRegistrySnapshot) -> io::Result<bool> {
+    let Some(identity) = snapshot.identity.as_ref() else { return Ok(false); };
+    if !crate::platform::process_kill::verified_process_dead(identity.pid, identity.creation_time) { return Ok(false); }
+    let Some(_guard) = crate::platform::acquire_session_mutex_strict(&snapshot.base)? else { return Ok(false); };
+    let current = snapshot_kill_registry(&snapshot.dir, &snapshot.base)?;
+    if current.files != snapshot.files { return Ok(false); }
+    if !crate::platform::process_kill::verified_process_dead(identity.pid, identity.creation_time) { return Ok(false); }
+    for (ext, bytes) in SESSION_REGISTRY_EXTENSIONS.iter().zip(&snapshot.files) {
+        if bytes.is_some() {
+            match std::fs::remove_file(snapshot.dir.join(format!("{}.{}", snapshot.base, ext))) {
+                Ok(()) => {},
+                Err(e) if e.kind() == ErrorKind::NotFound => {},
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Explicit kill scoped to the effective namespace; no process-name searches,
+/// and no registry deletion on a failed connection or authentication attempt.
+pub fn kill_registered_servers(namespace: Option<&str>) -> io::Result<()> {
+    let dir = std::path::PathBuf::from(crate::paths::psmux_dir());
+    let mut bases = std::collections::BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue; };
+            let base = name.strip_suffix(".port").or_else(|| name.strip_suffix(".registry.json"))
+                .or_else(|| name.strip_suffix(".pid"));
+            if let Some(base) = base {
+                if namespace.is_none() || session_visible_from(base, namespace) { bases.insert(base.to_string()); }
+            }
+        }
+    }
+    let mut failures = Vec::new();
+    for base in bases {
+        let snapshot = match snapshot_kill_registry(&dir, &base) {
+            Ok(snapshot) => snapshot,
+            Err(error) => { failures.push(format!("{}: {}", crate::paths::registry_session_name(&base), error)); continue; }
+        };
+        if let Ok((port, key)) = read_session_endpoint(&base) {
+            if let Ok(mut response) = open_authed(&format!("127.0.0.1:{}", port), &key, b"kill-server\n",
+                Duration::from_millis(500), Duration::from_millis(2000)) {
+                let _ = response.read_all();
+            }
+        }
+        if let Some(identity) = snapshot.identity.as_ref() {
+            // Exact check and termination happen on the same OS handle.
+            if !crate::platform::process_kill::verified_process_dead(identity.pid, identity.creation_time) {
+                crate::platform::process_kill::terminate_server_pid_exact(identity.pid, identity.creation_time);
+            }
+            let deadline = std::time::Instant::now() + Duration::from_millis(1000);
+            while !crate::platform::process_kill::verified_process_dead(identity.pid, identity.creation_time)
+                && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            if crate::platform::process_kill::verified_process_dead(identity.pid, identity.creation_time) {
+                cleanup_killed_registry(&snapshot)?;
+            } else { failures.push(format!("{}: server exit could not be confirmed", crate::paths::registry_session_name(&base))); }
+        } else if snapshot.files.iter().any(Option::is_some) {
+            // Old servers without a precise anchor can clean themselves. They
+            // do not grant permission for a PID-based force kill or file wipe.
+            if snapshot_kill_registry(&dir, &base)?.files.iter().any(Option::is_some) {
+                failures.push(format!("{}: server identity unavailable; registry preserved", crate::paths::registry_session_name(&base)));
+            }
+        }
+    }
+    if failures.is_empty() { Ok(()) } else { Err(io::Error::other(failures.join("; "))) }
 }
 
 /// The exact-match identity gate for the force-kill fallback: terminate only when
@@ -866,12 +944,7 @@ pub fn namespace_peer_pids(dir: &Path, ns: Option<&str>, self_pid: u32) -> Vec<P
             continue;
         }
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        let mine = match ns {
-            Some(n) => stem.starts_with(&format!("{}__", n)),
-            // A bare session name has no `__` separator; the default namespace's
-            // own warm helper is the one exception.
-            None => !stem.contains("__") || stem == "__warm__",
-        };
+        let mine = session_visible_from(stem, ns);
         if !mine {
             continue;
         }
@@ -1052,67 +1125,11 @@ pub fn read_namespace_instance(ns: Option<&str>) -> Option<String> {
 /// server) and reaps the process itself, bounding the process count regardless
 /// of how the duplicate arose.
 pub fn reap_orphaned_servers() {
-    let Some(psmux_dir) = crate::paths::psmux_dir_opt() else {
-        return;
-    };
-    reap_orphaned_servers_in(Path::new(&psmux_dir));
+    // Kept as a compatibility entry point. Live orphan cleanup is unsafe:
+    // a busy server can temporarily lose registry files and still own panes.
 }
 
-fn reap_orphaned_servers_in(psmux_dir: &Path) {
-    use crate::platform::process_kill;
-
-    // Issue #474: no registry, no reaping. When the data dir does not exist,
-    // this invocation cannot see the files that track live servers (an MSYS2
-    // login shell that unset USERPROFILE resolves home elsewhere, for
-    // example). Proceeding with an empty view would classify every live
-    // server on the machine as an orphan and terminate them all.
-    if !psmux_dir.is_dir() {
-        return;
-    }
-
-    let (tracked_ports, tracked_pids) = read_tracked_registry(psmux_dir);
-    let self_pid = std::process::id();
-
-    // Capture the reuse-guard cutoff BEFORE enumerating: any process we see now
-    // was created at or before this instant, so a PID reused afterwards is
-    // rejected by terminate_server_pid (#447 guard).
-    let now_ft = process_kill::now_process_filetime();
-    // 100ns ticks in the grace window; a process is "old enough" to reap only if
-    // its creation time is at or before now - grace.
-    let grace_ticks = (ORPHAN_REAP_MIN_AGE.as_nanos() / 100) as u64;
-    let age_cutoff_ft = now_ft.saturating_sub(grace_ticks);
-
-    // Group loopback listeners by PID, keeping only psmux-image server processes.
-    let mut by_pid: std::collections::HashMap<u32, Vec<u16>> = std::collections::HashMap::new();
-    for (pid, port) in process_kill::loopback_listener_pids() {
-        by_pid.entry(pid).or_default().push(port);
-    }
-    let mut candidates: Vec<ServerCandidate> = Vec::new();
-    for (pid, ports) in by_pid {
-        let is_psmux = crate::platform::process_info::get_process_name(pid)
-            .map(|n| {
-                let n = n.to_ascii_lowercase();
-                PSMUX_SERVER_IMAGE_NAMES.contains(&n.as_str())
-            })
-            .unwrap_or(false);
-        if !is_psmux { continue; }
-        let creation_ft = process_kill::process_creation_time(pid).unwrap_or(u64::MAX);
-        candidates.push(ServerCandidate { pid, ports, creation_ft });
-    }
-
-    let owned_pids = read_owned_server_pids(psmux_dir);
-    let orphans = select_orphan_pids(
-        &candidates, &tracked_ports, &tracked_pids, &owned_pids, self_pid, age_cutoff_ft);
-    for pid in orphans {
-        if crate::debug_log::session_log_enabled() {
-            crate::debug_log::session_log("reaper", &format!(
-                "terminating orphaned psmux server pid {} (this data dir claims it, no registry entry references it)", pid));
-        }
-        process_kill::terminate_server_pid(pid, Some(now_ft));
-    }
-
-    prune_stale_server_markers(psmux_dir, &owned_pids);
-}
+fn reap_orphaned_servers_in(_psmux_dir: &Path) {}
 
 /// Delete ownership markers whose process is gone or whose PID now belongs to
 /// something else, so the directory tracks live servers rather than growing
@@ -1188,21 +1205,20 @@ fn pid_anchor_verdict(port_path: &Path) -> Option<bool> {
     let pid_path = port_path.with_extension("pid");
     // Tolerate both `pid` and `pid:creation_filetime` bodies (the latter written
     // so kill-server can verify identity); the anchor only needs the pid.
-    let (pid, _creation) = parse_pid_file_contents(&std::fs::read_to_string(&pid_path).ok()?)?;
-    let name = match crate::platform::process_info::get_process_name(pid) {
-        // No such process (a same-user psmux server is always openable with
-        // QUERY_LIMITED_INFORMATION, so an unopenable PID is not our server).
-        None => return Some(false),
-        Some(n) => n.to_ascii_lowercase(),
+    let (pid, creation) = parse_pid_file_contents(&std::fs::read_to_string(&pid_path).ok()?)?;
+    use crate::platform::process_kill::{process_identity, ProcessIdentity};
+    let observed_creation = match process_identity(pid) {
+        ProcessIdentity::Alive(actual) => Some(actual),
+        ProcessIdentity::Exited => return Some(false),
+        ProcessIdentity::Unknown => return None,
     };
-    if !PSMUX_SERVER_IMAGE_NAMES.contains(&name.as_str()) {
-        // PID recycled by an unrelated application; our server is gone.
-        return Some(false);
+    if let Some(recorded) = creation {
+        return observed_creation.map(|actual| actual == recorded);
     }
     // PID-reuse guard (same idea as the #447 reaper guard): a psmux process
     // created well AFTER the .pid file was last written cannot be the server
     // that wrote it. When either timestamp is unavailable, err towards alive.
-    if let Some(created_ft) = crate::platform::process_kill::process_creation_time(pid) {
+    if let Some(created_ft) = observed_creation {
         if let Some(mtime_ft) = std::fs::metadata(&pid_path)
             .ok()
             .and_then(|m| m.modified().ok())
@@ -1213,7 +1229,9 @@ fn pid_anchor_verdict(port_path: &Path) -> Option<bool> {
             }
         }
     }
-    Some(true)
+    // Legacy bare PID records cannot establish ownership. A live process may
+    // have reused the PID; query the authenticated endpoint instead.
+    None
 }
 
 /// Resolve the session key stored alongside a `.port` file (the sibling
@@ -1263,88 +1281,14 @@ fn cleanup_stale_port_files_in_with<F>(psmux_dir: &Path, mut probe: F)
 where
     F: FnMut(&str, u16) -> PortProbeResult,
 {
-    let boot = system_boot_time();
+    // Legacy entry point is now observational. Registry reclamation requires
+    // an owned generation under the session reservation, not age or TCP state.
     if let Ok(entries) = std::fs::read_dir(psmux_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map(|e| e == "port").unwrap_or(false) {
-                // PID-anchor verdict FIRST (issue #448 sentinel): the process
-                // table answers liveness instantly and definitively, so a
-                // Some(true) verdict (recorded PID alive with matching
-                // creation time) vetoes every heuristic below, including the
-                // boot-time guard. File metadata must never be a death
-                // certificate for a live server (issue #546): a live server's
-                // registry mtimes are frozen at creation (the 5s self-heal
-                // rewrites only on content change), so a forward wall-clock
-                // step, VM save/restore, or mtime-preserving backup restore
-                // pushes the frozen .port mtime behind the derived boot time
-                // and the old guard-first ordering reaped the registry of a
-                // running session — after which the orphan reaper killed its
-                // server — on any psmux invocation at all, even `psmux -V`.
-                // The genuine reboot case still reaps: after a restart, any
-                // live process holding a recycled PID was created later than
-                // .pid mtime + PID_REUSE_MARGIN_TICKS, which yields
-                // Some(false).
-                let pid_verdict = pid_anchor_verdict(&path);
-                if pid_verdict == Some(true) {
-                    continue; // live server; nothing to clean
-                }
-                // Boot-time guard: a port file last modified before this boot
-                // belongs to a server that died when the machine restarted.
-                // No network round-trip, and immune to the old port being
-                // reused by another process this boot. Applies only when the
-                // PID anchor could not positively confirm liveness
-                // (Some(false) or, for pre-#448 registries, None).
-                if let Some(boot) = boot {
-                    if let Some(mtime) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
-                        if is_pre_boot(mtime, boot, BOOT_TIME_MARGIN) {
-                            if crate::debug_log::session_log_enabled() {
-                                crate::debug_log::session_log("cleanup", &format!(
-                                    "reaping '{}': port file predates last boot (server died on restart)",
-                                    registry_base(&path)));
-                            }
-                            remove_session_registry_files(&path);
-                            continue;
-                        }
-                    }
-                }
-                // PID-anchor negative path: registry entries with a `.pid`
-                // sibling never pay a network probe. Dead-port probes are not
-                // just slow (they can burn the full connect timeout per
-                // attempt on Windows loopback) - they are also inconclusive,
-                // so stale files were never reaped and the probe tax repeated
-                // on every subsequent CLI invocation.
-                match pid_verdict {
-                    Some(false) => {
-                        if crate::debug_log::session_log_enabled() {
-                            crate::debug_log::session_log("cleanup", &format!(
-                                "reaping '{}': recorded server PID is dead or recycled",
-                                registry_base(&path)));
-                        }
-                        remove_session_registry_files(&path);
-                        continue;
-                    }
-                    _ => {} // no .pid anchor; fall through to the network probe
-                }
-                if let Ok(port_str) = std::fs::read_to_string(&path) {
-                    if let Ok(port) = port_str.trim().parse::<u16>() {
-                        let key = read_key_for_port_path(&path);
-                        if probe(&key, port) == PortProbeResult::Stale {
-                            if crate::debug_log::session_log_enabled() {
-                                crate::debug_log::session_log("cleanup", &format!(
-                                    "reaping '{}' (port {}): no psmux server authenticated as ours (stale)",
-                                    registry_base(&path), port));
-                            }
-                            remove_session_registry_files(&path);
-                        }
-                    } else {
-                        if crate::debug_log::session_log_enabled() {
-                            crate::debug_log::session_log("cleanup", &format!(
-                                "reaping '{}': unparseable port value {:?}",
-                                registry_base(&path), port_str.trim()));
-                        }
-                        remove_session_registry_files(&path);
-                    }
+            if path.extension().is_some_and(|ext| ext == "port") {
+                if let Ok(port) = std::fs::read_to_string(&path).unwrap_or_default().trim().parse::<u16>() {
+                    let _ = probe(&read_key_for_port_path(&path), port);
                 }
             }
         }
@@ -1461,50 +1405,9 @@ fn probe_auth_identity(addr: std::net::SocketAddr, key: &str) -> Result<AuthProb
 /// unparseable, still keeps the conservative `Inconclusive` verdict).
 fn probe_session_for_cleanup(key: &str, port: u16) -> PortProbeResult {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut saw_refused = false;
-    let mut saw_timed_out = false;
-    let mut saw_inconclusive = false;
-
-    for attempt in 0..STALE_PORT_PROBE_ATTEMPTS {
-        match probe_auth_identity(addr, key) {
-            Ok(AuthProbe::Authenticated) => {
-                if crate::debug_log::session_log_enabled() {
-                    crate::debug_log::session_log("probe",
-                        &format!("port {}: AUTH accepted -> alive", port));
-                }
-                return PortProbeResult::Alive;
-            }
-            Ok(AuthProbe::Rejected) => {
-                if crate::debug_log::session_log_enabled() {
-                    crate::debug_log::session_log("probe", &format!(
-                        "port {}: AUTH rejected by a different server (reused port) -> stale", port));
-                }
-                return PortProbeResult::Stale;
-            }
-            Ok(AuthProbe::Unknown) => saw_inconclusive = true,
-            Err(ErrorKind::ConnectionRefused) => saw_refused = true,
-            Err(ErrorKind::TimedOut) => saw_timed_out = true,
-            Err(_) => saw_inconclusive = true,
-        }
-
-        if attempt + 1 < STALE_PORT_PROBE_ATTEMPTS {
-            std::thread::sleep(STALE_PORT_RETRY_DELAY);
-        }
-    }
-
-    if (saw_refused || saw_timed_out) && !saw_inconclusive {
-        if crate::debug_log::session_log_enabled() {
-            crate::debug_log::session_log("probe", &format!(
-                "port {}: refused/timed-out on every attempt (refused={}, timed_out={}) -> stale",
-                port, saw_refused, saw_timed_out));
-        }
-        PortProbeResult::Stale
-    } else {
-        if crate::debug_log::session_log_enabled() {
-            crate::debug_log::session_log("probe",
-                &format!("port {}: no definitive answer -> inconclusive (kept)", port));
-        }
-        PortProbeResult::Inconclusive
+    match probe_auth_identity(addr, key) {
+        Ok(AuthProbe::Authenticated) => PortProbeResult::Alive,
+        _ => PortProbeResult::Inconclusive,
     }
 }
 
@@ -1512,6 +1415,35 @@ fn probe_session_for_cleanup(key: &str, port: u16) -> PortProbeResult {
 pub fn read_session_key(session: &str) -> io::Result<String> {
     let keypath = crate::paths::key_file(session);
     std::fs::read_to_string(&keypath).map(|s| s.trim().to_string())
+}
+
+/// Read one coherent endpoint generation, preferring the atomic manifest.
+/// A malformed manifest is a real error; it must not fall back to mixed files.
+pub fn read_session_endpoint(base: &str) -> io::Result<(u16, String)> {
+    if let Some(manifest) = crate::registry::read_manifest(base)? {
+        if validate_auth_key(&manifest.key).is_none() {
+            return Err(io::Error::new(ErrorKind::InvalidData, "invalid session credentials"));
+        }
+        return Ok((manifest.port, manifest.key));
+    }
+    let port = std::fs::read_to_string(crate::paths::port_file(base))?
+        .trim().parse::<u16>()
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid session port"))?;
+    if port == 0 { return Err(io::Error::new(ErrorKind::InvalidData, "invalid session port")); }
+    let key = read_session_key(base)?;
+    if validate_auth_key(&key).is_none() {
+        return Err(io::Error::new(ErrorKind::InvalidData, "invalid session credentials"));
+    }
+    Ok((port, key))
+}
+
+pub fn existing_session_state(base: &str) -> SessionLiveness {
+    if registry_pid_anchor_alive(base) == Some(false) { return SessionLiveness::Dead; }
+    match read_session_endpoint(base) {
+        Ok((port, key)) => probe_session_liveness(&format!("127.0.0.1:{}", port), &key,
+            Duration::from_millis(500), Duration::from_millis(2000)),
+        Err(_) => SessionLiveness::Unresponsive,
+    }
 }
 
 /// Hard cap on a single response payload read from the server (256 KB).
@@ -1571,143 +1503,152 @@ pub fn send_auth_cmd(addr: &str, key: &str, cmd: &[u8]) -> io::Result<()> {
 /// callers; new code should prefer `fetch_authed_response` /
 /// `fetch_authed_response_multi`.
 pub fn send_auth_cmd_response(addr: &str, key: &str, cmd: &[u8]) -> io::Result<String> {
-    let key = match validate_auth_key(key) {
-        Some(k) => k,
-        None => return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid session key")),
-    };
-    let mut s = std::net::TcpStream::connect(addr)?;
-    let _ = s.set_nodelay(true);
-    let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
-    let _ = write!(s, "AUTH {}\n", key);
-    let _ = std::io::Write::write_all(&mut s, cmd);
-    let _ = s.flush();
-    let mut br = std::io::BufReader::new(std::io::Read::take(&mut s, MAX_AUTHED_RESPONSE_BYTES));
-    let mut auth_line = String::new();
-    let _ = std::io::BufRead::read_line(&mut br, &mut auth_line);
-    let mut buf = String::new();
-    let _ = std::io::Read::read_to_string(&mut br, &mut buf);
-    Ok(buf)
+    query_authed_all(addr, key, cmd, Duration::from_millis(500), Duration::from_millis(2000))
 }
 
-/// Internal: open an authenticated connection and send a single command.
-///
-/// Returns a length-capped `BufReader` positioned right after the command
-/// write, ready for response parsing. Centralizes:
-///   - CRLF/NUL key validation (security)
-///   - connect timeout, read timeout, TCP_NODELAY
-///   - response size cap (`MAX_AUTHED_RESPONSE_BYTES`, DoS guard)
-///   - the AUTH + command write
-///
-/// The size cap is applied with `Read::take` BEFORE the `BufReader` so the
-/// resulting reader still exposes `BufRead`. Wrapping the other way around
-/// (`BufReader::take`) loses `BufRead` because `Take` is `Read`-only.
+/// A bounded protocol reader with a total wall-time budget, not merely an
+/// idle timeout. A peer sending one byte per timeout cannot keep the CLI hung.
+struct AuthedReader {
+    reader: std::io::BufReader<std::net::TcpStream>,
+    remaining: usize,
+    deadline: std::time::Instant,
+}
+
+impl AuthedReader {
+    fn arm_timeout(&self) -> io::Result<()> {
+        let remaining = self.deadline.checked_duration_since(std::time::Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| io::Error::new(ErrorKind::TimedOut, "server response deadline exceeded"))?;
+        self.reader.get_ref().set_read_timeout(Some(remaining))
+    }
+
+    fn read_line(&mut self) -> io::Result<String> {
+        use std::io::BufRead;
+        let mut line = Vec::new();
+        loop {
+            self.arm_timeout()?;
+            let buf = self.reader.fill_buf()?;
+            if buf.is_empty() {
+                return Err(io::Error::new(ErrorKind::UnexpectedEof, "server closed before a complete response line"));
+            }
+            let n = buf.iter().position(|b| *b == b'\n').map_or(buf.len(), |p| p + 1);
+            if n > self.remaining {
+                return Err(io::Error::new(ErrorKind::InvalidData, "server response exceeds size limit"));
+            }
+            let complete = buf[n - 1] == b'\n';
+            line.extend_from_slice(&buf[..n]);
+            self.reader.consume(n);
+            self.remaining -= n;
+            if complete {
+                line.pop();
+                if line.last() == Some(&b'\r') { line.pop(); }
+                return String::from_utf8(line).map_err(|_| io::Error::new(ErrorKind::InvalidData, "server response is not UTF-8"));
+            }
+        }
+    }
+
+    fn read_all(&mut self) -> io::Result<String> {
+        use std::io::BufRead;
+        let mut output = Vec::new();
+        loop {
+            self.arm_timeout()?;
+            let buf = self.reader.fill_buf()?;
+            if buf.is_empty() { break; }
+            if buf.len() > self.remaining {
+                return Err(io::Error::new(ErrorKind::InvalidData, "server response exceeds size limit"));
+            }
+            let n = buf.len();
+            output.extend_from_slice(buf);
+            self.reader.consume(n);
+            self.remaining -= n;
+        }
+        String::from_utf8(output).map_err(|_| io::Error::new(ErrorKind::InvalidData, "server response is not UTF-8"))
+    }
+}
+
+fn protocol_error(line: &str) -> Option<io::Error> {
+    if line.starts_with("ERROR:") || line == "ERR" || line.starts_with("ERR ") {
+        let kind = if line.contains("Authentication required") || line.contains("Invalid session key") {
+            ErrorKind::PermissionDenied
+        } else { ErrorKind::Other };
+        Some(io::Error::new(kind, line.to_string()))
+    } else { None }
+}
+
 fn open_authed(
     addr: &str,
     key: &str,
     cmd: &[u8],
     connect_timeout: Duration,
     read_timeout: Duration,
-) -> Option<std::io::BufReader<std::io::Take<std::net::TcpStream>>> {
-    let key = validate_auth_key(key)?;
-    let sock_addr: std::net::SocketAddr = addr.parse().ok()?;
-    let mut s = std::net::TcpStream::connect_timeout(&sock_addr, connect_timeout).ok()?;
-    s.set_read_timeout(Some(read_timeout)).ok()?;
+) -> io::Result<AuthedReader> {
+    let key = validate_auth_key(key)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "missing or invalid session key"))?;
+    let sock_addr: std::net::SocketAddr = addr.parse()
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid server address"))?;
+    let mut s = std::net::TcpStream::connect_timeout(&sock_addr, connect_timeout)?;
+    s.set_read_timeout(Some(read_timeout))?;
+    s.set_write_timeout(Some(read_timeout))?;
     let _ = s.set_nodelay(true);
-    write!(s, "AUTH {}\n", key).ok()?;
-    s.write_all(cmd).ok()?;
-    if !cmd.ends_with(b"\n") {
-        s.write_all(b"\n").ok()?;
+    write!(s, "AUTH {}\n", key)?;
+    s.write_all(cmd)?;
+    if !cmd.ends_with(b"\n") { s.write_all(b"\n")?; }
+    s.flush()?;
+    // Commands are complete; EOF makes multi-line response completion explicit.
+    // A fast peer can finish and close before this half-close reaches Winsock.
+    // The response parser still must prove completion; do not discard buffered
+    // valid replies merely because shutdown reports an already closed socket.
+    let _ = s.shutdown(std::net::Shutdown::Write);
+    let mut response = AuthedReader {
+        reader: std::io::BufReader::new(s),
+        remaining: MAX_AUTHED_RESPONSE_BYTES as usize,
+        deadline: std::time::Instant::now() + read_timeout,
+    };
+    let ack = response.read_line()?;
+    if let Some(error) = protocol_error(&ack) { return Err(error); }
+    if ack != "OK" {
+        return Err(io::Error::new(ErrorKind::InvalidData, "invalid authentication acknowledgement"));
     }
-    let _ = s.flush();
-    Some(std::io::BufReader::new(std::io::Read::take(s, MAX_AUTHED_RESPONSE_BYTES)))
+    Ok(response)
 }
 
-/// Read one response line from an authenticated stream, transparently
-/// skipping the `OK\n` AUTH ack regardless of when it arrives.
-///
-/// Returns `None` on timeout, EOF, empty payload, or `ERROR:` reply.
-/// Returns `Some(line)` on a valid payload (newline trimmed).
-fn read_authed_line<R: std::io::BufRead>(br: &mut R) -> Option<String> {
-    // First read: could be either the AUTH ack ("OK") or the payload
-    // (if the ack was already pipelined into the same packet).
-    let mut line = String::new();
-    if std::io::BufRead::read_line(br, &mut line).ok()? == 0 {
-        return None;
-    }
-    let trimmed = line.trim();
-    if trimmed == "OK" {
-        // First line WAS the ack. Read the real payload now.
-        line.clear();
-        if std::io::BufRead::read_line(br, &mut line).ok()? == 0 {
-            return None;
-        }
-    }
-    // Filter again in case the second line is also empty/error/OK.
-    let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed == "OK" || trimmed.starts_with("ERROR:") {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+/// Require exact AUTH acknowledgement and a complete newline-framed payload.
+/// A valid empty line is a result, whereas EOF, timeout and truncation are errors.
+pub fn query_authed_line(
+    addr: &str, key: &str, cmd: &[u8], connect_timeout: Duration, read_timeout: Duration,
+) -> io::Result<String> {
+    let mut response = open_authed(addr, key, cmd, connect_timeout, read_timeout)?;
+    let line = response.read_line()?;
+    if let Some(error) = protocol_error(&line) { return Err(error); }
+    Ok(line)
 }
 
-/// Read all remaining bytes from an authenticated stream, stripping a
-/// leading `OK\n` AUTH ack if present.
-///
-/// Returns `None` on no payload, error response, or read failure.
-/// Returns `Some(payload)` with the AUTH ack removed and trailing
-/// whitespace stripped. Total read is capped by the underlying `Take`.
-fn read_authed_all<R: std::io::Read>(rd: &mut R) -> Option<String> {
-    let mut buf = String::new();
-    std::io::Read::read_to_string(rd, &mut buf).ok()?;
-    let body = buf.strip_prefix("OK\n").or_else(|| buf.strip_prefix("OK\r\n")).unwrap_or(&buf);
-    let trimmed = body.trim();
-    if trimmed.is_empty() || trimmed.starts_with("ERROR:") {
-        None
-    } else {
-        Some(trimmed.to_string())
+/// Require exact AUTH acknowledgement and EOF for a complete bounded body.
+pub fn query_authed_all(
+    addr: &str, key: &str, cmd: &[u8], connect_timeout: Duration, read_timeout: Duration,
+) -> io::Result<String> {
+    let mut response = open_authed(addr, key, cmd, connect_timeout, read_timeout)?;
+    let body = response.read_all()?;
+    if body.is_empty() {
+        return Err(io::Error::new(ErrorKind::UnexpectedEof, "server closed without a command response"));
     }
+    if let Some(error) = protocol_error(body.trim_end()) { return Err(error); }
+    Ok(body)
 }
 
-/// Send an authenticated single-command request and return one response line.
-///
-/// Centralized AUTH + command + response helper used by all picker fetches.
-/// Handles every known framing race for the AUTH ack:
-///   - ack pipelined with payload (one packet, both lines arrive together)
-///   - ack arrives first, then payload
-///   - ack delayed past first read (issue #250 race)
-///   - server replies only `OK` and never sends payload
-///   - server replies `ERROR: ...`
-///   - server hangs / connection refused / bad address
-///
-/// All callers get the same robust behavior; they can no longer reinvent
-/// the parser per-site (which is how #250 happened).
+/// Compatibility wrappers for picker callers; transport errors remain unknown.
 pub fn fetch_authed_response(
-    addr: &str,
-    key: &str,
-    cmd: &[u8],
-    connect_timeout: Duration,
-    read_timeout: Duration,
+    addr: &str, key: &str, cmd: &[u8], connect_timeout: Duration, read_timeout: Duration,
 ) -> Option<String> {
-    let mut br = open_authed(addr, key, cmd, connect_timeout, read_timeout)?;
-    read_authed_line(&mut br)
+    query_authed_line(addr, key, cmd, connect_timeout, read_timeout).ok()
+        .filter(|s| !s.is_empty())
 }
 
-/// Like `fetch_authed_response` but returns the entire response body
-/// (multi-line payloads such as `list-tree` JSON arrays or `choose-buffer`
-/// listings). The leading AUTH ack line is stripped if present.
-///
-/// The total payload is bounded by `MAX_AUTHED_RESPONSE_BYTES` to prevent
-/// a malformed or hostile server from forcing unbounded client memory.
 pub fn fetch_authed_response_multi(
-    addr: &str,
-    key: &str,
-    cmd: &[u8],
-    connect_timeout: Duration,
-    read_timeout: Duration,
+    addr: &str, key: &str, cmd: &[u8], connect_timeout: Duration, read_timeout: Duration,
 ) -> Option<String> {
-    let mut br = open_authed(addr, key, cmd, connect_timeout, read_timeout)?;
-    read_authed_all(&mut br)
+    query_authed_all(addr, key, cmd, connect_timeout, read_timeout).ok()
+        .map(|s| s.trim_end().to_string()).filter(|s| !s.is_empty())
 }
 
 /// Fetch a one-line `session-info` response from a session server.
@@ -1738,125 +1679,39 @@ pub fn fetch_session_info(
 /// `classify_sessions_parallel`, which both lists and prunes in one pass.
 #[allow(dead_code)]
 pub fn fetch_session_infos_parallel<F>(
-    inputs: Vec<(String, String, String)>,
-    connect_timeout: Duration,
-    read_timeout: Duration,
-    fallback: F,
+    inputs: Vec<(String, String, String)>, connect_timeout: Duration, read_timeout: Duration, fallback: F,
 ) -> Vec<(String, String)>
-where
-    F: Fn(&str) -> String + Send + Sync,
+where F: Fn(&str) -> String + Send + Sync,
 {
-    if inputs.is_empty() {
-        return Vec::new();
-    }
-    // Single session: skip thread spawn overhead entirely.
-    if inputs.len() == 1 {
-        let (label, addr, key) = &inputs[0];
-        let info = fetch_session_info(addr, key, connect_timeout, read_timeout)
-            .unwrap_or_else(|| fallback(label));
-        return vec![(label.clone(), info)];
-    }
-    let results: Vec<(String, String)> = std::thread::scope(|scope| {
-        let fallback_ref = &fallback;
-        let handles: Vec<_> = inputs
-            .iter()
-            .map(|(label, addr, key)| {
-                let label = label.clone();
-                let addr = addr.clone();
-                let key = key.clone();
-                scope.spawn(move || {
-                    let info = fetch_session_info(&addr, &key, connect_timeout, read_timeout)
-                        .unwrap_or_else(|| fallback_ref(&label));
-                    (label, info)
-                })
-            })
-            .collect();
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
-    });
-    results
+    classify_sessions_parallel(inputs, connect_timeout, read_timeout).into_iter()
+        .map(|(label, state)| {
+            let info = match state { SessionLiveness::Alive(info) => info, _ => fallback(&label) };
+            (label, info)
+        }).collect()
 }
 
 /// Liveness verdict for one session, produced by a single bounded probe.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SessionLiveness {
-    /// Server authenticated and returned its session-info line (the payload).
+    /// Server authenticated and returned a complete nonempty session-info line.
     Alive(String),
-    /// Definitively gone: the connection failed (refused / unreachable — on
-    /// loopback any connect failure means nothing is listening), an `ERROR`
-    /// auth rejection (a different server reused the port), or connected then
-    /// silent past the read timeout. Its registry files should be reaped. A
-    /// genuinely live server that was momentarily too slow self-heals: it
-    /// rewrites its `.port`/`.key`/`.sid` every 5s (see
-    /// `ensure_session_registry_files`).
+    /// A recorded process generation is positively known to have exited.
     Dead,
-    /// No usable AUTH key on disk, so identity cannot be verified at all.
-    /// Left in place and shown as `(not responding)` rather than deleted.
+    /// Communication or identity could not be verified. Never authorizes cleanup.
+    Unresponsive,
+    /// Credentials are unavailable. Retained for callers distinguishing this case.
     Unreachable,
 }
 
-/// Single bounded liveness probe: connect, AUTH with the session's own key,
-/// ask for `session-info`, and classify the reply. Never retries or blocks
-/// beyond `connect_timeout + read_timeout`.
+/// Network failure never proves a process died: a live server can be busy,
+/// lose its listener, or have inconsistent registry data. Discovery is read-only.
 fn probe_session_liveness(
-    addr: &str,
-    key: &str,
-    connect_timeout: Duration,
-    read_timeout: Duration,
+    addr: &str, key: &str, connect_timeout: Duration, read_timeout: Duration,
 ) -> SessionLiveness {
-    let sock: std::net::SocketAddr = match addr.parse() {
-        Ok(a) => a,
-        Err(_) => return SessionLiveness::Dead,
-    };
-    let key = match validate_auth_key(key) {
-        Some(k) => k,
-        None => return SessionLiveness::Unreachable,
-    };
-    // On loopback a live server always completes the TCP handshake (the kernel
-    // accepts into the listen backlog even before the app calls accept()), so
-    // ANY connect failure means nothing usable is listening -> Dead. We do not
-    // branch on the error kind: Windows does not always surface a clean
-    // `ConnectionRefused` for a free port.
-    let mut s = match std::net::TcpStream::connect_timeout(&sock, connect_timeout) {
-        Ok(s) => s,
-        Err(_) => return SessionLiveness::Dead,
-    };
-    let _ = s.set_read_timeout(Some(read_timeout));
-    let _ = s.set_nodelay(true);
-    if write!(s, "AUTH {}\n", key).is_err() || s.write_all(b"session-info\n").is_err() {
-        // Connection broke right after connect -> not a healthy server.
-        return SessionLiveness::Dead;
-    }
-    let _ = s.flush();
-    let mut br = std::io::BufReader::new(std::io::Read::take(s, MAX_AUTHED_RESPONSE_BYTES));
-    let mut line = String::new();
-    match std::io::BufRead::read_line(&mut br, &mut line) {
-        Ok(0) => SessionLiveness::Dead,
-        Ok(_) => {
-            let t = line.trim();
-            if t.starts_with("ERROR") {
-                return SessionLiveness::Dead;
-            }
-            if t == "OK" {
-                // Ack consumed; the next line is the real payload.
-                line.clear();
-                match std::io::BufRead::read_line(&mut br, &mut line) {
-                    Ok(0) => SessionLiveness::Dead,
-                    Ok(_) => {
-                        let t2 = line.trim();
-                        if t2.is_empty() || t2 == "OK" || t2.starts_with("ERROR") {
-                            SessionLiveness::Dead
-                        } else {
-                            SessionLiveness::Alive(t2.to_string())
-                        }
-                    }
-                    Err(_) => SessionLiveness::Dead,
-                }
-            } else {
-                // Ack pipelined with the payload in one line.
-                SessionLiveness::Alive(t.to_string())
-            }
-        }
-        Err(_) => SessionLiveness::Dead,
+    if validate_auth_key(key).is_none() { return SessionLiveness::Unreachable; }
+    match query_authed_line(addr, key, b"session-info\n", connect_timeout, read_timeout) {
+        Ok(info) if !info.is_empty() => SessionLiveness::Alive(info),
+        _ => SessionLiveness::Unresponsive,
     }
 }
 
@@ -1869,33 +1724,27 @@ fn probe_session_liveness(
 /// it replaces a sequential cleanup pass (O(N * timeout)) with one parallel
 /// round-trip that both lists and prunes.
 pub fn classify_sessions_parallel(
-    inputs: Vec<(String, String, String)>,
-    connect_timeout: Duration,
-    read_timeout: Duration,
+    inputs: Vec<(String, String, String)>, connect_timeout: Duration, read_timeout: Duration,
 ) -> Vec<(String, SessionLiveness)> {
-    if inputs.is_empty() {
-        return Vec::new();
+    // Bound thread/resource use for a registry with many entries. Failed worker
+    // creation cannot omit a row or turn unknown liveness into a death verdict.
+    const MAX_PROBE_WORKERS: usize = 16;
+    let mut results = Vec::with_capacity(inputs.len());
+    for chunk in inputs.chunks(MAX_PROBE_WORKERS) {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk.iter().map(|(label, addr, key)| {
+                let worker = std::thread::Builder::new().spawn_scoped(scope, move || {
+                    probe_session_liveness(addr, key, connect_timeout, read_timeout)
+                });
+                (label, worker)
+            }).collect();
+            for (label, worker) in handles {
+                let state = worker.ok().and_then(|worker| worker.join().ok()).unwrap_or(SessionLiveness::Unresponsive);
+                results.push((label.clone(), state));
+            }
+        });
     }
-    if inputs.len() == 1 {
-        let (label, addr, key) = &inputs[0];
-        let v = probe_session_liveness(addr, key, connect_timeout, read_timeout);
-        return vec![(label.clone(), v)];
-    }
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = inputs
-            .iter()
-            .map(|(label, addr, key)| {
-                let label = label.clone();
-                let addr = addr.clone();
-                let key = key.clone();
-                scope.spawn(move || {
-                    let v = probe_session_liveness(&addr, &key, connect_timeout, read_timeout);
-                    (label, v)
-                })
-            })
-            .collect();
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
-    })
+    results
 }
 
 /// PID-anchor liveness for the session registered under `base`, for
@@ -1903,8 +1752,21 @@ pub fn classify_sessions_parallel(
 /// TCP connect timeout per dead entry. Some(false) = definitively dead
 /// (reap + skip), Some(true) = live, None = no anchor (probe as usual).
 pub fn registry_pid_anchor_alive(base: &str) -> Option<bool> {
-    let port_path = crate::paths::port_file_opt(base)?;
-    pid_anchor_verdict(Path::new(&port_path))
+    match crate::registry::read_manifest(base) {
+        Ok(Some(manifest)) => {
+            use crate::platform::process_kill::{process_identity, ProcessIdentity};
+            match process_identity(manifest.pid) {
+                ProcessIdentity::Alive(actual) => Some(actual == manifest.creation_time),
+                ProcessIdentity::Exited => Some(false),
+                ProcessIdentity::Unknown => None,
+            }
+        }
+        Ok(None) => {
+            let port_path = crate::paths::port_file_opt(base)?;
+            pid_anchor_verdict(Path::new(&port_path))
+        }
+        Err(_) => None,
+    }
 }
 
 /// Reap a single session's registry files (`.port`/`.key`/`.sid`) by base name.
@@ -1918,166 +1780,151 @@ pub fn remove_session_registry(base: &str) {
     remove_session_registry_files(Path::new(&port_path));
 }
 
-pub fn send_control(line: String) -> io::Result<()> {
-    let mut target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
-    if env::var("PSMUX_ROUTE_DEBUG").is_ok() {
-        eprintln!("[route] send_control target={:?} full={:?} argv={:?} line={:?}",
-            target, env::var("PSMUX_TARGET_FULL").ok(),
-            env::args().collect::<Vec<_>>(), line.trim());
-    }
-    // Never target a warm (standby) session — resolve to a real session instead
+fn control_target() -> io::Result<String> {
+    let target = env::var("PSMUX_TARGET_SESSION").unwrap_or_else(|_| "default".to_string());
     if is_warm_session(&target) {
-        // Extract namespace from warm session name (e.g. "foo____warm__" -> Some("foo"))
-        let ns = target.strip_suffix("____warm__").map(|s| s.to_string());
-        target = resolve_last_session_name_ns(ns.as_deref()).unwrap_or_else(|| "default".to_string());
-    }
-    let full_target = env::var("PSMUX_TARGET_FULL").ok();
-    let path = crate::paths::port_file(&target);
-    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
-    let session_key = read_session_key(&target).unwrap_or_default();
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-    // 1s connect timeout: a busy-but-alive server must not be mistaken for a
-    // dead one. The old 100ms falsely tripped callers' stale-port cleanup,
-    // deleting the port file of a server that was merely slow to accept.
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(1000))?;
-    let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
-    let _ = write!(stream, "AUTH {}\n", session_key);
-    if let Some(ref ft) = full_target {
-        let _ = write!(stream, "TARGET {}\n", ft);
-    }
-    let _ = write!(stream, "{}", line);
-    // Tier 2 — confirmed EXECUTION (not just delivery): append a `session-info`
-    // barrier. It round-trips through the server's single FIFO event loop, so its
-    // reply proves the command above was actually applied, not merely enqueued.
-    // This makes send_control synchronous and closes races where a caller inspects
-    // the effect immediately after the CLI returns. For commands whose server
-    // handler tears down the connection first (e.g. kill-session), the barrier is
-    // simply never answered — that path is covered by the caller's verify-retry.
-    let _ = write!(stream, "session-info\n");
-    let _ = stream.flush();
-    // Half-close the write side so the server observes EOF *after* our bytes.
-    // TCP guarantees all sent data is delivered before the FIN, so the server's
-    // read_line always sees the full command before its loop ends — eliminating
-    // the RST-on-close race that used to silently drop fire-and-forget commands
-    // (the old 50ms "drain" read was only a partial mitigation).
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    // Read to EOF (bounded by the read timeout): blocks until the server has
-    // processed the barrier — i.e. the command has executed — or the connection
-    // closes / times out.
-    let mut buf = [0u8; 256];
-    loop {
-        match std::io::Read::read(&mut stream, &mut buf) {
-            Ok(0) => break,
-            Ok(_) => continue,
-            Err(_) => break,
+        resolve_last_session_name_ns(session_namespace(&target).as_deref())
+            .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "no user session running"))
+    } else { Ok(target) }
+}
+
+fn targeted_command(line: &str) -> io::Result<Vec<u8>> {
+    let mut command = String::new();
+    if let Ok(full) = env::var("PSMUX_TARGET_FULL") {
+        if full.bytes().any(|b| b == b'\n' || b == b'\r' || b == 0) {
+            return Err(io::Error::new(ErrorKind::InvalidInput, "invalid target"));
         }
+        command.push_str(&format!("TARGET {}\n", full));
+    }
+    command.push_str(line);
+    if !command.ends_with('\n') { command.push('\n'); }
+    Ok(command.into_bytes())
+}
+
+pub fn send_control(line: String) -> io::Result<()> {
+    let target = control_target()?;
+    let (port, key) = read_session_endpoint(&target)?;
+    let mut command = targeted_command(&line)?;
+    command.extend_from_slice(b"session-info\n");
+    let mut response = open_authed(&format!("127.0.0.1:{}", port), &key, &command,
+        Duration::from_millis(1000), Duration::from_millis(3000))?;
+    let body = response.read_all()?;
+    for line in body.lines() {
+        if let Some(error) = protocol_error(line) { return Err(error); }
+    }
+    // A complete session-info reply proves the FIFO event loop passed the
+    // command. EOF after AUTH alone must never report a crashed command as OK.
+    if !body.lines().any(|line| line.contains(" windows (created ")) {
+        return Err(io::Error::new(ErrorKind::UnexpectedEof, "server closed before command completion was confirmed"));
     }
     Ok(())
 }
 
 pub fn send_control_with_response(line: String) -> io::Result<String> {
-    let mut target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
-    if env::var("PSMUX_ROUTE_DEBUG").is_ok() {
-        eprintln!("[route] send_control_with_response target={:?} full={:?} argv={:?} line={:?}",
-            target, env::var("PSMUX_TARGET_FULL").ok(),
-            env::args().collect::<Vec<_>>(), line.trim());
+    let target = control_target()?;
+    let (port, key) = read_session_endpoint(&target)?;
+    let command = targeted_command(&line)?;
+    let mut response = open_authed(&format!("127.0.0.1:{}", port), &key, &command,
+        Duration::from_millis(1000), Duration::from_millis(3000))?;
+    // Pane captures and buffers can be much larger than picker information.
+    response.remaining = 16 * 1024 * 1024;
+    let body = response.read_all()?;
+    let verb = line.split_whitespace().next().unwrap_or("");
+    // These commands carry arbitrary user text, including literal ERROR lines.
+    let arbitrary_text = matches!(verb, "capture-pane" | "capturep" | "show-buffer" | "showb" | "save-buffer" | "saveb");
+    if !arbitrary_text {
+        if let Some(error) = protocol_error(body.trim_end()) { return Err(error); }
     }
-    // Never target a warm (standby) session — resolve to a real session instead
-    if is_warm_session(&target) {
-        let ns = target.strip_suffix("____warm__").map(|s| s.to_string());
-        target = resolve_last_session_name_ns(ns.as_deref()).unwrap_or_else(|| "default".to_string());
+    if body.is_empty() {
+        return Err(io::Error::new(ErrorKind::UnexpectedEof, "server closed without a command response"));
     }
-    let full_target = env::var("PSMUX_TARGET_FULL").ok();
-    let path = crate::paths::port_file(&target);
-    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
-    let session_key = read_session_key(&target).unwrap_or_default();
-    // Bounded connect: against a saturated listen backlog, a bare connect()
-    // fails only after the ~21s Windows SYN-retransmit and surfaces as the
-    // notorious `os error 10060`. A 1s timeout turns that into a fast, retryable
-    // error instead of a multi-second hang printed to the user.
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "bad server address"))?;
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(1000))?;
-    let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(3000)));
-    let _ = write!(stream, "AUTH {}\n", session_key);
-    if let Some(ref ft) = full_target {
-        let _ = write!(stream, "TARGET {}\n", ft);
+    Ok(body)
+}
+
+const MAX_INTERNAL_COMMAND_BYTES: usize = 128 * 1024;
+const MAX_INTERNAL_COMMANDS: usize = 32;
+
+struct QueuedControl {
+    port: u16,
+    command: String,
+    key: String,
+    notify: Option<crate::types::ControlSender>,
+}
+
+fn queue_control_request(queue: &std::sync::mpsc::SyncSender<QueuedControl>, port: u16, msg: &str,
+    key: &str, notify: Option<crate::types::ControlSender>) -> io::Result<()> {
+    if msg.len().saturating_add(key.len()) > MAX_INTERNAL_COMMAND_BYTES {
+        return Err(io::Error::new(ErrorKind::InvalidInput, "internal command exceeds 128 KiB limit"));
     }
-    let _ = write!(stream, "{}", line);
-    let _ = stream.flush();
-    // Half-close so the server sees EOF after our request and closes the socket
-    // once the reply is complete — giving a definitive Ok(0) end-of-response
-    // instead of relying on an idle-gap timeout to guess the reply is done.
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    let mut buf = Vec::new();
-    let mut temp = [0u8; 4096];
-    let mut timed_out = false;
-    loop {
-        match std::io::Read::read(&mut stream, &mut temp) {
-            Ok(0) => break,
-            Ok(n) => buf.extend_from_slice(&temp[..n]),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => { timed_out = true; break; }
-            Err(_) => break,
-        }
-    }
-    let result = String::from_utf8_lossy(&buf).to_string();
-    // Strip the "OK\n" AUTH response prefix if present. This is protocol
-    // framing, not payload — it must come off before the checks below, because
-    // the server writes it before it has even read the command (issue #561).
-    let result = if result.starts_with("OK\n") {
-        result[3..].to_string()
-    } else if result.starts_with("OK\r\n") {
-        result[4..].to_string()
-    } else {
-        result
-    };
-    // A connection-level refusal is not reply data. The server writes these
-    // INSTEAD of running the command (and without the OK ack), but every caller
-    // simply printed the reply, so `list-windows` put "ERROR: Authentication
-    // required" on STDOUT at exit 0 and a machine consumer ingested it as a
-    // window record (issue #561). Classified here, at the single chokepoint,
-    // rather than at the 22 call sites that print the reply.
-    //
-    // Matched as exact whole-payload strings on purpose, NOT as an "ERROR:"
-    // prefix: capture-pane and show-buffer return arbitrary pane content, which
-    // may legitimately begin with the word ERROR, and misreading that as a
-    // refusal would be a worse bug than the one being fixed.
-    let trimmed = result.trim();
-    if trimmed == "ERROR: Authentication required" || trimmed == "ERROR: Invalid session key" {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            trimmed.trim_start_matches("ERROR:").trim().to_string(),
-        ));
-    }
-    // A read timeout means the reply is INCOMPLETE. The half-close above makes a
-    // complete reply end in a definitive server-side EOF (Ok(0)), so landing in
-    // the timeout branch at all means we did not get the whole answer, whatever
-    // is already in `buf`. The old guard also required `buf.is_empty()`, which
-    // the OK ack made permanently false on any authenticated connection, so a
-    // stall returned Ok("") and a truncation returned Ok(partial) at exit 0 —
-    // indistinguishable from an empty result set and from a complete one
-    // (issue #561, cases B and C).
-    if timed_out {
-        return Err(io::Error::new(io::ErrorKind::TimedOut, "no response from server (timed out)"));
-    }
-    Ok(result)
+    validate_auth_key(key).ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "invalid session key"))?;
+    queue.try_send(QueuedControl { port, command: msg.to_string(), key: key.to_string(), notify })
+        .map_err(|e| match e {
+            std::sync::mpsc::TrySendError::Full(_) => io::Error::new(ErrorKind::WouldBlock, "internal command queue is full"),
+            std::sync::mpsc::TrySendError::Disconnected(_) => io::Error::new(ErrorKind::BrokenPipe, "internal command worker stopped"),
+        })
+}
+
+/// Enqueue key bindings/hooks without connecting or waiting on the server's own
+/// event loop. One bounded worker preserves submission order, including across
+/// commands that need an execution acknowledgement before the next is sent.
+pub fn enqueue_control(app: &crate::types::AppState, port: u16, msg: &str) -> io::Result<()> {
+    static QUEUE: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<QueuedControl>>> = std::sync::OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<QueuedControl>(MAX_INTERNAL_COMMANDS);
+        let worker = std::thread::Builder::new().name("psmux-command-worker".into()).spawn(move || {
+            while let Ok(request) = rx.recv() {
+                let result = (|| {
+                    let mut command = request.command.clone();
+                    if !command.ends_with('\n') { command.push('\n'); }
+                    command.push_str("session-info\n");
+                    let mut response = open_authed(&format!("127.0.0.1:{}", request.port), &request.key,
+                        command.as_bytes(), Duration::from_millis(500), Duration::from_millis(3000))?;
+                    let body = response.read_all()?;
+                    for line in body.lines() {
+                        if let Some(error) = protocol_error(line) { return Err(error); }
+                    }
+                    if !body.lines().any(|line| line.contains(" windows (created ")) {
+                        return Err(io::Error::new(ErrorKind::UnexpectedEof, "internal command completion not confirmed"));
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    let message = format!("command failed: {}", error);
+                    crate::debug_log::session_log("command", &message);
+                    if let Some(notify) = request.notify {
+                        // Retry a bounded number of times from the worker, never
+                        // from the event loop, so a busy queue can surface the error.
+                        for _ in 0..20 {
+                            if notify.send(crate::types::CtrlReq::StatusMessage(message.clone())).is_ok() { break; }
+                            std::thread::sleep(Duration::from_millis(25));
+                        }
+                    }
+                }
+            }
+        });
+        worker.ok().map(|_| tx)
+    }).as_ref().ok_or_else(|| io::Error::other("could not start internal command worker"))?;
+    queue_control_request(queue, port, msg, &app.session_key, app.control_tx.clone())
 }
 
 /// Send a control message to a specific port with authentication
 pub fn send_control_to_port(port: u16, msg: &str, session_key: &str) -> io::Result<()> {
-    let addr = format!("127.0.0.1:{}", port);
-    if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {
-        let _ = stream.set_nodelay(true);
-        let _ = write!(stream, "AUTH {}\n", session_key);
-        let _ = stream.write_all(msg.as_bytes());
-        let _ = stream.flush();
-        // Drain the OK response to prevent RST
-        let mut buf = [0u8; 64];
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-        let _ = std::io::Read::read(&mut stream, &mut buf);
-    }
+    let key = validate_auth_key(session_key).ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "invalid session key"))?;
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_millis(500))?;
+    stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let _ = stream.set_nodelay(true);
+    write!(stream, "AUTH {}\n", key)?;
+    stream.write_all(msg.as_bytes())?;
+    if !msg.ends_with('\n') { stream.write_all(b"\n")?; }
+    stream.flush()?;
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut response = AuthedReader { reader: std::io::BufReader::new(stream),
+        remaining: 4096, deadline: std::time::Instant::now() + Duration::from_millis(500) };
+    let ack = response.read_line()?;
+    if let Some(error) = protocol_error(&ack) { return Err(error); }
+    if ack != "OK" { return Err(io::Error::new(ErrorKind::InvalidData, "invalid authentication acknowledgement")); }
     Ok(())
 }
 
@@ -2231,7 +2078,6 @@ pub fn resolve_last_session_name_ns_in(dir: &std::path::Path, ns: Option<&str>) 
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let ns_prefix = ns.map(|n| format!("{}__", n));
 
     // (activity, is_last_session_hint, base): ranked in that order, newest and
     // then hinted first, with the name as a final deterministic tie-break.
@@ -2243,14 +2089,7 @@ pub fn resolve_last_session_name_ns_in(dir: &std::path::Path, ns: Option<&str>) 
         if ext != "port" || is_warm_session(base) {
             continue;
         }
-        // Filter by namespace: -L sessions have "ns__name" format.
-        let in_ns = match ns_prefix {
-            Some(ref prefix) => base.starts_with(prefix.as_str()),
-            None => !base.contains("__"),
-        };
-        if !in_ns {
-            continue;
-        }
+        if !session_visible_from(base, ns) { continue; }
         let activity = session_activity_in(dir, base, e.metadata().ok());
         let hinted = hint.as_deref() == Some(base);
         let better = match best {
@@ -2292,7 +2131,7 @@ pub fn resolve_routing_target(
     if let Some(tmux_val) = tmux_env {
         if let Some(base) = session_base_owning_tmux_port(tmux_val, psmux_dir) {
             let in_namespace = match l_socket_name {
-                Some(ns) => base.starts_with(&format!("{}__", ns)),
+                Some(ns) => session_visible_from(&base, Some(ns)),
                 None => true,
             };
             if in_namespace {
@@ -2306,7 +2145,7 @@ pub fn resolve_routing_target(
     }
     // else a namespaced `X__default` so `-L X` never leaks to the un-namespaced
     // `default` server. With no `-L`, stay unresolved (the caller keeps "default").
-    l_socket_name.map(|ns| format!("{}__default", ns))
+    l_socket_name.map(|ns| crate::paths::storage_base(Some(ns), "default"))
 }
 
 /// Find the session port-file base whose control port matches the one encoded
@@ -2358,30 +2197,22 @@ pub fn list_session_names() -> Vec<String> {
 /// Return session names filtered by namespace (same logic as resolve_last_session_name_ns).
 pub fn list_session_names_ns(ns: Option<&str>) -> Vec<String> {
     let dir = crate::paths::psmux_dir();
-    let mut names = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for e in entries.flatten() {
-            if let Some(fname) = e.file_name().to_str().map(|s| s.to_string()) {
-                if let Some((base, ext)) = fname.rsplit_once('.') {
-                    if ext == "port" {
-                        if is_warm_session(base) { continue; }
-                        // Filter by namespace
-                        match ns {
-                            Some(prefix) => {
-                                if !base.starts_with(&format!("{}__", prefix)) { continue; }
-                            }
-                            None => {
-                                if base.contains("__") { continue; }
-                            }
-                        }
-                        names.push(base.to_string());
-                    }
-                }
+    list_session_names_ns_in(Path::new(&dir), ns)
+}
+
+fn list_session_names_ns_in(dir: &Path, ns: Option<&str>) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else { continue; };
+            let Some(base) = name.strip_suffix(".port").or_else(|| name.strip_suffix(".registry.json")) else { continue; };
+            if !is_warm_session(base) && session_visible_from(base, ns) {
+                names.insert(base.to_string());
             }
         }
     }
-    names.sort();
-    names
+    names.into_iter().collect()
 }
 
 /// A tree entry used by choose-tree: either a session header or a window under a session.
@@ -2416,7 +2247,7 @@ pub fn tree_chooser_sessions_in(
                     // Hide warm (standby) sessions from choose-tree
                     if is_warm_session(stem) { continue; }
                     // Another -L namespace is another server: never listed.
-                    if !session_visible_from(stem, ns) { continue; }
+                    if !session_visible_from(stem, ns.as_deref()) { continue; }
                     if let Ok(port_str) = std::fs::read_to_string(&path) {
                         if let Ok(port) = port_str.trim().parse::<u16>() {
                             let mtime = entry.metadata()
@@ -2549,3 +2380,7 @@ mod tests_issue603_bare_routing;
 #[cfg(test)]
 #[path = "../tests-rs/test_picker_namespace_filter.rs"]
 mod tests_picker_namespace_filter;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_reliability_discovery.rs"]
+mod tests_reliability_discovery;

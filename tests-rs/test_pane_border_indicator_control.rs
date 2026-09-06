@@ -16,10 +16,24 @@ fn assert_indicator_request(request: CtrlReq, expected: &str) {
     }
 }
 
-fn simple_tcp_command(command: &str) -> (String, mpsc::Receiver<CtrlReq>) {
+fn simple_tcp_command(command: &str) -> (String, crate::types::ControlReceiver) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    let (request_tx, request_rx) = mpsc::channel();
+    let (request_tx, request_rx) = crate::types::control_channel();
+    let (observed_tx, observed_rx) = crate::types::control_channel();
+    // Fake the event-loop completion boundary without creating a psmux server.
+    let dispatch = std::thread::spawn(move || {
+        while let Ok(request) = request_rx.recv() {
+            let request = match request {
+                CtrlReq::CommandRequest(request, completion) => {
+                    completion.send(Ok(())).unwrap();
+                    *request
+                }
+                request => request,
+            };
+            observed_tx.send(request).unwrap();
+        }
+    });
     let handler = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
         handle_connection(
@@ -45,11 +59,12 @@ fn simple_tcp_command(command: &str) -> (String, mpsc::Receiver<CtrlReq>) {
     response.clear();
     reader.read_to_string(&mut response).unwrap();
     handler.join().unwrap();
-    (response, request_rx)
+    dispatch.join().unwrap();
+    (response, observed_rx)
 }
 
 fn rejected_control_command(command: &str, args: &[&str]) -> String {
-    let (request_tx, request_rx) = mpsc::channel();
+    let (request_tx, request_rx) = crate::types::control_channel();
     let (response_tx, response_rx) = mpsc::channel();
     assert!(dispatch_control_command(
         command,
@@ -344,7 +359,7 @@ fn persistent_control_accepts_global_window_forms() {
             "both",
         ),
     ] {
-        let (request_tx, request_rx) = mpsc::channel();
+        let (request_tx, request_rx) = crate::types::control_channel();
         let (response_tx, response_rx) = mpsc::channel();
         assert!(dispatch_control_command(
             command,

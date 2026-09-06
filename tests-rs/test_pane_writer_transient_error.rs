@@ -91,13 +91,13 @@ fn transient_write_error_keeps_the_writer_alive() {
 
     // The first write hits the injected failure inside the writer thread.
     assert_eq!(queue.write(b"first").unwrap(), 5, "enqueue must still succeed");
-    // A later write is consumed by the still-alive thread.
-    assert_eq!(queue.write(b"second").unwrap(), 6);
+    // Later writes must report the asynchronous failure, while retaining the handle.
 
     assert!(
         wait_until("failing write attempted", || attempts.load(Ordering::SeqCst) >= 1, Duration::from_secs(5)),
         "the writer thread must attempt the queued write"
     );
+    assert_eq!(queue.write(b"second").unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
     // Exactly one attempt: the failure stops further writes instead of
     // starting a retry storm.
     std::thread::sleep(Duration::from_millis(200));
@@ -119,11 +119,10 @@ fn transient_write_error_keeps_the_writer_alive() {
     );
 }
 
-/// After a failure the thread stays alive but sheds further writes (the
-/// documented "a failed write only stops further writes" contract): no
-/// panic, no delivery, no release.
+/// After a failure the thread retains the PTY handle but rejects further
+/// writes with the observed error instead of silently consuming their bytes.
 #[test]
-fn writes_after_a_failure_are_consumed_without_delivery_or_release() {
+fn writes_after_a_failure_report_error_without_releasing_handle() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let dropped = Arc::new(AtomicBool::new(false));
@@ -136,12 +135,13 @@ fn writes_after_a_failure_are_consumed_without_delivery_or_release() {
 
     let mut queue = spawn_pane_write_queue(Box::new(inner));
     assert_eq!(queue.write(b"boom").unwrap(), 4); // fails inside the thread
-    assert_eq!(queue.write(b"after").unwrap(), 5); // consumed, not delivered
 
     assert!(
         wait_until("failure attempted", || attempts.load(Ordering::SeqCst) >= 1, Duration::from_secs(5))
     );
-    // Give the thread time to process the second write, then check state.
+    assert_eq!(queue.write(b"after").unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+    assert!(queue.flush().is_err());
+    // Verify no retry storm and retain the PTY handle.
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(
         attempts.load(Ordering::SeqCst),
@@ -185,11 +185,11 @@ fn writes_before_the_failure_are_delivered() {
     );
 
     assert_eq!(queue.write(b"boom").unwrap(), 4); // fails inside the thread
-    assert_eq!(queue.write(b"after").unwrap(), 5); // consumed, not delivered
 
     assert!(
         wait_until("failure attempted", || attempts.load(Ordering::SeqCst) >= 2, Duration::from_secs(5))
     );
+    assert_eq!(queue.write(b"after").unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(
         attempts.load(Ordering::SeqCst),

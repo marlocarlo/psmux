@@ -7,6 +7,366 @@ use crate::types::{
     ControlNotification, CtrlReq, LayoutKind, WaitForOp, WindowDumpFormat,
 };
 
+const MAX_WIRE_LINE: usize = 1024 * 1024;
+
+const MAX_CONNECTIONS: usize = 128;
+static CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub(super) struct ConnectionPermit;
+impl ConnectionPermit {
+    pub(super) fn acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        CONNECTIONS.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+            |count| (count < MAX_CONNECTIONS).then_some(count + 1)).ok().map(|_| Self)
+    }
+}
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) { CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel); }
+}
+
+/// Retain fragmented commands across socket timeouts without exposing a
+/// partial command to the dispatcher. Bound allocation before copying bytes.
+struct BoundedLines<R: io::Read> {
+    reader: io::BufReader<R>,
+    pending: Vec<u8>,
+    started: Option<std::time::Instant>,
+}
+impl<R: io::Read> BoundedLines<R> {
+    fn new(reader: R) -> Self { Self { reader: io::BufReader::new(reader), pending: Vec::new(), started: None } }
+    fn get_ref(&self) -> &R { self.reader.get_ref() }
+    fn read_line(&mut self, output: &mut String) -> io::Result<usize> {
+        loop {
+            if self.started.is_some_and(|start| start.elapsed() > Duration::from_secs(10)) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "incomplete command exceeded deadline"));
+            }
+            let available = self.reader.fill_buf()?;
+            if available.is_empty() {
+                return if self.pending.is_empty() { Ok(0) } else {
+                    Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete command"))
+                };
+            }
+            let newline = available.iter().position(|b| *b == b'\n');
+            let count = newline.map_or(available.len(), |i| i + 1);
+            if self.pending.len().saturating_add(count) > MAX_WIRE_LINE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "command exceeds 1 MiB limit"));
+            }
+            self.started.get_or_insert_with(std::time::Instant::now);
+            self.pending.extend_from_slice(&available[..count]);
+            self.reader.consume(count);
+            if newline.is_some() {
+                let line = std::str::from_utf8(&self.pending)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "command is not UTF-8"))?;
+                output.push_str(line);
+                let count = self.pending.len();
+                self.pending.clear();
+                self.started = None;
+                return Ok(count);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod bounded_wire_tests {
+    use super::*;
+
+    #[test]
+    fn connection_admission_is_bounded_and_reusable() {
+        let mut permits = Vec::new();
+        for _ in 0..MAX_CONNECTIONS { permits.push(ConnectionPermit::acquire().unwrap()); }
+        assert!(ConnectionPermit::acquire().is_none());
+        permits.pop();
+        assert!(ConnectionPermit::acquire().is_some());
+        drop(permits);
+        assert_eq!(CONNECTIONS.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn oversized_and_truncated_commands_never_reach_dispatch() {
+        let mut reader = BoundedLines::new(io::Cursor::new(vec![b'x'; MAX_WIRE_LINE + 1]));
+        let mut line = String::new();
+        assert_eq!(reader.read_line(&mut line).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(line.is_empty());
+        assert!(reader.pending.len() <= MAX_WIRE_LINE);
+        let mut reader = BoundedLines::new(io::Cursor::new(b"send-keys partial"));
+        assert_eq!(reader.read_line(&mut line).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert!(line.is_empty());
+    }
+
+    #[test]
+    fn complete_lines_are_separate_and_utf8_is_validated() {
+        let mut reader = BoundedLines::new(io::Cursor::new(b"first\nsecond\n"));
+        let mut line = String::new();
+        assert_eq!(reader.read_line(&mut line).unwrap(), 6);
+        assert_eq!(line, "first\n");
+        line.clear();
+        assert_eq!(reader.read_line(&mut line).unwrap(), 7);
+        assert_eq!(line, "second\n");
+        let mut reader = BoundedLines::new(io::Cursor::new([0xff, b'\n']));
+        line.clear();
+        assert!(reader.read_line(&mut line).is_err());
+        assert!(line.is_empty());
+    }
+
+    #[test]
+    fn socket_timeouts_preserve_partial_command() {
+        struct Fragmented { reads: usize }
+        impl io::Read for Fragmented {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                let data = match self.reads {
+                    1 => b"send-".as_slice(),
+                    2 => return Err(io::ErrorKind::TimedOut.into()),
+                    3 => b"keys\n".as_slice(),
+                    _ => return Ok(0),
+                };
+                buffer[..data.len()].copy_from_slice(data);
+                Ok(data.len())
+            }
+        }
+        let mut reader = BoundedLines::new(Fragmented { reads: 0 });
+        let mut line = String::new();
+        assert_eq!(reader.read_line(&mut line).unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(line.is_empty());
+        assert_eq!(reader.read_line(&mut line).unwrap(), 10);
+        assert_eq!(line, "send-keys\n");
+    }
+}
+
+/// Every request has its own completion channel. Waiting on the submitting
+/// connection provides backpressure and keeps errors attached to that client;
+/// a global "last error" or a later unrelated barrier could steal an error.
+#[derive(Clone)]
+struct RequestSender {
+    inner: crate::types::ControlSender,
+    errors: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    error_stream: std::sync::Arc<std::sync::Mutex<TcpStream>>,
+    control_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    persistent_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+trait RequestDispatch {
+    fn send(&self, request: CtrlReq) -> Result<(), String>;
+}
+
+/// The connection handler runs inside the server process, whose startup has
+/// resolved PSMUX_SOCKET_NAME. Keep logical names separate from registry bases.
+fn new_session_destination(
+    namespace: Option<&str>,
+    requested_name: Option<String>,
+    next_name: impl FnOnce(Option<&str>) -> String,
+) -> io::Result<(String, String)> {
+    let name = requested_name.unwrap_or_else(|| next_name(namespace));
+    crate::paths::validate_registry_base(namespace, &name)?;
+    Ok((name.clone(), crate::paths::storage_base(namespace, &name)))
+}
+
+fn spawned_session_manifest_matches(
+    manifest: &crate::registry::RegistryManifest,
+    spawned_pid: u32,
+    creation_time: u64,
+) -> bool {
+    creation_time != 0 && manifest.pid == spawned_pid && manifest.creation_time == creation_time
+}
+
+fn kill_session_target_base(
+    namespace: Option<&str>, target: &str,
+    resolve_id: impl FnOnce(usize) -> Option<String>,
+) -> io::Result<String> {
+    let target = crate::cli::strip_exact_match_prefix(target);
+    let session = target.split(':').next().unwrap_or("");
+    if session.is_empty() || session.starts_with('%') || session.starts_with('@') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "kill-session requires an explicit session name or ID"));
+    }
+    if let Some(id) = session.strip_prefix('$') {
+        let id = id.parse::<usize>().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid session ID"))?;
+        let base = resolve_id(id).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "session ID not found"))?;
+        if !crate::paths::registry_visible_from(&base, namespace) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "session ID not found in current namespace"));
+        }
+        return Ok(base);
+    }
+    crate::paths::validate_registry_base(namespace, session)?;
+    Ok(crate::paths::storage_base(namespace, session))
+}
+
+/// An explicit target either resolves in this namespace or fails. It can
+/// never fall through to terminating the current session.
+fn route_kill_session(
+    tx: &impl RequestDispatch, target: Option<&str>, namespace: Option<&str>,
+    endpoint: impl FnOnce(&str) -> io::Result<(u16, String)>,
+    kill_endpoint: impl FnOnce(u16, &str) -> io::Result<()>,
+) -> io::Result<()> {
+    if let Some(target) = target {
+        let base = kill_session_target_base(namespace, target, crate::session::resolve_session_by_id)?;
+        let (port, key) = endpoint(&base).map_err(|error| io::Error::new(error.kind(),
+            format!("can't resolve session '{}': {}", target, error)))?;
+        kill_endpoint(port, &key)
+    } else {
+        tx.send(CtrlReq::KillSession).map_err(io::Error::other)
+    }
+}
+
+fn kill_session_request(tx: &impl RequestDispatch, target: Option<&str>) -> io::Result<()> {
+    let namespace = std::env::var("PSMUX_SOCKET_NAME").ok().filter(|value| !value.is_empty());
+    route_kill_session(tx, target, namespace.as_deref(), crate::session::read_session_endpoint,
+        |port, key| {
+            let response = crate::session::query_authed_line(&format!("127.0.0.1:{}", port), key,
+                b"kill-session\n", Duration::from_millis(500), Duration::from_secs(2))?;
+            if response == "OK" { Ok(()) }
+            else { Err(io::Error::new(io::ErrorKind::InvalidData, "session termination was not acknowledged")) }
+        })
+}
+
+fn has_session_request(tx: &impl RequestDispatch) -> io::Result<()> {
+    let (reply, receiver) = mpsc::channel();
+    tx.send(CtrlReq::HasSession(reply)).map_err(io::Error::other)?;
+    match receiver.recv_timeout(Duration::from_secs(5)) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(io::Error::new(io::ErrorKind::NotFound, "session not found")),
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "session existence was not confirmed")),
+    }
+}
+
+#[cfg(test)]
+mod session_command_routing_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_kill_target_is_encoded_in_current_namespace() {
+        let (tx, rx) = mpsc::channel();
+        route_kill_session(&tx, Some("=worker__one"), Some("team"), |base| {
+            assert_eq!(base, crate::paths::storage_base(Some("team"), "worker__one"));
+            Ok((1234, "key".into()))
+        }, |port, key| { assert_eq!((port, key), (1234, "key")); Ok(()) }).unwrap();
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn unresolved_explicit_kill_never_terminates_current_session() {
+        let (tx, rx) = mpsc::channel();
+        let result = route_kill_session(&tx, Some("missing"), Some("team"), |_| {
+            Err(io::ErrorKind::NotFound.into())
+        }, |_, _| panic!("unresolved endpoint must never be used"));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn only_omitted_target_terminates_current_session() {
+        let (tx, rx) = mpsc::channel();
+        route_kill_session(&tx, None, Some("team"), |_| panic!("no lookup"), |_, _| panic!("no forwarding")).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), CtrlReq::KillSession));
+        assert!(kill_session_target_base(Some("team"), ":0", |_| None).is_err());
+        assert!(kill_session_target_base(Some("team"), "$999", |_| None).is_err());
+    }
+
+    #[test]
+    fn numeric_session_id_cannot_cross_namespace() {
+        let foreign = crate::paths::storage_base(None, "worker");
+        assert!(kill_session_target_base(Some("team"), "$4", |_| Some(foreign)).is_err());
+        let same = crate::paths::storage_base(Some("team"), "worker");
+        assert_eq!(kill_session_target_base(Some("team"), "$4", |_| Some(same.clone())).unwrap(), same);
+    }
+
+    #[test]
+    fn negative_has_session_is_a_request_error_not_process_exit() {
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || match rx.recv().unwrap() {
+            CtrlReq::HasSession(reply) => reply.send(false).unwrap(),
+            _ => panic!("expected HasSession"),
+        });
+        assert_eq!(has_session_request(&tx).unwrap_err().kind(), io::ErrorKind::NotFound);
+        worker.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod new_session_destination_tests {
+    use super::*;
+
+    #[test]
+    fn automatic_name_uses_the_inherited_namespace() {
+        let (name, base) = new_session_destination(Some("team__one"), None, |namespace| {
+            assert_eq!(namespace, Some("team__one"));
+            "4".into()
+        }).unwrap();
+        assert_eq!(name, "4");
+        assert_eq!(base, crate::paths::storage_base(Some("team__one"), "4"));
+        assert_ne!(base, crate::paths::storage_base(None, "4"));
+    }
+
+    #[test]
+    fn explicit_name_is_validated_and_encoded_without_allocating() {
+        let (name, base) = new_session_destination(Some("team"), Some("work__one".into()), |_| {
+            panic!("explicit name must not allocate a numeric name")
+        }).unwrap();
+        assert_eq!(name, "work__one");
+        assert_eq!(base, crate::paths::storage_base(Some("team"), "work__one"));
+        assert!(new_session_destination(Some("team"), Some("bad\nname".into()), |_| "0".into()).is_err());
+    }
+
+    #[test]
+    fn existing_or_recycled_pid_cannot_confirm_a_new_spawn() {
+        let manifest = crate::registry::RegistryManifest {
+            pid: 42, creation_time: 100, generation: "generation".into(),
+            port: 1234, key: "key".into(), sid: 1,
+        };
+        assert!(spawned_session_manifest_matches(&manifest, 42, 100));
+        assert!(!spawned_session_manifest_matches(&manifest, 43, 100));
+        assert!(!spawned_session_manifest_matches(&manifest, 42, 101));
+        assert!(!spawned_session_manifest_matches(&manifest, 42, 0));
+    }
+}
+impl RequestDispatch for RequestSender {
+    fn send(&self, request: CtrlReq) -> Result<(), String> { RequestSender::send(self, request) }
+}
+#[cfg(test)]
+impl RequestDispatch for mpsc::Sender<CtrlReq> {
+    fn send(&self, request: CtrlReq) -> Result<(), String> {
+        mpsc::Sender::send(self, request).map_err(|_| "test receiver closed".into())
+    }
+}
+#[cfg(test)]
+impl RequestDispatch for crate::types::ControlSender {
+    fn send(&self, request: CtrlReq) -> Result<(), String> {
+        crate::types::ControlSender::send(self, request).map_err(|_| "test queue unavailable".into())
+    }
+}
+impl RequestSender {
+    fn send(&self, req: CtrlReq) -> Result<(), String> {
+        let shutdown = matches!(req, CtrlReq::KillServer | CtrlReq::KillSession);
+        let (done, receiver) = mpsc::channel();
+        let result = if shutdown {
+            self.inner.send(req).map_err(|_| "server busy or unavailable; request was not accepted".to_string())
+        } else if self.inner.send(CtrlReq::CommandRequest(Box::new(req), done)).is_err() {
+            Err("server busy or unavailable; request was not accepted".to_string())
+        } else {
+            receiver.recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| Err("server did not acknowledge request; outcome is unknown".to_string()))
+        };
+        if let Err(error) = &result {
+            if self.control_mode.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(mut errors) = self.errors.lock() { errors.push(error.clone()); }
+            } else if self.persistent_mode.load(std::sync::atomic::Ordering::Relaxed) {
+                // Frames have a dedicated socket writer. Never inject ERROR
+                // bytes through another clone in the middle of a JSON frame.
+                if self.inner.send(CtrlReq::StatusMessage(error.clone())).is_err() {
+                    if let Ok(stream) = self.error_stream.lock() {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                    }
+                }
+            } else if let Ok(mut stream) = self.error_stream.lock() {
+                let _ = writeln!(stream, "ERROR: {}", error.replace(['\r', '\n'], " "));
+                let _ = stream.flush();
+            }
+        }
+        result
+    }
+    fn take_error(&self) -> Option<String> {
+        let mut errors = self.errors.lock().ok()?;
+        if errors.is_empty() { None } else { Some(std::mem::take(&mut *errors).join("; ")) }
+    }
+}
+
 /// Clear HANDLE_FLAG_INHERIT on a connection socket (see the comment at the
 /// clone sites in `handle_connection`). No-op off Windows.
 #[cfg(windows)]
@@ -34,7 +394,7 @@ fn clear_inherit(_s: &TcpStream) {}
 /// server thread to expand it with the same CtrlReq the bind-key path uses.
 /// Without `-F`, or for an empty value, this is the identity.
 fn expand_set_option_value(
-    tx: &mpsc::Sender<CtrlReq>,
+    tx: &impl RequestDispatch,
     format_expand: bool,
     value: String,
 ) -> String {
@@ -412,7 +772,7 @@ fn parse_new_pane_args(args: &[&str]) -> ParsedNewPane {
 /// to the main server event loop via the `tx` channel.
 pub(crate) fn handle_connection(
     stream: TcpStream,
-    tx: mpsc::Sender<CtrlReq>,
+    tx: crate::types::ControlSender,
     session_key: &str,
     aliases: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
 ) {
@@ -434,10 +794,16 @@ let mut write_stream = match stream.try_clone() {
 // each one where it is made.
 clear_inherit(&stream);
 clear_inherit(&write_stream);
+let error_stream = match write_stream.try_clone() { Ok(s) => s, Err(_) => return };
+clear_inherit(&error_stream);
+let _ = error_stream.set_write_timeout(Some(Duration::from_secs(5)));
+let tx = RequestSender { inner: tx, errors: Default::default(),
+    error_stream: std::sync::Arc::new(std::sync::Mutex::new(error_stream)),
+    control_mode: Default::default(), persistent_mode: Default::default() };
 
 // Set initial timeout for auth (reduced from 5s - client sends immediately)
 let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
-let mut r = io::BufReader::new(stream);
+let mut r = BoundedLines::new(stream);
 
 // Read the authentication line
 let mut auth_line = String::new();
@@ -475,7 +841,7 @@ let _ = r.get_ref().set_read_timeout(Some(Duration::from_millis(2000)));
 
 // Check for PERSISTENT flag and optional TARGET line
 let mut persistent = false;
-let mut resp_tx_opt: Option<mpsc::Sender<mpsc::Receiver<String>>> = None;
+let mut resp_tx_opt: Option<mpsc::SyncSender<mpsc::Receiver<String>>> = None;
 let mut global_target_win: Option<usize> = None;
 let mut global_target_win_is_id = false;
 let mut global_target_win_name: Option<String> = None;
@@ -489,6 +855,7 @@ if r.read_line(&mut line).is_err() {
 // Check if client requests persistent connection mode
 if line.trim() == "PERSISTENT" {
     persistent = true;
+    tx.persistent_mode.store(true, std::sync::atomic::Ordering::Relaxed);
     // Enable TCP_NODELAY for low-latency persistent connections
     let _ = r.get_ref().set_nodelay(true);
     let _ = write_stream.set_nodelay(true);
@@ -511,7 +878,7 @@ if line.trim() == "PERSISTENT" {
     // timeout, a full socket causes write() to block forever, silently
     // freezing frame delivery. 5 s matches the command-response timeout.
     let _ = ws_bg.set_write_timeout(Some(Duration::from_secs(5)));
-    let (resp_tx, resp_rx) = mpsc::channel::<mpsc::Receiver<String>>();
+    let (resp_tx, resp_rx) = mpsc::sync_channel::<mpsc::Receiver<String>>(64);
 
     // Register a frame slot for server-pushed frames (event-driven rendering).
     // Slot holds at most one pending frame; push_frame() overwrites any
@@ -552,7 +919,7 @@ if line.trim() == "PERSISTENT" {
         // same `client_id` the second one is a harmless no-op. The client
         // reconnects under a *new* `client_id`, so reaping the old id here does
         // not remove the live reconnected client.
-        struct Guard { client_id: u64, shutdown: std::net::TcpStream, tx: mpsc::Sender<CtrlReq> }
+        struct Guard { client_id: u64, shutdown: std::net::TcpStream, tx: RequestSender }
         impl Drop for Guard {
             fn drop(&mut self) {
                 let _ = self.shutdown.shutdown(std::net::Shutdown::Both);
@@ -571,7 +938,8 @@ if line.trim() == "PERSISTENT" {
             // starve frame delivery.
 
             // 0. Drain queued directives (non-blocking).
-            while let Ok(directive) = directive_rx.try_recv() {
+            for _ in 0..16 {
+                let Ok(directive) = directive_rx.try_recv() else { break; };
                 if write!(ws_bg, "{}\n", directive).is_err() { return; }
                 if ws_bg.flush().is_err() { return; }
             }
@@ -591,7 +959,8 @@ if line.trim() == "PERSISTENT" {
                         }
                         Err(_) => return,
                     }
-                    while let Ok(rrx) = resp_rx.try_recv() {
+                    for _ in 0..16 {
+                        let Ok(rrx) = resp_rx.try_recv() else { break; };
                         match rrx.recv_timeout(Duration::from_secs(5)) {
                             Ok(text) => {
                                 if write!(ws_bg, "{}\n", text).is_err() { return; }
@@ -630,7 +999,7 @@ if control_echo || control_noecho {
     let ctrl_client_id = crate::types::next_client_id();
     crate::types::register_persistent_stream(ctrl_client_id, &write_stream);
 
-    let (notif_tx, notif_rx) = std::sync::mpsc::sync_channel::<ControlNotification>(4096);
+    let (notif_tx, notif_rx) = std::sync::mpsc::sync_channel::<ControlNotification>(128);
 
     // Wrap the write stream in a mutex so that the notification writer
     // thread and the command-response loop never interleave bytes on
@@ -703,6 +1072,7 @@ if control_echo || control_noecho {
     });
 
     // Control mode command loop: read lines, dispatch, wrap in %begin/%end/%error
+    tx.control_mode.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut cmd_counter: u64 = 0;
     let tx_ctrl = tx.clone();
     let aliases_ctrl = aliases.clone();
@@ -864,7 +1234,7 @@ if control_echo || control_noecho {
         let skip_target_focus = matches!(cmd_name, "join-pane" | "joinp" | "move-pane" | "movep"
             | "move-window" | "movew" | "swap-window" | "swapw"
             | "switch-client" | "switchc" | "resize-window" | "resizew"
-            | "kill-window" | "killw" | "detach-client" | "detach");
+            | "kill-window" | "killw" | "detach-client" | "detach" | "kill-session" | "kill-ses");
         // capture-pane -t %N resolves the pane id inside the capture itself;
         // swap-pane resolves its own target and swaps it with the *current*
         // active pane (temp-focusing the target would make active == target
@@ -919,7 +1289,7 @@ if control_echo || control_noecho {
 
         // Dispatch command (use a oneshot for the response)
         let (resp_s, resp_r) = mpsc::channel::<String>();
-        let response_result = if let Some(err) = focus_err {
+        let mut response_result = if let Some(err) = focus_err {
             // Unresolvable -t target: skip dispatch entirely and surface
             // the diagnostic through the %error path (sentinel encoding,
             // same as dispatcher-signalled errors).
@@ -938,6 +1308,10 @@ if control_echo || control_noecho {
                 None
             }
         };
+
+        if let Some(error) = tx_ctrl.take_error() {
+            response_result = Some(Ok(format!("\u{0001}ERR\u{0001}{}", error)));
+        }
 
         // Acquire write lock for the ENTIRE %begin … %end sequence so
         // notifications from the notification thread never interleave
@@ -1172,7 +1546,7 @@ let is_focus_cmd = matches!(cmd, "select-window" | "selectw" | "select-pane" | "
 let skip_target_focus = matches!(cmd, "join-pane" | "joinp" | "move-pane" | "movep"
     | "move-window" | "movew" | "swap-window" | "swapw"
     | "switch-client" | "switchc" | "resize-window" | "resizew"
-    | "kill-window" | "killw" | "detach-client" | "detach");
+    | "kill-window" | "killw" | "detach-client" | "detach" | "kill-session" | "kill-ses");
 let targeted_kill_pane_id = if matches!(cmd, "kill-pane" | "killp") && pane_is_id {
     target_pane
 } else {
@@ -1411,7 +1785,10 @@ match cmd {
         if let Some(ref rtx_bg) = resp_tx_opt {
             // Persistent mode: hand off to writer thread (non-blocking).
             // This lets the read loop keep processing keys immediately.
-            let _ = rtx_bg.send(rrx);
+            if rtx_bg.try_send(rrx).is_err() {
+                crate::types::shutdown_client_stream(client_id);
+                return;
+            }
         } else {
             // One-shot mode: block and respond inline
             if let Ok(text) = rrx.recv() { 
@@ -1889,43 +2266,20 @@ match cmd {
         }
     }
     "kill-session" | "kill-ses" => {
-        // If -t <target> is given, kill that session instead of self.
-        // The target may be specified without the -L socket-name namespace
-        // prefix (e.g. "worker1" instead of "ns1__worker1"), so if the raw
-        // path is missing we ask our own server for its session name and
-        // fall through to KillSession when raw_target matches us.
-        if let Some(ref tgt) = raw_target {
-            let port_path = crate::paths::port_file(tgt);
-            let mut handled = false;
-            if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                if let Ok(port) = port_str.trim().parse::<u16>() {
-                    let key = crate::session::read_session_key(tgt).unwrap_or_default();
-                    let _ = crate::session::send_control_to_port(port, "kill-session\n", &key);
-                    handled = true;
-                }
-            }
-            if !handled {
-                // Query our own session name. If it matches the target
-                // (in-namespace name), kill self. Otherwise the target
-                // simply does not exist on this server.
-                let (rtx, rrx) = mpsc::channel::<String>();
-                let _ = tx.send(CtrlReq::SessionInfo(rtx));
-                if let Ok(line) = rrx.recv() {
-                    let self_name = line.split(':').next().unwrap_or("").trim();
-                    if !self_name.is_empty() && self_name == tgt {
-                        let _ = tx.send(CtrlReq::KillSession);
-                    }
-                }
-            }
-        } else {
-            let _ = tx.send(CtrlReq::KillSession);
+        match kill_session_request(&tx, raw_target.as_deref()) {
+            Ok(()) if !persistent => { let _ = writeln!(write_stream, "OK"); let _ = write_stream.flush(); }
+            Ok(()) => {},
+            Err(error) if persistent => { let _ = tx.send(CtrlReq::StatusMessage(error.to_string())); }
+            Err(error) => { let _ = writeln!(write_stream, "ERROR: {}", error); let _ = write_stream.flush(); }
         }
+        if !persistent { break; }
     }
     "has-session" => {
-        let (rtx, rrx) = mpsc::channel::<bool>();
-        let _ = tx.send(CtrlReq::HasSession(rtx));
-        if let Ok(exists) = rrx.recv() {
-            if !exists { std::process::exit(1); }
+        match has_session_request(&tx) {
+            Ok(()) if !persistent => { let _ = writeln!(write_stream, "OK"); let _ = write_stream.flush(); }
+            Ok(()) => {},
+            Err(error) if persistent => { let _ = tx.send(CtrlReq::StatusMessage(error.to_string())); }
+            Err(error) => { let _ = writeln!(write_stream, "ERROR: {}", error); let _ = write_stream.flush(); }
         }
     }
     "rename-session" | "rename" => {
@@ -3039,24 +3393,21 @@ match cmd {
         } else {
             (stdin_flag, stdout_flag)
         };
-        // Same reply shape as #559/#566: a direct file sink that cannot be
-        // opened must reach the caller as a non-zero exit, not a silent
-        // rc-0 no-op. The handler answers "" on acceptance; only an
-        // "ERROR: ..." reply is forwarded.
+        // Even an empty success needs a complete frame. EOF immediately after
+        // AUTH cannot distinguish acceptance from a server that crashed.
         let (rtx, rrx) = mpsc::channel::<String>();
         let _ = tx.send(CtrlReq::PipePane(cmd, stdin, stdout, toggle, Some(rtx)));
-        let resp = rrx.recv_timeout(Duration::from_millis(2000)).unwrap_or_default();
+        let resp = rrx.recv_timeout(Duration::from_millis(2000))
+            .unwrap_or_else(|_| "ERROR: pipe-pane did not return an outcome".to_string());
         if !persistent {
-            if !resp.is_empty() {
-                let _ = write!(write_stream, "{}\n", resp);
-                let _ = write_stream.flush();
-            }
+            let _ = writeln!(write_stream, "{}", resp);
+            let _ = write_stream.flush();
             // pipe-pane can sit in the middle of a chained line
             // (`pipe-pane -o ... \; display-message ...`); breaking with
             // queued sub-commands would silently drop the rest of the
             // chain. With no chain pending, the client's half-close ends
             // the loop on the next read anyway.
-            if pending_chain.is_empty() { break; }
+            // Also read any subsequent completion barrier sent on this socket.
         }
     }
     "select-layout" | "selectl" => {
@@ -3750,7 +4101,7 @@ match cmd {
             }
 
             if let Some(ref err) = env_parse_err {
-                let msg = format!("psmux: {}\n", err);
+                let msg = format!("ERROR: {}\n", err);
                 if persistent {
                     let _ = tx.send(CtrlReq::StatusMessage(msg.trim().to_string()));
                 } else {
@@ -3760,37 +4111,31 @@ match cmd {
                 if !persistent { break; }
             } else {
 
-            // Note: socket_name (from -L flag) is not directly available here;
-            // the client-side handler in commands.rs has it via app.socket_name.
-            let name = sess_name.unwrap_or_else(|| crate::session::next_session_name(None));
-
-            let port_file_base = name.clone();
-
-            let port_path = crate::paths::port_file(&port_file_base);
-
-            // Check if session already exists
-            let already_exists = if std::path::Path::new(&port_path).exists() {
-                if let Ok(port_str) = std::fs::read_to_string(&port_path) {
-                    if let Ok(port) = port_str.trim().parse::<u16>() {
-                        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
-                        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100)).is_ok()
-                    } else { false }
-                } else { false }
-            } else { false };
-
-            if already_exists {
-                if persistent {
-                    let _ = tx.send(CtrlReq::StatusMessage(format!("session '{}' already exists", name)));
-                } else {
-                    let _ = write!(write_stream, "session '{}' already exists\n", name);
-                    let _ = write_stream.flush();
-                    break;
+            let namespace = std::env::var("PSMUX_SOCKET_NAME").ok().filter(|value| !value.is_empty());
+            let create_result = (|| -> io::Result<String> {
+                let (name, port_file_base) = new_session_destination(
+                    namespace.as_deref(), sess_name, crate::session::next_session_name)?;
+                let has_registration = crate::registry::manifest_path(&port_file_base).exists()
+                    || std::path::Path::new(&crate::paths::port_file(&port_file_base)).exists()
+                    || std::path::Path::new(&crate::paths::pid_file(&port_file_base)).exists();
+                if has_registration {
+                    match crate::session::existing_session_state(&port_file_base) {
+                        crate::session::SessionLiveness::Dead => {},
+                        crate::session::SessionLiveness::Alive(_) => return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists, format!("session '{}' already exists", name))),
+                        _ => return Err(io::Error::new(io::ErrorKind::WouldBlock,
+                            format!("session '{}' is registered but not responding; registration preserved", name))),
+                    }
                 }
-            } else {
-                // Spawn new server
-                let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("psmux"));
+                // The child reserves the name before publication. If another
+                // creator wins this race, its manifest must never count as our
+                // successful spawn below.
+                let exe = std::env::current_exe()?;
                 let mut server_args: Vec<String> = vec!["server".into(), "-s".into(), name.clone()];
-
+                if let Some(namespace) = namespace.as_ref() {
+                    server_args.push("-L".into());
+                    server_args.push(namespace.clone());
+                }
                 if let Some(ref dir) = start_dir {
                     server_args.push("-d".into());
                     server_args.push(dir.clone());
@@ -3819,41 +4164,69 @@ match cmd {
                     server_args.push(format!("{}={}", k, v));
                 }
                 #[cfg(windows)]
-                { let _ = crate::platform::spawn_server_hidden(&exe, &server_args); }
+                let spawned_pid = crate::platform::spawn_server_hidden(&exe, &server_args)?;
                 #[cfg(not(windows))]
-                {
-                    let mut cmd_proc = std::process::Command::new(&exe);
-                    for a in &server_args { cmd_proc.arg(a); }
-                    cmd_proc.stdin(std::process::Stdio::null());
-                    cmd_proc.stdout(std::process::Stdio::null());
-                    cmd_proc.stderr(std::process::Stdio::null());
-                    let _ = cmd_proc.spawn();
-                }
-
-                // Wait for port file
-                for _ in 0..500 {
-                    if std::path::Path::new(&port_path).exists() { break; }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-
-                if std::path::Path::new(&port_path).exists() {
-                    if !detached {
-                        // In-process follow-up to a new-session: nobody is waiting
-                        // on a switch result here, the reply for this command has
-                        // already been decided below.
-                        let _ = tx.send(CtrlReq::SwitchClient(name.clone(), 't', None));
+                let spawned_pid = {
+                    let mut command = std::process::Command::new(&exe);
+                    command.args(&server_args).stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+                    command.spawn()?.id()
+                };
+                let creation_time = crate::platform::process_kill::process_creation_time(spawned_pid)
+                    .filter(|created| *created != 0).ok_or_else(|| io::Error::other(
+                        format!("cannot verify newly spawned session '{}'; outcome is unknown", name)))?;
+                let deadline = std::time::Instant::now() + Duration::from_secs(15);
+                loop {
+                    if crate::platform::process_kill::verified_process_dead(spawned_pid, creation_time) {
+                        return Err(io::Error::other(format!("new session '{}' exited before becoming ready", name)));
                     }
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(io::Error::new(io::ErrorKind::TimedOut,
+                            format!("new session '{}' did not become ready; outcome is unknown, registration preserved", name)));
+                    }
+                    if let Some(manifest) = crate::registry::read_manifest(&port_file_base)? {
+                        if spawned_session_manifest_matches(&manifest, spawned_pid, creation_time) {
+                            let address = format!("127.0.0.1:{}", manifest.port);
+                            // AUTH alone only confirms the early listener. Require a
+                            // real initial window, answered by the initialized loop.
+                            if let Ok(windows) = crate::session::query_authed_all(
+                                &address, &manifest.key, b"list-windows\n",
+                                remaining.min(Duration::from_millis(200)),
+                                remaining.min(Duration::from_millis(500))) {
+                                if crate::detached_list_windows_ready(&windows) { break; }
+                            }
+                        } else if !crate::platform::process_kill::verified_process_dead(
+                            manifest.pid, manifest.creation_time) {
+                            return Err(io::Error::new(io::ErrorKind::AlreadyExists,
+                                format!("session '{}' belongs to another server", name)));
+                        }
+                        // Positively dead records may still be present before
+                        // this child's first atomic publication. Wait for it;
+                        // never query the old endpoint or delete its records.
+                    }
+                    std::thread::sleep(Duration::from_millis(20).min(
+                        deadline.saturating_duration_since(std::time::Instant::now())));
+                }
+                if !detached {
+                    tx.send(CtrlReq::SwitchClient(name.clone(), 't', None)).map_err(io::Error::other)?;
+                }
+                Ok(name)
+            })();
+            match create_result {
+                Ok(name) => {
                     if persistent {
                         let _ = tx.send(CtrlReq::StatusMessage(format!("created session '{}'", name)));
                     } else {
-                        let _ = write!(write_stream, "OK\n");
+                        let _ = writeln!(write_stream, "OK");
                         let _ = write_stream.flush();
                     }
-                } else {
+                }
+                Err(error) => {
                     if persistent {
-                        let _ = tx.send(CtrlReq::StatusMessage(format!("failed to create session '{}'", name)));
+                        let _ = tx.send(CtrlReq::StatusMessage(error.to_string()));
                     } else {
-                        let _ = write!(write_stream, "failed to create session '{}'\n", name);
+                        let _ = writeln!(write_stream, "ERROR: {}", error);
                         let _ = write_stream.flush();
                     }
                 }
@@ -3944,7 +4317,7 @@ match cmd {
             .filter(|s| !s.is_empty())
             .or_else(|| respawn_positional_command(&args));
         let workdir = args.windows(2).find(|w| w[0] == "-c").map(|w| w[1].to_string());
-        let _ = tx.send(CtrlReq::RespawnWindow(workdir, command));
+        let _ = tx.send(CtrlReq::RespawnWindow(workdir, args.contains(&"-k"), command));
     }
     "lock-server" | "lock-session" | "lock" | "locks" => {
         // Lock is a no-op on Windows (no terminal locking concept)
@@ -4031,7 +4404,7 @@ match cmd {
 fn dispatch_control_command(
     cmd: &str,
     args: &[&str],
-    tx: &mpsc::Sender<CtrlReq>,
+    tx: &impl RequestDispatch,
     resp_tx: mpsc::Sender<String>,
     target_pane: Option<usize>,
     pane_is_id: bool,
@@ -4592,11 +4965,11 @@ fn dispatch_control_command(
             true
         }
         "has-session" | "has" => {
-            let (rtx, rrx) = mpsc::channel::<bool>();
-            let _ = tx.send(CtrlReq::HasSession(rtx));
-            if let Ok(exists) = rrx.recv_timeout(Duration::from_secs(5)) {
-                let _ = resp_tx.send(if exists { String::new() } else { "session not found".to_string() });
-            }
+            let response = match has_session_request(tx) {
+                Ok(()) => String::new(),
+                Err(error) => format!("\u{0001}ERR\u{0001}{}", error),
+            };
+            let _ = resp_tx.send(response);
             true
         }
         "list-clients" | "lsc" => {
@@ -4642,8 +5015,11 @@ fn dispatch_control_command(
             true
         }
         "kill-session" => {
-            let _ = tx.send(CtrlReq::KillSession);
-            let _ = resp_tx.send(String::new());
+            let response = match kill_session_request(tx, raw_target) {
+                Ok(()) => String::new(),
+                Err(error) => format!("\u{0001}ERR\u{0001}{}", error),
+            };
+            let _ = resp_tx.send(response);
             true
         }
         "kill-server" => {
